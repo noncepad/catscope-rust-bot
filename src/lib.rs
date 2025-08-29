@@ -1,0 +1,2 @@
+#[allow(warnings)]
+mod catscopevalidator;
