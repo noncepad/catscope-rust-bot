@@ -1,6 +1,6 @@
 [package]
 name = "catscope-bot-guest"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "MIT"
 authors = ["Maintainers <maintainers@noncepad.com>"]
@@ -11,7 +11,7 @@ wit-bindgen = "0.44.0"
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["rlib"]
 
 [package.metadata.component]
 package = "catscope:witbot"

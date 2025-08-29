@@ -1,2 +1,2 @@
 #[allow(warnings)]
-mod catscopevalidator;
+pub mod catscopevalidator;
