@@ -1,0 +1,51 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  GIT_TRACE: "0"
+  GIT_DEPTH: "1"
+  GIT_CURL_VERBOSE: "1"
+  GIT_LFS_SKIP_SMUDGE: "1"
+  GIT_STRATEGY: "clone"
+  GIT_SUBMODULE_STRATEGY: recursive
+  MINOR_VERSION: "2"
+
+build_test:
+  stage: build
+  image: rust:1.89
+  tags: ["d-3"]
+  script:
+    - rustup target add wasm32-wasip2
+    - rustup component add clippy
+    - cargo clippy --  -D clippy::shadow_unrelated -D clippy::shadow_reuse -D unused_variables  -D needless_borrow -D large_enum_variant
+    - cargo build --target wasm32-wasip2 --release
+
+build_tar:
+  stage: build
+  tags: ["d-3"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  image: ${CI_REGISTRY}/eflam/builder/compact:main-bookworm
+  script:
+    - git archive --format=tar HEAD >out.tar
+  artifacts:
+    expire_in: 1 hour
+    paths:
+      - ./out.tar
+
+deploy_source:
+  stage: deploy
+  tags: ["deploy", "bastion"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  variables:
+    COMMIT_MSG: "doing update"
+    # do not increase major version past 0 or else go list will fail
+    TARGET_PROJECT: ${CI_PROJECT_NAME}
+    TARGET_GIT_DIR: "/var/share/noncepad/git/${TARGET_PROJECT}.git"
+  needs:
+    - job: build_tar
+      artifacts: true
+  script:
+    - /bin/bash ./contrib/remote-git.sh

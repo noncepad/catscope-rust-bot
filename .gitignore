@@ -1,3 +1,2 @@
-/.vscode
-/target
-/*.wasm
+.env
+target
