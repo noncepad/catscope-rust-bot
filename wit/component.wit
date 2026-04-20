@@ -1,0 +1,149 @@
+package catscope:witbot@0.1.0;
+
+world catscopevalidator {
+  include wasi:cli/imports@0.2.6;
+  include wasi:cli/command@0.2.6;
+//  import wasi:cli/environment@0.2.6;
+//  import wasi:io/poll@0.2.6;
+//  import wasi:io/streams@0.2.6;
+ // import wasi:cli/stdout@0.2.6;
+  
+  //import: guest->host function calls
+  import transactionprocessor;
+  import shooter;
+  import general;
+}
+interface general{
+  use wasi:io/poll@0.2.6.{pollable};
+  enum error-code {
+    unknown,
+    timeout,
+  }
+  ready:func()->tuple<option<u32>,option<u32>>; 
+  stdin: func(channel: u8)->list<u8>;
+  stdout: func(channel: u8,data: list<u8>);
+  finish: func()->bool;
+}
+interface transactionprocessor{
+  enum error-code {
+    unknown,
+    access-denied,
+    not-supported,
+    invalid-argument,
+    out-of-memory,
+    timeout,
+  }
+  record transactionresult{
+    slot: u64,
+    signature: list<u8>,
+    status: u8,
+    success: bool,
+    // this ID is from the assembly reference
+    id: u32,
+  }
+  // Assemble a transaction.
+  resource assembly {
+    constructor();
+    // set an address lookup table
+    lookup: func(lookup-table:u64)->result<_,error-code>;
+    // add an instruction; 0=read only; 1=signer;2=writer; both= signer | writer
+    ix: func(program:u64,compute: u32,data:list<u8>,account:list<u64>,flag:list<u8>)->result<_,error-code>;
+    // set the CU limit for the transaction.
+    compute: func(compute:u32)->result<_,error-code>;
+    // set the priority fee for a transaction.
+    priority: func(fee:u64)->result<_,error-code>;
+    // which account will pay the transaction fee
+    payer: func(payer:u64)->result<_,error-code>;
+  }
+
+  resource accidlookup{
+    poll: func()->u32;
+    read: func()->option<u64>;
+  }
+
+
+  // on success, return the slot
+  send: func(signature: list<u8>,txdata: list<u8>)->result<_,error-code>;
+  keygen: func()->result<u64,error-code>;
+  // look up an account id by pubkey
+  accountid: func(pubkey: list<u8>)->result<accidlookup,error-code>;
+  // look up a pubkey by account
+  pubkey: func(key: u64)->result<list<u8>,error-code>;
+  blockhash: func()->result<list<u8>,error-code>;
+  rent: func(size: u32)->result<u64,error-code>;
+  // delete a transaction
+  txcancel: func(transaction:assembly);
+  // sign a transaction and send the transaction out to be confirmed in a block
+  txflush: func(transactionlist:list<assembly>)->result<_,error-code>;
+  // send a transaction
+  txsend: func(transactionlist:assembly)->result<_,error-code>;
+}
+
+
+interface shooter{
+  use transactionprocessor.{transactionresult};
+  enum error-code{
+    unknown,
+    access-denied,
+    not-supported,
+    invalid-argument,
+    out-of-memory,
+    timeout,
+  }
+  record edge{
+    accountfrom: u64,
+    accountto: u64,
+    weight: u32, 
+  }
+  record commit {
+    slot: u64,
+    // merge all accounts into a single byte slice
+    data: list<u8>,
+    // mark boders of account byte slices here
+    border: list<u32>,
+    // put edges here; from->to pair, there are no weights.
+    edgeadd: list<u64>,
+    // put edges here; from->to pair, there are no weights.
+    edgeremove: list<u64>,
+  }
+  record header{
+    slot: u64,
+    version: u64,
+    lamports: u64,
+    rentepoch: u64,
+    accountid: u64,
+    owner: u64,
+    datasize: u32,
+  }
+  record accountv1{
+    header: header,
+    body: list<u8>,
+  }
+  record tokenaccountv1{
+    id: u64,
+    owner: u64,
+    mint: u64,
+    amount: u64,
+  }
+
+  resource client {
+    // return the next account. error if there is no more accounts to process.
+    subscribe: func(id: u64,filter: u32,depth: u32)->result<u32,error-code>;
+    // get notifications on when there is information to read
+    poll: func()->u32;
+    // when the poll says data is available, call the read function
+    // list<u8>,list<u32>=[]tx
+    read: func()->tuple<option<u32>,option<u64>,option<commit>,list<u8>,list<u32>,list<tokenaccountv1>,list<accountv1>>;
+    cancel: func(subid:u32);
+  }
+
+
+  pubkey-map-by-pubkey: func(pubkey: list<u8>)->result<u64,error-code>;
+  pubkey-map-by-id: func(id: u64)->result<list<u8>,error-code>;
+  account-by-id: func(id: u64)->result<list<u8>,error-code>;
+  account-by-pubkey: func(pubkey: list<u8>)->result<list<u8>,error-code>;
+  connect: func()->result<client,error-code>;
+  disconnect: func(connection: client);
+  neighbor: func(id: u64,downstream: bool)->list<edge>;
+}
+
