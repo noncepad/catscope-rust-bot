@@ -15,11 +15,29 @@ build_test:
   stage: build
   image: rust:1.89
   tags: ["d-3"]
+  rules:
+    - if: $CI_COMMIT_BRANCH != "main"
   script:
     - rustup target add wasm32-wasip2
     - rustup component add clippy
     - cargo clippy --  -D clippy::shadow_unrelated -D clippy::shadow_reuse -D unused_variables  -D needless_borrow -D large_enum_variant
     - cargo build --target wasm32-wasip2 --release
+
+build_bot:
+  stage: build
+  image: rust:1.89
+  tags: ["d-3"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  script:
+    - rustup target add wasm32-wasip2
+    - rustup component add clippy
+    - cargo clippy --  -D clippy::shadow_unrelated -D clippy::shadow_reuse -D unused_variables  -D needless_borrow -D large_enum_variant
+    - cargo build --target wasm32-wasip2 --release
+  artifacts:
+    expire_in: 1 hour
+    paths:
+      - ./target/wasm32-wasip2/release/catscope_rust_bot.wasm
 
 build_tar:
   stage: build
@@ -47,5 +65,8 @@ deploy_source:
   needs:
     - job: build_tar
       artifacts: true
+    - job: build_bot
+      artifacts: true
   script:
     - /bin/bash ./contrib/remote-git.sh
+    - cp ./target/wasm32-wasip2/release/catscope_rust_bot.wasm /var/share/dev/catscope_rust_bot.wasm
