@@ -4,6 +4,7 @@ use crate::{
     err::CatscopeGuestError,
     event::{AccountWrapper, Event, EventCallback},
     event_loop::EventPoller,
+    log_warn,
     txview::TransactionList,
     util::as_bytes_mut,
 };
@@ -87,7 +88,7 @@ impl EventCallback for Graph {
     fn on_event(&mut self) -> Result<bool, CatscopeGuestError> {
         //log_debug!("Graph::on_event - 1");
         let mx = self.inner.borrow();
-        let (o_ack, o_slot, mut o_commit, tx_data, l_tx_border, l_token, l_account) =
+        let (o_ack, o_slot, mut o_commit, tx_data, l_tx_border, l_token, l_account, l_sws) =
             mx.client.read();
 
         if !l_token.is_empty() {
@@ -107,6 +108,12 @@ impl EventCallback for Graph {
                 l_tx_border,
             )));
         }
+        if !l_sws.is_empty() {
+            for sws in l_sws {
+                self.poller
+                    .event(Event::SlotStatus(sws.slot, sws.status.try_into().unwrap()));
+            }
+        }
         if let Some(inner_commit) = o_commit.take() {
             log_debug!("Graph::on_event - 5");
             self.poller.event(Event::Commit(Commit::new(
@@ -120,6 +127,7 @@ impl EventCallback for Graph {
         if let Some(sub_id) = o_ack {
             log_debug!("Graph::on_event - 7 - {sub_id}");
         }
+
         Ok(true)
     }
 }
@@ -182,7 +190,7 @@ impl Commit {
     /// Process a commit.
     pub fn process<CH: CommitHook>(&self, hook: &mut CH) {
         let slot = self.commit.slot;
-        log_debug!("commit - 1 - slot {slot}");
+        log_warn!("commit - 1 - slot {slot}");
         hook.start(slot);
         let data = &self.commit.data;
         log_debug!(

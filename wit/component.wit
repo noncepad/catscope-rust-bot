@@ -126,6 +126,11 @@ interface shooter{
     amount: u64,
   }
 
+  record slotstatus{
+    slot: u64,
+    status: u8,
+  }
+
   resource client {
     // return the next account. error if there is no more accounts to process.
     subscribe: func(id: u64,filter: u32,depth: u32)->result<u32,error-code>;
@@ -133,7 +138,7 @@ interface shooter{
     poll: func()->u32;
     // when the poll says data is available, call the read function
     // list<u8>,list<u32>=[]tx
-    read: func()->tuple<option<u32>,option<u64>,option<commit>,list<u8>,list<u32>,list<tokenaccountv1>,list<accountv1>>;
+    read: func()->tuple<option<u32>,option<u64>,option<commit>,list<u8>,list<u32>,list<tokenaccountv1>,list<accountv1>,list<slotstatus>>;
     cancel: func(subid:u32);
   }
 

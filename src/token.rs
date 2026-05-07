@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-
 use crate::{
     catscope::witbot::shooter::Tokenaccountv1,
     graph::{AccountId, TokenAmount},
 };
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct TokenDatabase {

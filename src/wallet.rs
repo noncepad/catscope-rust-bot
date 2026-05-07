@@ -2,7 +2,6 @@ use crate::{
     catscope::witbot::{shooter::Header, transactionprocessor},
     err::CatscopeGuestError,
     graph::{AccountId, Graph, Subscription},
-    log_debug,
     tx::ComputeUnit,
     util::account_id_from_pubkey,
 };
@@ -17,12 +16,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use solana_sdk_ids::system_program::ID as SystemProgramID;
-use std::{
-    cell::UnsafeCell,
-    collections::{HashMap, HashSet, VecDeque},
-    rc::Rc,
-    u32,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct Wallet {
     m_key: HashMap<AccountId, SignerStatus>,
@@ -35,7 +29,7 @@ pub struct Wallet {
 }
 
 struct SignerStatus {
-    key: Keypair,
+    key: Box<Keypair>,
     header: Header,
     sub: Subscription,
 }
@@ -69,7 +63,7 @@ impl Wallet {
     /// This also includes doing a graph subscription to get Lamport updates.
     pub fn append_key(
         &mut self,
-        key: Keypair,
+        key: Box<Keypair>,
         g1: &mut Graph,
     ) -> Result<AccountId, CatscopeGuestError> {
         let pubkey = key.pubkey();
