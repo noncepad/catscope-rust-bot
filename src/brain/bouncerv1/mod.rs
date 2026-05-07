@@ -7,17 +7,14 @@ use crate::{
     err::CatscopeGuestError,
     event::Event,
     event_loop::EventHandler,
-    graph::{CommitHook, Graph},
+    graph::Graph,
     log_debug,
-    message::{
-        InboundMesasgeHandler, MessageAction, MessageDeserializer, MessageSend, MessageSerializer,
-    },
-    stdio::{MessageInbound, MessageOutbound, StdioPacket},
-    util::{as_bytes, as_bytes_mut, rc_unlock, rc_unlock_mut},
+    message::{InboundMesasgeHandler, MessageAction, MessageSend},
+    stdio::{MessageInbound, MessageOutbound},
+    util::rc_unlock_mut,
     wallet::Wallet,
 };
-use solana_sdk::{pubkey::Pubkey, signer::Signer as _};
-use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc, time::SystemTime};
+use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc};
 
 pub(crate) mod configuration;
 pub(crate) mod message;
@@ -70,6 +67,7 @@ impl EventHandler for BouncerV1Hook {
         &mut self,
         poller: crate::event_loop::EventPoller,
         rc_edgemgr: std::rc::Rc<std::cell::UnsafeCell<crate::graph::EdgeManager>>,
+        _l_args: &[String],
     ) -> Result<(), crate::err::CatscopeGuestError> {
         assert!(self.o_poller.replace(poller.clone()).is_none());
         let g = Graph::new(poller)?;
@@ -123,6 +121,9 @@ impl EventHandler for BouncerV1Hook {
                 // low latency update
                 log_debug!("Sample::event - 5");
                 helper.mid_on_tx(transaction_list);
+            }
+            Event::SlotStatus(slot, status) => {
+                helper.on_slot_status(slot, status);
             }
         };
         helper.evaluate();

@@ -1,14 +1,12 @@
-use solana_sdk::pubkey::Pubkey;
-
 use crate::{
     catscope::witbot::general,
     err::CatscopeGuestError,
-    event_loop::EventHandler,
     log_debug,
     message::{MessageSend, MessageSerializer},
     util::as_bytes,
 };
-use std::{cell::UnsafeCell, collections::HashMap, rc::Rc, time::UNIX_EPOCH};
+use solana_sdk::pubkey::Pubkey;
+use std::{collections::HashMap, time::UNIX_EPOCH};
 
 /// Create a fixed size data packet to send out on stdout or stderr.
 pub struct StdioPacket {

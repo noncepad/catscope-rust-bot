@@ -1,12 +1,6 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+use crate::{err::CatscopeGuestError, stdio::MessageInbound, util::as_bytes_mut};
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
-
-use crate::{
-    err::CatscopeGuestError,
-    stdio::{MessageInbound, MessageOutbound, MessageType},
-    util::{as_bytes, as_bytes_mut},
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub trait InboundMesasgeHandler<C: Sized + Default, M_IN: MessageDeserializer, M_OUT> {
     fn on_message(&mut self, action: MessageAction<C, M_IN>);
@@ -28,7 +22,7 @@ pub trait MessageSerializer {
 }
 
 pub enum MessageAction<C: Sized + Default, M_IN: MessageDeserializer> {
-    PrivateKey(Keypair),
+    PrivateKey(Box<Keypair>),
     Ping(SystemTime),
     Custom(M_IN),
     AdjustConfiguration(C),
@@ -66,7 +60,7 @@ impl<C: Sized + Default, M_IN: MessageDeserializer> TryFrom<&MessageInbound>
                     )));
                 }
                 let x: [u8; 32] = v.try_into().unwrap();
-                let y = Keypair::new_from_array(x);
+                let y = Box::new(Keypair::new_from_array(x));
                 Ok(MessageAction::PrivateKey(y))
             }
             b"mothership_ping_v1" => {

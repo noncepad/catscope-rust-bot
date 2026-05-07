@@ -17,13 +17,17 @@ pub trait EventHandler {
         &mut self,
         poller: EventPoller,
         rc_edgemgr: Rc<UnsafeCell<EdgeManager>>,
+        args: &[String],
     ) -> Result<(), CatscopeGuestError>;
     fn on_unload(&mut self) -> Result<(), CatscopeGuestError>;
     fn on_event(&mut self, event: Event) -> Result<(), CatscopeGuestError>;
     fn flush(&mut self) -> Result<(), CatscopeGuestError>;
 }
 
-pub fn run(handler: Rc<RefCell<dyn EventHandler>>) -> Result<(), CatscopeGuestError> {
+pub fn run(
+    handler: Rc<RefCell<dyn EventHandler>>,
+    args: Vec<String>,
+) -> Result<(), CatscopeGuestError> {
     let rc_ip;
     let rc_edgemgr = Rc::new(UnsafeCell::new(EdgeManager::default()));
     {
@@ -38,7 +42,7 @@ pub fn run(handler: Rc<RefCell<dyn EventHandler>>) -> Result<(), CatscopeGuestEr
             inner: rc_ip.clone(),
         };
         let mut h = handler.borrow_mut();
-        h.on_load(poller, rc_edgemgr.clone())?;
+        h.on_load(poller, rc_edgemgr.clone(), args.as_slice())?;
     }
     let ip = rc_unlock_mut(&rc_ip);
     let mut r = Ok(());
@@ -97,6 +101,9 @@ pub struct EventPoller {
     inner: Rc<UnsafeCell<InnerEventPoller>>,
 }
 impl EventPoller {
+    pub(crate) fn is_alive(&self) -> bool {
+        self.is_alive.get()
+    }
     pub(crate) fn event(&self, event: Event) {
         let ip = rc_unlock_mut(&self.inner);
         ip.q_event.push_back(event);

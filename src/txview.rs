@@ -1,10 +1,9 @@
+use crate::{err::CatscopeGuestError, graph::AccountId};
 use solana_sdk::{
     clock::Slot, instruction::InstructionError, signature::SIGNATURE_BYTES,
     transaction::TransactionError,
 };
 use wincode::{SchemaRead, SchemaWrite};
-
-use crate::{err::CatscopeGuestError, graph::AccountId};
 
 pub struct TransactionList {
     i: usize,

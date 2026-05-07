@@ -1,14 +1,3 @@
-use std::{collections::VecDeque, time::SystemTime};
-
-use solana_sdk::{
-    clock::Slot,
-    pubkey::Pubkey,
-    signature::{Keypair, Signature},
-    signer::Signer as _,
-    transaction::TransactionError,
-};
-use solana_system_interface::instruction as system_instruction;
-
 use crate::{
     brain::bouncerv1::{
         message::Latency, Configuration, CustomMessageInbound, CustomMessageOutbound,
@@ -17,14 +6,22 @@ use crate::{
         shooter::{Header, Tokenaccountv1},
         transactionprocessor,
     },
-    event::AccountWrapper,
+    event::{AccountWrapper, SlotStatus},
     graph::{CommitHook, Graph, Lamports},
     log_debug, log_info,
     message::{InboundMesasgeHandler, MessageSend},
-    txview::{CatscopeTransactionReadWrapper, TransactionList},
+    txview::TransactionList,
     util::pubkey_from_account_id,
     wallet::Wallet,
 };
+use solana_sdk::{
+    clock::Slot,
+    pubkey::Pubkey,
+    signature::{Keypair, Signature},
+    signer::Signer as _,
+};
+use solana_system_interface::instruction as system_instruction;
+use std::{collections::VecDeque, time::SystemTime};
 
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -56,7 +53,7 @@ impl<'a> StateHelper<'a> {
         assert_eq!(self.configuration.count, 1);
         // do on_load stuff
         log_debug!("_+__loaded: Configuration {:?}", self.configuration);
-        let keypair = Keypair::new();
+        let keypair = Box::new(Keypair::new());
         let g = self.o_graph.take().unwrap();
         let payer = self.wallet.append_key(keypair, g).unwrap();
 
@@ -67,6 +64,7 @@ impl<'a> StateHelper<'a> {
         self.o_graph.replace(g);
     }
 
+    pub(crate) fn on_slot_status(&mut self, _slot: Slot, _status: SlotStatus) {}
     pub(crate) fn mid_on_account(&mut self, mut account_wrapper: AccountWrapper) {
         while let Some((header, _body)) = account_wrapper.account() {
             // got account
@@ -136,9 +134,9 @@ impl<'a> StateHelper<'a> {
     }
 
     /// only call this from CommitHook
-    fn slot(&'a self) -> Slot {
-        *self.o_commit_slot.as_ref().unwrap()
-    }
+    //    pub(crate) fn slot(&'a self) -> Slot {
+    //       *self.o_commit_slot.as_ref().unwrap()
+    //  }
     fn msg_send(&mut self, message: MessageSend<CustomMessageOutbound>) {
         self.q_msg.push_front(message);
     }

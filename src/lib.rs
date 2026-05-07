@@ -3,7 +3,7 @@ wit_bindgen::generate!({
     path: "wit",
     generate_all,
 });
-use crate::{brain::bouncerv1::BouncerV1Hook, event_loop::run};
+use crate::{brain::Merged, event_loop::run};
 use exports::wasi::cli::run::Guest;
 use std::{cell::RefCell, rc::Rc};
 
@@ -25,9 +25,14 @@ struct Component;
 
 impl Guest for Component {
     fn run() -> Result<(), ()> {
-        let sampler = Rc::new(RefCell::new(BouncerV1Hook::default()));
-        //let sampler = Rc::new(RefCell::new(ArbV1Hook::default()));
-        let r = run(sampler);
+        let args = std::env::args();
+        let mut l_arg = Vec::new();
+        for x in args {
+            l_arg.push(x);
+        }
+        let b = Merged::default();
+        let sampler = Rc::new(RefCell::new(b));
+        let r = run(sampler, l_arg);
         if let Err(e) = r {
             panic!("program exited with error: {e}")
         }

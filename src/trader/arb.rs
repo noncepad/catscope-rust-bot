@@ -41,10 +41,7 @@
 //! }
 //! ```
 
-use crate::{
-    graph::AccountId,
-    trader::types::PriceUpdate,
-};
+use crate::{graph::AccountId, trader::types::PriceUpdate};
 
 pub type NodeId = u32;
 pub type EdgeId = u32;
@@ -99,7 +96,6 @@ pub struct ArbGraph {
     pool_to_edges: Vec<(AccountId, EdgeId)>,
 
     // ── Post-build hot-path data (CSR) ─────────────────────────────────────
-
     /// Flattened edge lists for every cycle.
     /// Cycle `c` uses `cycle_edges[cycle_offsets[c]..cycle_offsets[c+1]]`.
     cycle_edges: Vec<EdgeId>,
@@ -114,6 +110,16 @@ pub struct ArbGraph {
 
     /// Cached log-sum per cycle.  Negative ⟹ profitable.
     cycle_cost: Vec<f64>,
+}
+
+pub struct AddEdge {
+    from: NodeId,
+    to: NodeId,
+    initial_price: f64,
+    fee: f64,
+    pool_id: AccountId,
+    input_mint: AccountId,
+    output_mint: AccountId,
 }
 
 impl ArbGraph {
@@ -140,26 +146,27 @@ impl ArbGraph {
     /// `fee`: fractional swap fee (`0.003` = 0.3%).
     ///
     /// Returns the [`EdgeId`] for this edge.
-    pub fn add_edge(
-        &mut self,
-        from: NodeId,
-        to: NodeId,
-        initial_price: f64,
-        fee: f64,
-        pool_id: AccountId,
-        input_mint: AccountId,
-        output_mint: AccountId,
-    ) -> EdgeId {
-        assert!((from as usize) < self.n_nodes);
-        assert!((to as usize) < self.n_nodes);
+    pub fn add_edge(&mut self, ae: AddEdge) -> EdgeId {
+        assert!((ae.from as usize) < self.n_nodes);
+        assert!((ae.to as usize) < self.n_nodes);
         let id = self.edges.len() as EdgeId;
-        let weight = -(initial_price * (1.0 - fee)).ln();
-        self.edges.push(Edge { from, to, weight, fee, pool_id, input_mint, output_mint });
-        self.adj[from as usize].push((to, id));
+        let weight = -(ae.initial_price * (1.0 - ae.fee)).ln();
+        self.edges.push(Edge {
+            from: ae.from,
+            to: ae.to,
+            weight,
+            fee: ae.fee,
+            pool_id: ae.pool_id,
+            input_mint: ae.input_mint,
+            output_mint: ae.output_mint,
+        });
+        self.adj[ae.from as usize].push((ae.to, id));
 
         // Insert into sorted pool_to_edges for binary-search lookup.
-        let pos = self.pool_to_edges.partition_point(|&(pid, _)| pid < pool_id);
-        self.pool_to_edges.insert(pos, (pool_id, id));
+        let pos = self
+            .pool_to_edges
+            .partition_point(|&(pid, _)| pid < ae.pool_id);
+        self.pool_to_edges.insert(pos, (ae.pool_id, id));
 
         id
     }
@@ -210,7 +217,8 @@ impl ArbGraph {
         // ── Initial cycle costs ───────────────────────────────────────────────
         self.cycle_cost = Vec::with_capacity(n_cycles);
         for cycle in &raw_cycles {
-            let cost: f64 = cycle.iter()
+            let cost: f64 = cycle
+                .iter()
                 .map(|&eid| self.edges[eid as usize].weight)
                 .sum();
             self.cycle_cost.push(cost);
@@ -297,8 +305,12 @@ impl ArbGraph {
         let mut buf = [0u32; 8];
         let mut n = 0usize;
         {
-            let lo = self.pool_to_edges.partition_point(|&(pid, _)| pid < update.pool);
-            let hi = self.pool_to_edges.partition_point(|&(pid, _)| pid <= update.pool);
+            let lo = self
+                .pool_to_edges
+                .partition_point(|&(pid, _)| pid < update.pool);
+            let hi = self
+                .pool_to_edges
+                .partition_point(|&(pid, _)| pid <= update.pool);
             for &(_, eid) in &self.pool_to_edges[lo..hi] {
                 if n < buf.len() {
                     buf[n] = eid;
@@ -316,12 +328,16 @@ impl ArbGraph {
             let new_price = if inp == p.token_a && outp == p.token_b {
                 p.price
             } else if inp == p.token_b && outp == p.token_a {
-                if p.price > 0.0 { 1.0 / p.price } else { continue }
+                if p.price > 0.0 {
+                    1.0 / p.price
+                } else {
+                    continue;
+                }
             } else {
                 continue;
             };
 
-            self.update_edge(eid, new_price, |cid, profit| on_arb(cid, profit));
+            self.update_edge(eid, new_price, &mut on_arb);
         }
     }
 
@@ -349,18 +365,30 @@ impl ArbGraph {
 
     /// All edges registered for `pool_id` (usually the two swap directions).
     pub fn edges_for_pool(&self, pool_id: AccountId) -> impl Iterator<Item = EdgeId> + '_ {
-        let lo = self.pool_to_edges.partition_point(|&(pid, _)| pid < pool_id);
-        let hi = self.pool_to_edges.partition_point(|&(pid, _)| pid <= pool_id);
+        let lo = self
+            .pool_to_edges
+            .partition_point(|&(pid, _)| pid < pool_id);
+        let hi = self
+            .pool_to_edges
+            .partition_point(|&(pid, _)| pid <= pool_id);
         self.pool_to_edges[lo..hi].iter().map(|&(_, eid)| eid)
     }
 
     /// Edge metadata.
     #[inline]
-    pub fn edge(&self, id: EdgeId) -> &Edge { &self.edges[id as usize] }
+    pub fn edge(&self, id: EdgeId) -> &Edge {
+        &self.edges[id as usize]
+    }
 
-    pub fn n_nodes(&self) -> usize { self.n_nodes }
-    pub fn n_edges(&self) -> usize { self.edges.len() }
-    pub fn n_cycles(&self) -> usize { self.cycle_cost.len() }
+    pub fn n_nodes(&self) -> usize {
+        self.n_nodes
+    }
+    pub fn n_edges(&self) -> usize {
+        self.edges.len()
+    }
+    pub fn n_cycles(&self) -> usize {
+        self.cycle_cost.len()
+    }
 
     // ─── Cycle enumeration (called only during build_cycles) ──────────────────
 
@@ -408,12 +436,66 @@ mod tests {
     fn triangle_graph() -> (ArbGraph, [EdgeId; 6]) {
         let mut g = ArbGraph::new(3);
         // price = 1.0, fee = 0  → weight = -ln(1.0) = 0
-        let e_ab = g.add_edge(0, 1, 1.0, 0.0, 10, 100, 200);
-        let e_ba = g.add_edge(1, 0, 1.0, 0.0, 10, 200, 100);
-        let e_bc = g.add_edge(1, 2, 1.0, 0.0, 20, 200, 300);
-        let e_cb = g.add_edge(2, 1, 1.0, 0.0, 20, 300, 200);
-        let e_ca = g.add_edge(2, 0, 1.0, 0.0, 30, 300, 100);
-        let e_ac = g.add_edge(0, 2, 1.0, 0.0, 30, 100, 300);
+        // 0, 1, 1.0, 0.0, 10, 100, 200
+        let e_ab = g.add_edge(AddEdge {
+            from: 0,
+            to: 1,
+            initial_price: 1.0,
+            fee: 0.0,
+            pool_id: 10,
+            input_mint: 100,
+            output_mint: 200,
+        });
+        //1, 0, 1.0, 0.0, 10, 200, 100
+        let e_ba = g.add_edge(AddEdge {
+            from: 1,
+            to: 0,
+            initial_price: 1.0,
+            fee: 0.0,
+            pool_id: 10,
+            input_mint: 200,
+            output_mint: 100,
+        });
+        //1, 2, 1.0, 0.0, 20, 200, 300
+        let e_bc = g.add_edge(AddEdge {
+            from: 1,
+            to: 2,
+            initial_price: 1.0,
+            fee: 0.0,
+            pool_id: 20,
+            input_mint: 200,
+            output_mint: 300,
+        });
+        //2, 1, 1.0, 0.0, 20, 300, 200
+        let e_cb = g.add_edge(AddEdge {
+            from: 2,
+            to: 1,
+            initial_price: 1.0,
+            fee: 0.0,
+            pool_id: 20,
+            input_mint: 300,
+            output_mint: 200,
+        });
+        //2, 0, 1.0, 0.0, 30, 300, 100
+        let e_ca = g.add_edge(AddEdge {
+            from: 2,
+            to: 0,
+            initial_price: 1.0,
+            fee: 0.0,
+            pool_id: 30,
+            input_mint: 300,
+            output_mint: 100,
+        });
+        //0, 2, 1.0, 0.0, 30, 100, 300
+        let e_ac = g.add_edge(AddEdge {
+            from: 0,
+            to: 2,
+            initial_price: 1.0,
+            fee: 0.0,
+            pool_id: 30,
+            input_mint: 100,
+            output_mint: 300,
+        });
         g.build_cycles(3);
         (g, [e_ab, e_ba, e_bc, e_cb, e_ca, e_ac])
     }
@@ -465,8 +547,26 @@ mod tests {
     fn fee_raises_break_even_price() {
         let mut g = ArbGraph::new(2);
         // A→B→A with 0.3% fee on each leg.
-        let e_ab = g.add_edge(0, 1, 1.0, 0.003, 1, 1, 2);
-        let _e_ba = g.add_edge(1, 0, 1.0, 0.003, 1, 2, 1);
+        //0, 1, 1.0, 0.003, 1, 1, 2
+        let e_ab = g.add_edge(AddEdge {
+            from: 0,
+            to: 1,
+            initial_price: 1.0,
+            fee: 0.003,
+            pool_id: 1,
+            input_mint: 1,
+            output_mint: 2,
+        });
+        //1, 0, 1.0, 0.003, 1, 2, 1
+        let _e_ba = g.add_edge(AddEdge {
+            from: 1,
+            to: 0,
+            initial_price: 1.0,
+            fee: 0.003,
+            pool_id: 1,
+            input_mint: 2,
+            output_mint: 1,
+        });
         g.build_cycles(2);
         assert_eq!(g.n_cycles(), 1);
 
@@ -476,7 +576,9 @@ mod tests {
         let mut found = false;
         // Need round-trip product > 1/(0.997)^2 ≈ 1.006 to profit.
         // Set A→B = 1.004 → product = 1.004 * 1.0 * 0.997^2 ≈ 0.998 still < 1.
-        g.update_edge(e_ab, 1.004, |_, _| { found = true; });
+        g.update_edge(e_ab, 1.004, |_, _| {
+            found = true;
+        });
         assert!(!found, "1.004 is below break-even");
 
         // Set A→B = 1.01 → product = 1.01 * 0.997^2 ≈ 1.004 > 1.
@@ -490,8 +592,26 @@ mod tests {
     #[test]
     fn update_from_price_update_routes_both_edges() {
         let mut g = ArbGraph::new(2);
-        let _e_ab = g.add_edge(0, 1, 1.0, 0.0, 99, 1, 2);
-        let _e_ba = g.add_edge(1, 0, 1.0, 0.0, 99, 2, 1);
+        //0, 1, 1.0, 0.0, 99, 1, 2
+        let _e_ab = g.add_edge(AddEdge {
+            from: 0,
+            to: 1,
+            initial_price: 1.0,
+            fee: 0.0,
+            pool_id: 99,
+            input_mint: 1,
+            output_mint: 2,
+        });
+        //1, 0, 1.0, 0.0, 99, 2, 1
+        let _e_ba = g.add_edge(AddEdge {
+            from: 1,
+            to: 0,
+            initial_price: 1.0,
+            fee: 0.0,
+            pool_id: 99,
+            input_mint: 2,
+            output_mint: 1,
+        });
         g.build_cycles(2);
 
         let update = PriceUpdate {
@@ -499,7 +619,7 @@ mod tests {
             price: crate::trader::types::PoolPrice {
                 token_a: 1,
                 token_b: 2,
-                price: 1.05,  // A→B improved
+                price: 1.05, // A→B improved
                 reserve_a: 1000,
                 reserve_b: 1050,
                 fee_bps: 0,
@@ -507,7 +627,9 @@ mod tests {
         };
 
         let mut count = 0;
-        g.update_from_price_update(&update, |_, _| { count += 1; });
+        g.update_from_price_update(&update, |_, _| {
+            count += 1;
+        });
         // cycle A→B→A: weight = -ln(1.05) + -ln(1/1.05) = -ln(1.05)+ln(1.05) = 0
         // Still 0, no arb. But both edges got updated without panic.
         assert_eq!(count, 0);

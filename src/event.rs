@@ -1,3 +1,5 @@
+use solana_sdk::clock::Slot;
+
 use crate::{
     catscope::witbot::shooter::{Accountv1, Header, Tokenaccountv1},
     err::CatscopeGuestError,
@@ -18,7 +20,46 @@ pub enum Event {
     Commit(Commit),
     Account(AccountWrapper),
     Token(Vec<Tokenaccountv1>),
+    SlotStatus(Slot, SlotStatus),
     Transaction(TransactionList),
+}
+
+/// Mirrors the agave geyser SlotStatus, encoded as u8 by the host.
+/// Mapping matches catscope-zerohop convert_slot_status_from:
+///   1=Processed, 2=Rooted, 3=Confirmed, 4=FirstShredReceived,
+///   5=Completed, 6=CreatedBank, 7=Dead
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotStatus {
+    /// Heaviest fork tip processed by the node (not yet confirmed).
+    Processed,
+    /// Highest slot having reached max vote lockout (finalized).
+    Rooted,
+    /// Voted on by supermajority of the cluster.
+    Confirmed,
+    /// First shred for this slot has been received.
+    FirstShredReceived,
+    /// All shreds for this slot have been received.
+    Completed,
+    /// A bank has been created for this slot.
+    CreatedBank,
+    /// This slot is dead (fork was abandoned).
+    Dead,
+}
+
+impl TryFrom<u8> for SlotStatus {
+    type Error = u8;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            1 => Ok(Self::Processed),
+            2 => Ok(Self::Rooted),
+            3 => Ok(Self::Confirmed),
+            4 => Ok(Self::FirstShredReceived),
+            5 => Ok(Self::Completed),
+            6 => Ok(Self::CreatedBank),
+            7 => Ok(Self::Dead),
+            _ => Err(v),
+        }
+    }
 }
 
 pub struct AccountWrapper {
