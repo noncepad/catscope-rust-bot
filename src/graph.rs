@@ -120,9 +120,19 @@ impl EventCallback for Graph {
                 self.edgemgr.clone(),
                 inner_commit,
             )));
-        }
-        if let Some(slot) = o_slot {
+        } else if let Some(slot) = o_slot {
             log_debug!("Graph::on_event - 6 - {slot}");
+            let inner_commit = ShooterCommit {
+                slot,
+                data: vec![],
+                border: vec![],
+                edgeadd: vec![],
+                edgeremove: vec![],
+            };
+            self.poller.event(Event::Commit(Commit::new(
+                self.edgemgr.clone(),
+                inner_commit,
+            )));
         }
         if let Some(sub_id) = o_ack {
             log_debug!("Graph::on_event - 7 - {sub_id}");
@@ -190,7 +200,9 @@ impl Commit {
     /// Process a commit.
     pub fn process<CH: CommitHook>(&self, hook: &mut CH) {
         let slot = self.commit.slot;
-        log_warn!("commit - 1 - slot {slot}");
+        if slot % 100 == 0 {
+            log_warn!("commit - 1 - slot {slot}");
+        }
         hook.start(slot);
         let data = &self.commit.data;
         log_debug!(

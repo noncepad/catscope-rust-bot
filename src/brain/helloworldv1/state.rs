@@ -13,7 +13,7 @@ use crate::{
     catscope::witbot::shooter::{Header, Tokenaccountv1},
     event::{AccountWrapper, SlotStatus},
     graph::{AccountId, CommitHook},
-    log_info,
+    log_info, log_warn,
     message::{InboundMesasgeHandler, MessageAction, MessageSend},
     txview::TransactionList,
 };
@@ -110,6 +110,9 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
 impl<'a> CommitHook for StateHelper<'a> {
     fn start(&mut self, slot: Slot) {
         assert!(self.o_commit_slot.replace(slot).is_none());
+        if slot % 100 == 0 {
+            log_warn!("CommitHook - start {slot}");
+        }
         self.state.last_slot = slot;
     }
 
