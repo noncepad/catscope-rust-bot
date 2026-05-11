@@ -1,11 +1,11 @@
 use crate::graph::EdgeManager;
-use crate::log_debug;
 use crate::{
     catscope::witbot::general::{self, stdin},
     err::CatscopeGuestError,
     event::{Event, EventCallback, PollEvent},
     util::rc_unlock_mut,
 };
+use crate::{log_debug, log_warn};
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
     collections::{HashMap, VecDeque},
@@ -63,6 +63,7 @@ pub fn run(
                 // grab data from the host.
                 // then the callbacks put event messages
                 // into the event queue.
+                log_debug!("PollEvent::Wit - event {event_id}");
                 match ip.on_event_id(event_id) {
                     Ok(keep) => {
                         //log_debug!("run - 3 - event_id {event_id}; keep {keep}");

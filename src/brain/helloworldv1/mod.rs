@@ -8,7 +8,7 @@ use crate::{
     event::Event,
     event_loop::EventHandler,
     graph::Graph,
-    log_debug, log_info,
+    log_debug, log_info, log_warn,
     message::{InboundMesasgeHandler, MessageAction, MessageSend},
     stdio::{MessageInbound, MessageOutbound},
     util::rc_unlock_mut,
@@ -67,7 +67,7 @@ impl EventHandler for HelloWorldV1Hook {
         assert!(self.o_rc_graph.replace(g).is_none());
         let mut helper = self.helper();
         helper.on_load();
-        log_info!("on_load - 1");
+        log_info!("++++++on_load - 1");
         let q_msg = rc_unlock_mut(&self.tmp_q_msg);
         let mut outbound = self.msg_outbound.take().unwrap();
         while let Some(message) = q_msg.pop_front() {
@@ -75,7 +75,7 @@ impl EventHandler for HelloWorldV1Hook {
         }
         outbound.flush();
         self.msg_outbound.replace(outbound);
-        log_info!("on_load - 2");
+        log_info!("on_load - 2+++++");
         Ok(())
     }
 
@@ -87,10 +87,10 @@ impl EventHandler for HelloWorldV1Hook {
     fn on_event(&mut self, event: Event) -> Result<(), CatscopeGuestError> {
         let mut parser = self.o_msg_parser.take().unwrap();
         let mut helper = self.helper();
-        log_debug!("HelloWorldV1Hook::event - 1");
+        log_debug!("HelloWorldV1Hook::event - 1 - +++++");
         match event {
             Event::Stdin(data) => {
-                //log_info!("HelloWorldV1Hook::event - stdin");
+                log_debug!("HelloWorldV1Hook::event - stdin");
                 parser.parse(&data).unwrap();
                 let action: MessageAction<Configuration, CustomMessageInbound> = {
                     let x = &parser;
@@ -99,19 +99,24 @@ impl EventHandler for HelloWorldV1Hook {
                 helper.on_message(action);
             }
             Event::Commit(commit) => {
-                //log_info!("HelloWorldV1Hook::event - commit");
+                log_debug!("HelloWorldV1Hook::event - commit - 1");
                 commit.process(&mut helper);
+                log_debug!("HelloWorldV1Hook::event - commit - 2");
             }
             Event::Account(account_wrapper) => {
+                log_debug!("HelloWorldV1Hook::event - account_wrapper");
                 helper.mid_on_account(account_wrapper);
             }
             Event::Token(tokenaccountv1s) => {
+                log_debug!("HelloWorldV1Hook::event - token");
                 helper.mid_on_token(tokenaccountv1s);
             }
             Event::Transaction(transaction_list) => {
+                log_debug!("HelloWorldV1Hook::event - tx");
                 helper.mid_on_tx(transaction_list);
             }
             Event::SlotStatus(slot, status) => {
+                log_debug!("HelloWorldV1Hook::event - slot {slot} - status {status:?}");
                 helper.on_slot_status(slot, status);
             }
         };
