@@ -171,7 +171,7 @@ impl ArbGraph {
         id
     }
 
-    /// Enumerate all simple directed cycles up to `max_len` edges, compute
+    /// Enumerate all simple directed cycles of exactly `max_len` edges, compute
     /// initial costs, and build the CSR lookup tables.
     ///
     /// **Call once after all edges are added.**
@@ -392,8 +392,8 @@ impl ArbGraph {
 
     // ─── Cycle enumeration (called only during build_cycles) ──────────────────
 
-    /// DFS that emits simple directed cycles, each normalised to start at its
-    /// lowest-ID node.
+    /// DFS that emits simple directed cycles of exactly `max_len` edges,
+    /// each normalised to start at its lowest-ID node.
     fn dfs_cycles(
         start: NodeId,
         current: NodeId,
@@ -405,8 +405,9 @@ impl ArbGraph {
     ) {
         for &(next, eid) in &adj[current as usize] {
             if next == start {
-                // Close the cycle (path must be non-empty to avoid self-loops).
-                if !path.is_empty() {
+                // Close only when all max_len edges have been used (remaining == 0
+                // means the closing edge is the last one).
+                if !path.is_empty() && remaining == 0 {
                     let mut cycle = path.clone();
                     cycle.push(eid);
                     cycles.push(cycle);

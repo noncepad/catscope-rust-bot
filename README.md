@@ -3,7 +3,7 @@
 There are two sample modes:
 
 * `./src/brain/helloworldv1` - print slot numbers to stderr
-* `./src/brain/boucnerv1` - not yet complete
+* `./src/brain/bouncerv1` - not yet complete
 
 For an example of how to upload and run a web assembly bot, [please see this repository](https://github.com/noncepad/optimizer).
 
@@ -25,3 +25,14 @@ cargo check --target wasm32-wasip2
 
 The binary will be at `./target/wasm32-wasip2/release/catscope_rust_bot.wasm`
 
+## Test
+
+The default build target is `wasm32-wasip2`, so tests must be run against a native target explicitly:
+
+```bash
+# x86-64 Linux
+cargo test --target x86_64-unknown-linux-gnu
+
+# ARM64 Linux
+cargo test --target aarch64-unknown-linux-gnu
+```

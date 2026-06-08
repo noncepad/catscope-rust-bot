@@ -61,6 +61,7 @@ impl PoolPrice {
 }
 
 /// Parameters for a single-hop swap instruction.
+#[derive(Debug)]
 pub struct SwapParams {
     /// Pool account to route through.
     pub pool: AccountId,
@@ -80,6 +81,25 @@ pub struct SwapParams {
     pub user_wallet: AccountId,
 }
 
+impl SwapParams {
+    pub fn pool_lookup_id(&self) -> [AccountId; 2] {
+        let mut id = [self.input_mint, self.output_mint];
+        id.sort();
+        id
+    }
+
+    /// Set `min_amount_out` from a spot price and a maximum slippage tolerance.
+    ///
+    /// `spot_price` — expected output raw units per input raw unit for this
+    ///   swap direction (for A→B use `pool.price`; for B→A use `1.0 / pool.price`).
+    /// `max_slippage` — fractional tolerance, e.g. `0.005` for 0.5%.
+    ///
+    /// `min_amount_out = floor(amount_in * spot_price * (1 - max_slippage))`
+    pub fn set_min_amount_out(&mut self, spot_price: f64, max_slippage: f64) {
+        let expected = self.amount_in as f64 * spot_price;
+        self.min_amount_out = (expected * (1.0 - max_slippage)) as u64;
+    }
+}
 /// Emitted whenever a tracked pool's pricing state changes.
 #[derive(Debug, Clone)]
 pub struct PriceUpdate {
@@ -103,4 +123,17 @@ pub enum TraderError {
     PubkeyResolutionFailed(AccountId),
     /// A required DEX-specific configuration field is absent.
     MissingConfig(&'static str),
+}
+impl std::fmt::Display for TraderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPool(arg0) => f.debug_tuple("UnknownPool").field(arg0).finish(),
+            Self::PoolNotReady => write!(f, "PoolNotReady"),
+            Self::WrongMints => write!(f, "WrongMints"),
+            Self::PubkeyResolutionFailed(arg0) => {
+                f.debug_tuple("PubkeyResolutionFailed").field(arg0).finish()
+            }
+            Self::MissingConfig(arg0) => f.debug_tuple("MissingConfig").field(arg0).finish(),
+        }
+    }
 }

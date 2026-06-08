@@ -1,9 +1,18 @@
+use std::{cell::UnsafeCell, rc::Rc};
+
 use crate::{
-    brain::{bouncerv1::BouncerV1Hook, helloworldv1::HelloWorldV1Hook},
+    brain::helloworldv1::{
+        message::{
+            CustomMessageInbound as HelloCustomMessageInbound,
+            CustomMessageOutbound as HelloCustomMessageOutbound,
+        },
+        HelloWorldV1Hook,
+    },
     event_loop::EventHandler,
+    message::{MessageDeserializer, MessageSend, MessageSerializer, Parser},
+    TradingSetup,
 };
 
-pub mod bouncerv1;
 pub mod helloworldv1;
 
 pub struct Merged {
@@ -11,7 +20,6 @@ pub struct Merged {
 }
 
 enum BotMode {
-    Bouncer(Box<BouncerV1Hook>),
     HelloWorld(Box<HelloWorldV1Hook>),
 }
 
@@ -21,9 +29,10 @@ impl Default for Merged {
             Ok(x) => x,
             Err(_e) => panic!("env var MODE not set"),
         };
+        let rc_parser = Rc::new(UnsafeCell::new(Parser::default()));
+
         let inner = match mode.as_str() {
-            "BOUNCER" => BotMode::Bouncer(Box::default()),
-            "HELLOWORLD" => BotMode::HelloWorld(Box::default()),
+            "helloworldv1" => BotMode::HelloWorld(Box::new(HelloWorldV1Hook::new(rc_parser))),
             _ => panic!("unknown mode {mode}",),
         };
         Self { inner: Some(inner) }
@@ -36,16 +45,13 @@ impl EventHandler for Merged {
         poller: crate::event_loop::EventPoller,
         rc_edgemgr: std::rc::Rc<std::cell::UnsafeCell<crate::graph::EdgeManager>>,
         args: &[String],
+        trading: &TradingSetup,
     ) -> Result<(), crate::err::CatscopeGuestError> {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::Bouncer(mut x) => {
-                r = x.on_load(poller, rc_edgemgr, args);
-                inner = BotMode::Bouncer(x);
-            }
             BotMode::HelloWorld(mut x) => {
-                r = x.on_load(poller, rc_edgemgr, args);
+                r = x.on_load(poller, rc_edgemgr, args, trading);
                 inner = BotMode::HelloWorld(x);
             }
         };
@@ -57,10 +63,6 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::Bouncer(mut x) => {
-                r = x.on_unload();
-                inner = BotMode::Bouncer(x);
-            }
             BotMode::HelloWorld(mut x) => {
                 r = x.on_unload();
                 inner = BotMode::HelloWorld(x);
@@ -77,10 +79,6 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::Bouncer(mut x) => {
-                r = x.on_event(event);
-                inner = BotMode::Bouncer(x);
-            }
             BotMode::HelloWorld(mut x) => {
                 r = x.on_event(event);
                 inner = BotMode::HelloWorld(x);
@@ -94,10 +92,6 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::Bouncer(mut x) => {
-                r = x.flush();
-                inner = BotMode::Bouncer(x);
-            }
             BotMode::HelloWorld(mut x) => {
                 r = x.flush();
                 inner = BotMode::HelloWorld(x);
