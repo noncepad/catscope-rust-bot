@@ -9,11 +9,18 @@ pub struct TransactionList {
     i: usize,
     data: Vec<u8>,
     border: Vec<u32>,
+    // scratch buffer used when a tx slice is not 8-byte aligned
+    aligned_buf: Vec<u8>,
 }
 
 impl TransactionList {
     pub(crate) fn new(data: Vec<u8>, border: Vec<u32>) -> Self {
-        Self { data, border, i: 0 }
+        Self {
+            data,
+            border,
+            i: 0,
+            aligned_buf: Vec::new(),
+        }
     }
     pub fn transaction<'a, 'b: 'a>(
         &'b mut self,
@@ -35,7 +42,32 @@ impl TransactionList {
             result_from_bytes(&z).unwrap()
         };
 
-        let tx_slice = &self.data[start_tx..finish];
+        // tx_slice may start at an unaligned offset within data (e.g. 541 % 8 != 0).
+        // CatscopeTransactionReadWrapper requires 8-byte alignment for its typed slices.
+        // When misaligned, copy to aligned_buf first.
+        let is_aligned = (self.data.as_ptr() as usize + start_tx) % 8 == 0;
+        if !is_aligned {
+            let len = finish - start_tx;
+            // Ensure capacity without borrowing data yet.
+            if self.aligned_buf.len() < len {
+                self.aligned_buf.resize(len, 0);
+            }
+            // SAFETY: data and aligned_buf are distinct allocations; lengths checked above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.data.as_ptr().add(start_tx),
+                    self.aligned_buf.as_mut_ptr(),
+                    len,
+                );
+            }
+        }
+
+        let tx_slice: &[u8] = if is_aligned {
+            &self.data[start_tx..finish]
+        } else {
+            &self.aligned_buf[..finish - start_tx]
+        };
+        let data_len = self.data.len();
         let tx = CatscopeTransactionReadWrapper::try_from(tx_slice).unwrap_or_else(|e| {
             let hdr_size = std::mem::size_of::<CatscopeTransactionHeader>();
             let hdr_info = if tx_slice.len() >= hdr_size {
@@ -45,17 +77,20 @@ impl TransactionList {
                 let account_chunk_len = u32::from_le_bytes(tx_slice[84..88].try_into().unwrap());
                 let data_chunk_len = u32::from_le_bytes(tx_slice[88..92].try_into().unwrap());
                 let ix_count = outer_len.saturating_add(inner_len);
-                let expected = (outer_len as usize) * 21
-                    + (inner_len as usize) * 20
-                    + (account_len as usize) * 8
-                    + (account_chunk_len as usize) * 8
+                let ci_size = std::mem::size_of::<CatscopeInstruction>();
+                let aid_size = std::mem::size_of::<AccountId>();
+                let expected = (outer_len as usize) * ci_size
+                    + (inner_len as usize) * ci_size
+                    + (account_len as usize) * aid_size
+                    + (account_chunk_len as usize) * aid_size
+                    + (ix_count as usize) * 2  // account_chunk_last: u16 per ix
+                    + (ix_count as usize) * 2  // data_chunk_last: u16 per ix
+                    + (outer_len as usize)      // l1_inner: u8 per outer ix
                     + (data_chunk_len as usize);
-                // account_chunk_last + data_chunk_last: ix_count * 2 each
-                let expected2 = expected + (ix_count as usize) * 4;
                 format!(
                     "outer={outer_len} inner={inner_len} account={account_len} \
                      account_chunk={account_chunk_len} data_chunk={data_chunk_len} \
-                     ix_count={ix_count} expected_payload={expected2} available={}",
+                     ix_count={ix_count} expected_payload={expected} available={}",
                     tx_slice.len() - hdr_size
                 )
             } else {
@@ -66,8 +101,7 @@ impl TransactionList {
             };
             panic!(
                 "tx parse failed ({e:?}): start={start} start_tx={start_tx} finish={finish} \
-                 data_len={} | {hdr_info}",
-                self.data.len()
+                 data_len={data_len} aligned={is_aligned} | {hdr_info}",
             )
         });
         Some((tx, r))
@@ -110,7 +144,7 @@ pub struct CatscopeTransaction {
 /// invoked indirectly during execution.
 #[derive(Clone, Copy, Default, SchemaWrite, SchemaRead)]
 #[repr(C, align(8))]
-struct CatscopeInstruction {
+pub struct CatscopeInstruction {
     /// AccountId of the program that executed this instruction.
     program: AccountId,
     data_chunk_i: u16,
@@ -123,7 +157,7 @@ enum IxIndex {
 }
 pub struct CatscopeInstructionRead<'a> {
     i: IxIndex,
-    tx: &'a CatscopeTransaction,
+    tx: CatscopeTransactionReadWrapper<'a>,
 }
 
 impl<'a> CatscopeInstructionRead<'a> {
@@ -352,6 +386,32 @@ pub struct CatscopeTransactionReadWrapper<'a> {
     data_chunk_last: &'a [u16],
 }
 
+impl<'a> From<CatscopeInstructionRead<'a>> for CatscopeTransactionReadWrapper<'a> {
+    fn from(value: CatscopeInstructionRead<'a>) -> Self {
+        value.tx
+    }
+}
+
+impl<'a> CatscopeTransactionReadWrapper<'a> {
+    pub fn ix_inner_len(&'a self) -> usize {
+        self.inner.len()
+    }
+    pub fn ix_inner(self, i: usize) -> CatscopeInstructionRead<'a> {
+        CatscopeInstructionRead {
+            i: IxIndex::Inner(i),
+            tx: self,
+        }
+    }
+    pub fn ix_outer_len(&'a self) -> usize {
+        self.outer.len()
+    }
+    pub fn ix_outer(self, i: usize) -> CatscopeInstructionRead<'a> {
+        CatscopeInstructionRead {
+            i: IxIndex::Outer(i),
+            tx: self,
+        }
+    }
+}
 impl<'a> TryFrom<&'a [u8]> for CatscopeTransactionReadWrapper<'a> {
     type Error = CatscopeGuestError;
 

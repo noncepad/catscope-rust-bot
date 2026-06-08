@@ -43,15 +43,29 @@
 //! a_to_b                 (bool, true = token_a in → token_b out)
 //! ```
 
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    hash::BuildHasherDefault,
+    u32,
+};
+
 use crate::{
-    graph::AccountId,
+    catscope::witbot::shooter::{self, Header, Tokenaccountv1},
+    err::CatscopeGuestError,
+    graph::{AccountId, Graph, Subscription, SubscriptionRequest},
+    log_debug, log_warn,
+    token::{PairAmount, TradeAmount},
     trader::types::{PoolPrice, SwapParams, TraderError},
+    txview::{CatscopeInstruction, CatscopeInstructionRead, CatscopeTransactionReadWrapper},
     util::{account_id_from_pubkey, pubkey_from_account_id},
     wallet::Wallet,
+    TradingSetup,
 };
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 
 // ─── Program IDs ─────────────────────────────────────────────────────────────
@@ -62,10 +76,14 @@ pub const ORCA_WHIRLPOOL_PROGRAM_ID: Pubkey =
 pub const SPL_TOKEN_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
+pub const SPL_MEMO_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
 // ─── Whirlpool account offsets ────────────────────────────────────────────────
 
 const OFF_TICK_SPACING: usize = 41;
 const OFF_FEE_RATE: usize = 45;
+const OFF_LIQUIDITY: usize = 49;
 const OFF_SQRT_PRICE: usize = 65;
 const OFF_TICK_CURRENT: usize = 81;
 const OFF_MINT_A: usize = 101;
@@ -78,10 +96,22 @@ const MIN_WHIRLPOOL_LEN: usize = OFF_VAULT_B + 32;
 /// Number of initialized ticks per tick-array account.
 const TICK_ARRAY_SIZE: i32 = 88;
 
+// ─── Tick-array account offsets ───────────────────────────────────────────────
+// layout: discriminator(8) + start_tick_index(4) + ticks(88×113) + whirlpool(32)
+// Tick size: initialized(1)+liquidity_net(16)+liquidity_gross(16)+fee_growth_a(16)+fee_growth_b(16)+reward_growths(48) = 113
+const OFF_TA_START_INDEX: usize = 8;
+const OFF_TA_WHIRLPOOL: usize = 8 + 4 + 88 * 113; // = 9956
+const MIN_TICK_ARRAY_LEN: usize = OFF_TA_WHIRLPOOL + 32; // = 9988
+
+// ─── Anchor discriminators ────────────────────────────────────────────────────
+
+const DISC_WHIRLPOOL: [u8; 8] = [63, 149, 209, 12, 225, 128, 99, 9];
+const DISC_TICK_ARRAY: [u8; 8] = [69, 97, 189, 190, 110, 7, 66, 187];
+
 // ─── Parsed pool state ────────────────────────────────────────────────────────
 
 /// Parsed state of an Orca Whirlpool pool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OrcaWhirlpool {
     /// Token A mint.
     pub token_mint_a: AccountId,
@@ -91,6 +121,8 @@ pub struct OrcaWhirlpool {
     pub vault_a: AccountId,
     /// Pool's token B vault (subscribe for reserve updates).
     pub vault_b: AccountId,
+    /// Active liquidity in the current tick range (L value from CLMM).
+    pub liquidity: u128,
     /// Current sqrt price Q64.64 fixed-point.
     pub sqrt_price_x64: u128,
     /// Current tick index.
@@ -152,29 +184,190 @@ impl OrcaWhirlpool {
 
     /// Derive the oracle PDA for this pool.
     fn oracle_pda(&self, pool_pk: &Pubkey) -> Pubkey {
-        Pubkey::find_program_address(
-            &[b"oracle", pool_pk.as_ref()],
-            &ORCA_WHIRLPOOL_PROGRAM_ID,
-        )
-        .0
+        Pubkey::find_program_address(&[b"oracle", pool_pk.as_ref()], &ORCA_WHIRLPOOL_PROGRAM_ID).0
     }
 
-    /// Compute the three tick-array PDAs needed for a swap.
+    /// Compute the five tick-array PDAs for a SwapV2 instruction.
     ///
-    /// `a_to_b = true` means price decreases (tick goes down).
-    pub fn tick_arrays(&self, pool_pk: &Pubkey, a_to_b: bool) -> [Pubkey; 3] {
+    /// Layout matches the Orca SDK: [current, +1, +2, -1, -2].
+    /// The first 3 are the named tick_array0/1/2 accounts; the last 2 are
+    /// supplemental remaining accounts. The on-chain program selects what
+    /// it needs based on `a_to_b`.
+    pub fn tick_arrays(&self, pool_pk: &Pubkey) -> [Pubkey; 5] {
         let ts = TICK_ARRAY_SIZE * self.tick_spacing as i32;
         let start_0 = self.tick_array_start(self.tick_current_index);
-        let (start_1, start_2) = if a_to_b {
-            (start_0 - ts, start_0 - 2 * ts)
-        } else {
-            (start_0 + ts, start_0 + 2 * ts)
-        };
         [
             self.tick_array_pda(pool_pk, start_0),
-            self.tick_array_pda(pool_pk, start_1),
-            self.tick_array_pda(pool_pk, start_2),
+            self.tick_array_pda(pool_pk, start_0 + ts),
+            self.tick_array_pda(pool_pk, start_0 + 2 * ts),
+            self.tick_array_pda(pool_pk, start_0 - ts),
+            self.tick_array_pda(pool_pk, start_0 - 2 * ts),
         ]
+    }
+
+    pub fn parse(&mut self, body: &[u8]) -> Result<(), CatscopeGuestError> {
+        if body.len() < MIN_WHIRLPOOL_LEN {
+            return Err(CatscopeGuestError::InsufficientBufferV2(
+                body.len(),
+                MIN_WHIRLPOOL_LEN,
+            ));
+        }
+        let read_u16 = |off: usize| u16::from_le_bytes(body[off..off + 2].try_into().unwrap());
+        let read_u128 = |off: usize| u128::from_le_bytes(body[off..off + 16].try_into().unwrap());
+        let read_i32 = |off: usize| i32::from_le_bytes(body[off..off + 4].try_into().unwrap());
+        let read_pk = |off: usize| -> Pubkey {
+            Pubkey::new_from_array(body[off..off + 32].try_into().unwrap())
+        };
+        let pk_id = |pk: Pubkey| account_id_from_pubkey(&pk);
+        if self.token_mint_a == 0 {
+            self.token_mint_a = pk_id(read_pk(OFF_MINT_A));
+        }
+        if self.token_mint_b == 0 {
+            self.token_mint_b = pk_id(read_pk(OFF_MINT_B));
+        }
+        if self.vault_a == 0 {
+            self.vault_a = pk_id(read_pk(OFF_VAULT_A));
+        }
+        if self.vault_b == 0 {
+            self.vault_b = pk_id(read_pk(OFF_VAULT_B));
+        }
+        assert_ne!(self.vault_a, 0);
+        assert_ne!(self.vault_b, 0);
+        assert_ne!(self.token_mint_a, 0);
+        assert_ne!(self.token_mint_b, 0);
+        self.liquidity = read_u128(OFF_LIQUIDITY);
+        self.sqrt_price_x64 = read_u128(OFF_SQRT_PRICE);
+        self.tick_current_index = read_i32(OFF_TICK_CURRENT);
+        self.tick_spacing = read_u16(OFF_TICK_SPACING);
+        self.fee_rate = read_u16(OFF_FEE_RATE);
+
+        Ok(())
+    }
+
+    pub fn pool_lookup_id(&self) -> [AccountId; 2] {
+        let mut id = [self.token_mint_a, self.token_mint_b];
+        id.sort();
+        id
+    }
+    /// Append an Orca Whirlpool `swap_v2` instruction to the wallet queue.
+    /// Build a SwapV2 instruction deriving tick arrays from PDAs.
+    /// Prefer `build_swap_ix` with map-resolved tick arrays when possible.
+    pub fn build_swap_ix_pda(
+        &self,
+        pool_id: AccountId,
+        params: &SwapParams,
+        wallet: &mut Wallet,
+    ) -> Result<(), TraderError> {
+        let a_to_b = if params.input_mint == self.token_mint_a {
+            true
+        } else if params.input_mint == self.token_mint_b {
+            false
+        } else {
+            return Err(TraderError::WrongMints);
+        };
+        let pool_pk =
+            pubkey_from_account_id(&pool_id).ok_or(TraderError::PubkeyResolutionFailed(pool_id))?;
+        let ts = TICK_ARRAY_SIZE * self.tick_spacing as i32;
+        let start_0 = self.tick_array_start(self.tick_current_index);
+        let ta = if a_to_b {
+            [
+                self.tick_array_pda(&pool_pk, start_0),
+                self.tick_array_pda(&pool_pk, start_0 - ts),
+                self.tick_array_pda(&pool_pk, start_0 - 2 * ts),
+            ]
+        } else {
+            [
+                self.tick_array_pda(&pool_pk, start_0),
+                self.tick_array_pda(&pool_pk, start_0 + ts),
+                self.tick_array_pda(&pool_pk, start_0 + 2 * ts),
+            ]
+        };
+        self.build_swap_ix(pool_id, &ta, params, wallet)
+    }
+
+    /// Build a SwapV2 instruction using caller-supplied tick array pubkeys.
+    ///
+    /// `tick_arrays` must be 3 initialised accounts in swap-direction order.
+    pub fn build_swap_ix(
+        &self,
+        pool_id: AccountId,
+        tick_arrays: &[Pubkey; 3],
+        params: &SwapParams,
+        wallet: &mut Wallet,
+    ) -> Result<(), TraderError> {
+        let a_to_b = if params.input_mint == self.token_mint_a
+            && params.output_mint == self.token_mint_b
+        {
+            true
+        } else if params.input_mint == self.token_mint_b && params.output_mint == self.token_mint_a
+        {
+            false
+        } else {
+            return Err(TraderError::WrongMints);
+        };
+
+        let resolve = |id: AccountId| -> Result<Pubkey, TraderError> {
+            pubkey_from_account_id(&id).ok_or(TraderError::PubkeyResolutionFailed(id))
+        };
+
+        let pool_pk = resolve(pool_id)?;
+        let mint_a_pk = resolve(self.token_mint_a)?;
+        let mint_b_pk = resolve(self.token_mint_b)?;
+        let vault_a_pk = resolve(self.vault_a)?;
+        let vault_b_pk = resolve(self.vault_b)?;
+        let user_source_pk = resolve(params.user_source_token_account)?;
+        let user_dest_pk = resolve(params.user_destination_token_account)?;
+        let user_wallet_pk = resolve(params.user_wallet)?;
+
+        let oracle_pk = self.oracle_pda(&pool_pk);
+
+        let (user_a_pk, user_b_pk) = if a_to_b {
+            (user_source_pk, user_dest_pk)
+        } else {
+            (user_dest_pk, user_source_pk)
+        };
+
+        // SwapV2 instruction data (43 bytes):
+        //   discriminator(8) + amount(8) + other_amount_threshold(8) +
+        //   sqrt_price_limit(16) + amount_specified_is_input(1) + a_to_b(1) +
+        //   remaining_accounts_info = None → [0] (1 byte)
+        let mut data = Vec::with_capacity(43);
+        data.extend_from_slice(&SWAP_V2_DISCRIMINATOR);
+        data.extend_from_slice(&params.amount_in.to_le_bytes());
+        data.extend_from_slice(&params.min_amount_out.to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes()); // sqrt_price_limit (no limit)
+        data.push(1u8); // amount_specified_is_input = true
+        data.push(if a_to_b { 1u8 } else { 0u8 });
+        data.push(0u8); // remaining_accounts_info = None
+
+        let mut accounts = Vec::with_capacity(15);
+        accounts.push(AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false)); // token_program_a
+        accounts.push(AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false)); // token_program_b
+        accounts.push(AccountMeta::new_readonly(SPL_MEMO_PROGRAM_ID, false)); // memo_program
+        accounts.push(AccountMeta::new_readonly(user_wallet_pk, true)); // token_authority
+        accounts.push(AccountMeta::new(pool_pk, false)); // whirlpool
+        accounts.push(AccountMeta::new_readonly(mint_a_pk, false)); // token_mint_a
+        accounts.push(AccountMeta::new_readonly(mint_b_pk, false)); // token_mint_b
+        accounts.push(AccountMeta::new(user_a_pk, false)); // token_owner_account_a
+        accounts.push(AccountMeta::new(vault_a_pk, false)); // token_vault_a
+        accounts.push(AccountMeta::new(user_b_pk, false)); // token_owner_account_b
+        accounts.push(AccountMeta::new(vault_b_pk, false)); // token_vault_b
+        accounts.push(AccountMeta::new(tick_arrays[0], false)); // tick_array_0 (current)
+        accounts.push(AccountMeta::new(tick_arrays[1], false)); // tick_array_1 (step 1)
+        accounts.push(AccountMeta::new(tick_arrays[2], false)); // tick_array_2 (step 2)
+        accounts.push(AccountMeta::new(oracle_pk, false)); // oracle
+
+        wallet.require_signer(params.user_wallet);
+        wallet.append_ix(
+            Instruction {
+                program_id: ORCA_WHIRLPOOL_PROGRAM_ID,
+                accounts,
+                data,
+            },
+            ORCA_WHIRLPOOL_SWAP_CU,
+        );
+
+        Ok(())
     }
 }
 
@@ -194,9 +387,8 @@ pub fn parse(body: &[u8]) -> Option<OrcaWhirlpool> {
     let read_u16 = |off: usize| u16::from_le_bytes(body[off..off + 2].try_into().unwrap());
     let read_u128 = |off: usize| u128::from_le_bytes(body[off..off + 16].try_into().unwrap());
     let read_i32 = |off: usize| i32::from_le_bytes(body[off..off + 4].try_into().unwrap());
-    let read_pk = |off: usize| -> Pubkey {
-        Pubkey::new_from_array(body[off..off + 32].try_into().unwrap())
-    };
+    let read_pk =
+        |off: usize| -> Pubkey { Pubkey::new_from_array(body[off..off + 32].try_into().unwrap()) };
     let pk_id = |pk: Pubkey| account_id_from_pubkey(&pk);
 
     Some(OrcaWhirlpool {
@@ -204,6 +396,7 @@ pub fn parse(body: &[u8]) -> Option<OrcaWhirlpool> {
         token_mint_b: pk_id(read_pk(OFF_MINT_B)),
         vault_a: pk_id(read_pk(OFF_VAULT_A)),
         vault_b: pk_id(read_pk(OFF_VAULT_B)),
+        liquidity: read_u128(OFF_LIQUIDITY),
         sqrt_price_x64: read_u128(OFF_SQRT_PRICE),
         tick_current_index: read_i32(OFF_TICK_CURRENT),
         tick_spacing: read_u16(OFF_TICK_SPACING),
@@ -212,95 +405,478 @@ pub fn parse(body: &[u8]) -> Option<OrcaWhirlpool> {
         reserve_b: 0,
     })
 }
-
 // ─── Swap instruction builder ─────────────────────────────────────────────────
 
 /// Compute units budgeted for an Orca Whirlpool swap.
 pub const ORCA_WHIRLPOOL_SWAP_CU: u32 = 300_000;
 
-/// Anchor discriminator for the `swap` instruction.
-///
-/// First 8 bytes of `sha256("global:swap")`.
-pub const SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
+/// Anchor discriminator for the `swap_v2` instruction.
+pub const SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
 
-/// Append an Orca Whirlpool `swap` instruction to the wallet queue.
-///
-/// Tick-array PDAs are derived automatically from the pool's current tick
-/// and tick spacing. `sqrt_price_limit` is set to 0 (no limit).
+/// Append an Orca Whirlpool `swap_v2` instruction to the wallet queue.
 pub fn build_swap_ix(
     pool_id: AccountId,
     pool: &OrcaWhirlpool,
+    tick_arrays: &[Pubkey; 3],
     params: &SwapParams,
     wallet: &mut Wallet,
 ) -> Result<(), TraderError> {
-    let a_to_b = if params.input_mint == pool.token_mint_a
-        && params.output_mint == pool.token_mint_b
-    {
-        true
-    } else if params.input_mint == pool.token_mint_b && params.output_mint == pool.token_mint_a {
-        false
-    } else {
-        return Err(TraderError::WrongMints);
-    };
+    pool.build_swap_ix(pool_id, tick_arrays, params, wallet)
+}
 
-    let resolve = |id: AccountId| -> Result<Pubkey, TraderError> {
-        pubkey_from_account_id(&id).ok_or(TraderError::PubkeyResolutionFailed(id))
-    };
+#[derive(Default)]
+struct InfoWithVersion<M: Default> {
+    firstshred: M,
+    root: M,
+    version: u64,
+}
 
-    let pool_pk = resolve(pool_id)?;
-    let vault_a_pk = resolve(pool.vault_a)?;
-    let vault_b_pk = resolve(pool.vault_b)?;
-    let user_source_pk = resolve(params.user_source_token_account)?;
-    let user_dest_pk = resolve(params.user_destination_token_account)?;
-    let user_wallet_pk = resolve(params.user_wallet)?;
+/// Parsed state of an Orca tick-array account.
+#[derive(Debug, Clone)]
+pub struct ParsedTickArray {
+    /// The start tick index of this array (identifies its position in the pool's range).
+    pub start_tick_index: i32,
+    /// Pool (whirlpool) this tick array belongs to.
+    pub whirlpool: AccountId,
+}
 
-    let tick_arrays = pool.tick_arrays(&pool_pk, a_to_b);
-    let tick_array_pks = tick_arrays.map(|pk| {
-        account_id_from_pubkey(&pk);
-        pk
-    });
+pub struct OrcaState {
+    has_check_pool: bool,
+    count: usize,
+    parsed_count: usize,
+    tx_count: usize,
+    program_id: AccountId,
+    l_pool: Vec<PoolInfo>,
+    // map [mint_a,mint_b]->pool AccountId
+    m_pair: HashMap<[AccountId; 2], HashSet<usize>>,
+    q_update_pool: VecDeque<AccountId>,
+    // map vault token account id -> pool index in l_pool
+    m_vault: HashMap<AccountId, usize>,
+    // map tick_array account_id -> parsed tick array
+    m_tick_array: HashMap<AccountId, ParsedTickArray>,
+    // map pool_id -> { start_tick_index -> tick_array account_id }
+    m_pool_tick_arrays: HashMap<AccountId, HashMap<i32, AccountId>>,
+    l_token_sub: Vec<SubscriptionRequest>,
+    q_hold_sub: VecDeque<Vec<Subscription>>,
+    pending_token_counted: usize,
+}
+impl std::fmt::Debug for OrcaState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrcaState").finish()
+    }
+}
+struct TokenSubRequest {
+    pool_id: AccountId,
+    token_a: AccountId,
+    token_b: AccountId,
+}
+#[derive(Debug)]
+enum PoolTokenSubscribeStage {
+    Waiting,
+    Found(usize),
+}
 
-    let oracle_pk = pool.oracle_pda(&pool_pk);
+#[derive(Debug)]
+struct PoolInfo {
+    id: AccountId,
+    stage: PoolTokenSubscribeStage,
+    o_sub: Option<Subscription>,
+    last_root: Slot,
+    root: OrcaWhirlpool,
+    last_processed: Slot,
+    processed: OrcaWhirlpool,
+    last_tx: Slot,
+    mint_a: AccountId,
+    vault_a_balance: (u64, Slot),
+    mint_b: AccountId,
+    vault_b_balance: (u64, Slot),
+}
 
-    // Instruction data (43 bytes)
-    let mut data = Vec::with_capacity(43);
-    data.extend_from_slice(&SWAP_DISCRIMINATOR);
-    data.extend_from_slice(&params.amount_in.to_le_bytes());           // amount
-    data.extend_from_slice(&params.min_amount_out.to_le_bytes());      // other_amount_threshold
-    data.extend_from_slice(&0u128.to_le_bytes());                      // sqrt_price_limit (no limit)
-    data.push(1u8);                                                     // amount_specified_is_input = true
-    data.push(if a_to_b { 1u8 } else { 0u8 });                        // a_to_b
+impl Drop for PoolInfo {
+    fn drop(&mut self) {
+        let _ignore = self.o_sub.take();
+    }
+}
+impl OrcaState {
+    pub fn new(g: &Graph, trading: &TradingSetup) -> Result<Self, CatscopeGuestError> {
+        let l_ops = trading.orca();
+        let count = l_ops.len();
+        let mut l_pool = Vec::with_capacity(count);
+        let check_pool_id = {
+            let pubkey = Pubkey::from_str_const("Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE");
+            account_id_from_pubkey(&pubkey)
+        };
+        let mut has_check_pool = false;
+        let mut l_req = Vec::with_capacity(l_ops.len());
 
-    // Determine which user token accounts are A and B
-    let (user_a_pk, user_b_pk) = if a_to_b {
-        (user_source_pk, user_dest_pk)
-    } else {
-        (user_dest_pk, user_source_pk)
-    };
+        let mut hs_duplicate = HashSet::with_capacity(l_ops.len());
+        for ops in l_ops.iter() {
+            if !hs_duplicate.insert(ops.pubkey) {
+                continue;
+            }
+            if ops.pubkey == check_pool_id {
+                has_check_pool = true;
+            }
+            // subscribe to each pool and corresponding tick arrays
+            l_req.push(SubscriptionRequest {
+                root: ops.pubkey,
+                filter_weight: u32::MAX,
+                depth: 2,
+            });
+        }
+        let req_n = l_req.len();
+        log_warn!("OrcaState::subscribe {req_n} - 1");
+        let l_sub = g.bulk_subscribe(l_req)?;
+        log_warn!("OrcaState::subscribe {req_n} - 2");
+        assert_eq!(l_sub.len(), req_n);
+        for (i, s) in l_sub.into_iter().enumerate() {
+            let ops = &l_ops[i];
+            l_pool.push(PoolInfo {
+                vault_a_balance: (0, 0),
+                vault_b_balance: (0, 0),
+                stage: PoolTokenSubscribeStage::Waiting,
+                last_tx: 0,
+                id: ops.pubkey,
+                o_sub: Some(s),
+                last_root: 0,
+                root: OrcaWhirlpool::default(),
+                last_processed: 0,
+                processed: OrcaWhirlpool::default(),
+                mint_a: ops.mint_a,
+                mint_b: ops.mint_b,
+            });
+        }
+        let mut m_pair = HashMap::with_capacity(2 * l_ops.len());
+        l_pool.sort_unstable_by_key(|p| p.id);
+        for (i, pool) in l_pool.iter().enumerate() {
+            let mut id = [pool.mint_a, pool.mint_b];
+            id.sort();
+            let hs_pubkey: &mut HashSet<usize> = m_pair.entry(id).or_default();
+            hs_pubkey.insert(i);
+        }
+        let orca_program_id = account_id_from_pubkey(&ORCA_WHIRLPOOL_PROGRAM_ID);
 
-    let accounts = vec![
-        AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
-        AccountMeta::new_readonly(user_wallet_pk, true),  // token_authority (signer)
-        AccountMeta::new(pool_pk, false),
-        AccountMeta::new(user_a_pk, false),
-        AccountMeta::new(vault_a_pk, false),
-        AccountMeta::new(user_b_pk, false),
-        AccountMeta::new(vault_b_pk, false),
-        AccountMeta::new(tick_array_pks[0], false),
-        AccountMeta::new(tick_array_pks[1], false),
-        AccountMeta::new(tick_array_pks[2], false),
-        AccountMeta::new_readonly(oracle_pk, false),
-    ];
+        if let Ok(i) = l_pool.binary_search_by_key(&check_pool_id, |p| p.id) {
+            assert_eq!(check_pool_id, l_pool[i].id);
+        }
 
-    wallet.require_signer(params.user_wallet);
-    wallet.append_ix(
-        Instruction {
-            program_id: ORCA_WHIRLPOOL_PROGRAM_ID,
-            accounts,
-            data,
-        },
-        ORCA_WHIRLPOOL_SWAP_CU,
-    );
+        Ok(Self {
+            pending_token_counted: 0,
+            has_check_pool,
+            count: 0,
+            parsed_count: 0,
+            tx_count: 0,
+            l_pool,
+            m_pair,
+            q_update_pool: VecDeque::with_capacity(20),
+            program_id: orca_program_id,
+            m_vault: HashMap::with_capacity(100_000),
+            m_tick_array: HashMap::new(),
+            m_pool_tick_arrays: HashMap::new(),
+            l_token_sub: Vec::with_capacity(100_000),
+            q_hold_sub: VecDeque::new(),
+        })
+    }
 
-    Ok(())
+    #[inline]
+    pub fn program_id(&self) -> &AccountId {
+        &self.program_id
+    }
+
+    /// Look up all known tick arrays for a pool, keyed by start_tick_index.
+    pub fn tick_arrays_for_pool(&self, pool_id: &AccountId) -> Option<&HashMap<i32, AccountId>> {
+        self.m_pool_tick_arrays.get(pool_id)
+    }
+
+    /// Look up a single tick array by pool and start_tick_index.
+    pub fn tick_array_by_start(
+        &self,
+        pool_id: &AccountId,
+        start_tick_index: i32,
+    ) -> Option<AccountId> {
+        self.m_pool_tick_arrays
+            .get(pool_id)?
+            .get(&start_tick_index)
+            .copied()
+    }
+    pub fn has_check_pool(&self) -> bool {
+        self.has_check_pool
+    }
+    pub fn count(&self) -> (usize, usize, usize) {
+        (self.count, self.parsed_count, self.tx_count)
+    }
+    pub fn flush_pool(&mut self, g: &Graph) -> Result<(), CatscopeGuestError> {
+        let mut l_req = Vec::with_capacity(1_000);
+        std::mem::swap(&mut l_req, &mut self.l_token_sub);
+        let l_sub_id = g.bulk_subscribe(l_req)?;
+        self.q_hold_sub.push_back(l_sub_id);
+        Ok(())
+    }
+    /// l_account_id is sorted in ascending order
+    pub fn on_tx(&mut self, ix: &CatscopeInstructionRead<'_>, slot: &Slot) {
+        let l_account_id = ix.account();
+        //        ix.data();
+        let (mut i, mut j) = (0, 0);
+        while i < l_account_id.len() && j < self.l_pool.len() {
+            let x = l_account_id[i];
+            let y = self.l_pool[j].id;
+            if x < y {
+                i += 1;
+            } else if y < x {
+                j += 1;
+            } else {
+                self.tx_count += 1;
+                self.l_pool[j].last_tx = *slot;
+                self.l_pool[j].last_processed = *slot;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    pub fn on_account(
+        &mut self,
+        header: &Header,
+        body: &[u8],
+        is_final: bool,
+    ) -> Result<(), CatscopeGuestError> {
+        if header.owner != self.program_id {
+            return Ok(());
+        }
+        if body.len() < 8 {
+            return Ok(());
+        }
+        if body[..8] == DISC_WHIRLPOOL {
+            if !is_final {
+                self.count += 1;
+            }
+            if let Some(i) = self
+                .l_pool
+                .binary_search_by_key(&header.accountid, |p| p.id)
+                .ok()
+            {
+                // OFF_* constants are absolute offsets from byte 0 (including discriminator).
+                // Pass the full body so the constants align correctly.
+                {
+                    let pool = &mut self.l_pool[i];
+                    let vault_a;
+                    let vault_b;
+                    if is_final {
+                        pool.root.parse(body)?;
+                        pool.last_root = header.slot;
+                        if pool.last_processed < header.slot {
+                            pool.processed = pool.root.clone();
+                        }
+                        vault_a = pool.root.vault_a;
+                        vault_b = pool.root.vault_b;
+                    } else {
+                        self.parsed_count += 1;
+                        pool.last_processed = header.slot;
+                        pool.processed.parse(body)?;
+                        vault_a = pool.processed.vault_a;
+                        vault_b = pool.processed.vault_b;
+                    }
+                    assert_ne!(vault_a, vault_b);
+                    if let PoolTokenSubscribeStage::Waiting = pool.stage {
+                        pool.stage = PoolTokenSubscribeStage::Found(0);
+                        for v in [vault_a, vault_b] {
+                            self.l_token_sub.push(SubscriptionRequest {
+                                root: v,
+                                filter_weight: u32::MAX,
+                                depth: 1,
+                            });
+                            self.m_vault.insert(v, i);
+                        }
+                    }
+                }
+            }
+        } else if body[..8] == DISC_TICK_ARRAY {
+            if body.len() < MIN_TICK_ARRAY_LEN {
+                return Ok(());
+            }
+            let start_tick_index = i32::from_le_bytes(
+                body[OFF_TA_START_INDEX..OFF_TA_START_INDEX + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let whirlpool_pk = Pubkey::new_from_array(
+                body[OFF_TA_WHIRLPOOL..OFF_TA_WHIRLPOOL + 32]
+                    .try_into()
+                    .unwrap(),
+            );
+            let whirlpool = account_id_from_pubkey(&whirlpool_pk);
+            let ta_id = header.accountid;
+            self.m_tick_array
+                .entry(ta_id)
+                .and_modify(|e| e.start_tick_index = start_tick_index)
+                .or_insert(ParsedTickArray {
+                    start_tick_index,
+                    whirlpool,
+                });
+            self.m_pool_tick_arrays
+                .entry(whirlpool)
+                .or_default()
+                .insert(start_tick_index, ta_id);
+        }
+        Ok(())
+    }
+
+    /// Called for every low-latency token account update.
+    /// When the update is for a pool vault, fetches the fresh pool state via account_by_id
+    /// so that processed price/tick reflect changes before the next commit.
+    pub fn on_token(&mut self, ta: &Tokenaccountv1) -> Result<(), CatscopeGuestError> {
+        let pool_i = match self.m_vault.get(&ta.id) {
+            Some(&i) => i,
+            None => return Ok(()),
+        };
+
+        let pool = &mut self.l_pool[pool_i];
+        let mut add_pending_token_counted = 0;
+        match pool.stage {
+            PoolTokenSubscribeStage::Waiting => panic!("not possible"),
+            PoolTokenSubscribeStage::Found(n) => {
+                if n < 2 {
+                    pool.stage = PoolTokenSubscribeStage::Found(n + 1);
+                    add_pending_token_counted += 1;
+                }
+            }
+        };
+        if pool.mint_a == ta.mint {
+            pool.vault_a_balance = (ta.amount, ta.slot);
+        } else if pool.mint_b == ta.mint {
+            pool.vault_b_balance = (ta.amount, ta.slot);
+        } else {
+            panic!("pool token mismatch: {pool:?} {ta:?}")
+        }
+        // Update the reserve we know from the token account directly.
+        {
+            let pool2 = &mut self.l_pool[pool_i];
+            if ta.id == pool2.root.vault_a {
+                pool2.processed.reserve_a = ta.amount;
+            } else if ta.id == pool2.root.vault_b {
+                pool2.processed.reserve_b = ta.amount;
+            }
+        }
+        self.pending_token_counted += add_pending_token_counted;
+        Ok(())
+    }
+
+    /// Swap tokens through the best-priced pool for the given mint pair.
+    ///
+    /// "Best" means the pool that maximises the fee-adjusted output per input unit,
+    /// taking swap direction into account:
+    ///   - A→B (`input_mint == token_mint_a`): higher spot price is better.
+    ///   - B→A (`input_mint == token_mint_b`): lower spot price is better (more A per B).
+    ///
+    /// `min_amount_out` on `params` is overwritten using `set_min_amount_out` with
+    /// the winning pool's fee-adjusted directional price and `max_slippage`.
+    pub fn swap(
+        &self,
+        params: &mut SwapParams,
+        wallet: &mut Wallet,
+        max_slippage: f64,
+    ) -> Result<(), CatscopeGuestError> {
+        let pool_lookup_id = params.pool_lookup_id();
+        // look up the set of pools that trade mint_a and mint_b.
+        let hs_set = match self.m_pair.get(&pool_lookup_id) {
+            Some(x) => x,
+            None => {
+                return Err(CatscopeGuestError::MissingPool(
+                    pool_lookup_id[0],
+                    pool_lookup_id[1],
+                ))
+            }
+        };
+
+        // We always want to maximise output-per-input after fees, regardless of
+        // direction, so normalise both cases into a single "directional price"
+        // (output raw units per input raw unit, fee-adjusted).
+        let mut best_i: Option<usize> = None;
+        let mut best_directional_price = f64::NEG_INFINITY;
+
+        for &i in hs_set.iter() {
+            let pool = &self.l_pool[i];
+            let whirlpool = if pool.last_processed >= pool.last_root {
+                &pool.processed
+            } else {
+                &pool.root
+            };
+            if whirlpool.liquidity == 0 {
+                continue;
+            }
+            let spot = whirlpool.spot_price();
+            if spot == 0.0 {
+                continue;
+            }
+            // fee_rate is in hundredths of a basis point (3000 → 0.30%)
+            let fee_fraction = whirlpool.fee_rate as f64 / 1_000_000.0;
+            let directional = if params.input_mint == whirlpool.token_mint_a {
+                // A→B: output_B per input_A
+                spot * (1.0 - fee_fraction)
+            } else {
+                // B→A: output_A per input_B
+                (1.0 / spot) * (1.0 - fee_fraction)
+            };
+            if directional > best_directional_price {
+                best_directional_price = directional;
+                best_i = Some(i);
+            }
+        }
+
+        let i = best_i.ok_or(CatscopeGuestError::MissingPool(
+            pool_lookup_id[0],
+            pool_lookup_id[1],
+        ))?;
+
+        let pool = &self.l_pool[i];
+        let whirlpool = if pool.last_processed >= pool.last_root {
+            &pool.processed
+        } else {
+            &pool.root
+        };
+
+        params.set_min_amount_out(best_directional_price, max_slippage);
+
+        let a_to_b = params.input_mint == whirlpool.token_mint_a;
+        let ts = TICK_ARRAY_SIZE * whirlpool.tick_spacing as i32;
+        let start_0 = whirlpool.tick_array_start(whirlpool.tick_current_index);
+        let pool_pk =
+            pubkey_from_account_id(&pool.id).ok_or(CatscopeGuestError::MissingPool(pool.id, 0))?;
+
+        let ta_starts = if a_to_b {
+            [start_0, start_0 - ts, start_0 - 2 * ts]
+        } else {
+            [start_0, start_0 + ts, start_0 + 2 * ts]
+        };
+
+        log_warn!(
+            "swap: pool={} a_to_b={} tick={} spacing={} ts={} starts={:?}",
+            pool.id,
+            a_to_b,
+            whirlpool.tick_current_index,
+            whirlpool.tick_spacing,
+            ts,
+            ta_starts
+        );
+
+        let tick_arrays: [Pubkey; 3] = ta_starts.map(|start| {
+            if let Some(ta_id) = self.tick_array_by_start(&pool.id, start) {
+                if let Some(pk) = pubkey_from_account_id(&ta_id) {
+                    log_warn!("  ta start={} -> map id={} pk={}", start, ta_id, pk);
+                    return pk;
+                }
+            }
+            let pk = whirlpool.tick_array_pda(&pool_pk, start);
+            log_warn!("  ta start={} -> PDA fallback pk={}", start, pk);
+            pk
+        });
+
+        whirlpool.build_swap_ix(pool.id, &tick_arrays, params, wallet)?;
+        Ok(())
+    }
+}
+
+pub struct OrcaPoolSetup {
+    pub pubkey: AccountId,
+    pub mint_a: AccountId,
+    pub mint_b: AccountId,
 }

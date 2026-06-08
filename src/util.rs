@@ -11,13 +11,11 @@ pub enum LogLevel {
 
 pub fn log_level() -> LogLevel {
     static LEVEL: OnceLock<LogLevel> = OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        match std::env::var("LOG_LEVEL").as_deref() {
-            Ok("DEBUG") => LogLevel::Debug,
-            Ok("WARN") => LogLevel::Warn,
-            Ok("ERROR") => LogLevel::Error,
-            _ => LogLevel::Info,
-        }
+    *LEVEL.get_or_init(|| match std::env::var("LOG_LEVEL").as_deref() {
+        Ok("DEBUG") => LogLevel::Debug,
+        Ok("WARN") => LogLevel::Warn,
+        Ok("ERROR") => LogLevel::Error,
+        _ => LogLevel::Info,
     })
 }
 
@@ -26,11 +24,37 @@ pub fn start_time() -> Instant {
     *START.get_or_init(Instant::now)
 }
 
+pub struct PacketHolder {
+    pub p: StdioPacket,
+}
+
+impl PacketHolder {
+    pub fn log(&mut self, data: &[u8]) {
+        self.p.append(data);
+    }
+}
+
+struct SyncCell(UnsafeCell<PacketHolder>);
+unsafe impl Sync for SyncCell {}
+unsafe impl Send for SyncCell {}
+
+static GLOBAL_PACKET: OnceLock<SyncCell> = OnceLock::new();
+
+pub fn packet_holder() -> &'static mut PacketHolder {
+    let cell = GLOBAL_PACKET.get_or_init(|| {
+        SyncCell(UnsafeCell::new(PacketHolder {
+            p: StdioPacket::stderr(),
+        }))
+    });
+    unsafe { &mut *cell.0.get() }
+}
+
 #[macro_export]
 macro_rules! log_debug {
     ($($arg:tt)*) => {
         if $crate::util::log_level() <= $crate::util::LogLevel::Debug {
-            eprintln!("[DEBUG] [{:.3?}] {}", $crate::util::start_time().elapsed(), format_args!($($arg)*));
+            let msg = format!("[DEBUG] [{:.3?}] {}\n", $crate::util::start_time().elapsed(), format_args!($($arg)*));
+            $crate::util::packet_holder().log(msg.as_bytes());
         }
     };
 }
@@ -39,7 +63,8 @@ macro_rules! log_debug {
 macro_rules! log_info {
     ($($arg:tt)*) => {
         if $crate::util::log_level() <= $crate::util::LogLevel::Info {
-            eprintln!("[INFO]  [{:.3?}] {}", $crate::util::start_time().elapsed(), format_args!($($arg)*));
+            let msg = format!("[INFO]  [{:.3?}] {}\n", $crate::util::start_time().elapsed(), format_args!($($arg)*));
+            $crate::util::packet_holder().log(msg.as_bytes());
         }
     };
 }
@@ -48,7 +73,8 @@ macro_rules! log_info {
 macro_rules! log_warn {
     ($($arg:tt)*) => {
         if $crate::util::log_level() <= $crate::util::LogLevel::Warn {
-            eprintln!("[WARN]  [{:.3?}] {}", $crate::util::start_time().elapsed(), format_args!($($arg)*));
+            let msg = format!("[WARN]  [{:.3?}] {}\n", $crate::util::start_time().elapsed(), format_args!($($arg)*));
+            $crate::util::packet_holder().log(msg.as_bytes());
         }
     };
 }
@@ -57,12 +83,13 @@ macro_rules! log_warn {
 macro_rules! log_error {
     ($($arg:tt)*) => {
         if $crate::util::log_level() <= $crate::util::LogLevel::Error {
-            eprintln!("[ERROR] [{:.3?}] {}", $crate::util::start_time().elapsed(), format_args!($($arg)*));
+            let msg = format!("[ERROR] [{:.3?}] {}\n", $crate::util::start_time().elapsed(), format_args!($($arg)*));
+            $crate::util::packet_holder().log(msg.as_bytes());
         }
     };
 }
 
-use crate::{catscope::witbot::shooter, graph::AccountId};
+use crate::{catscope::witbot::shooter, graph::AccountId, stdio::StdioPacket};
 use solana_sdk::pubkey::Pubkey;
 
 pub fn pubkey_from_account_id(account_id: &AccountId) -> Option<Pubkey> {

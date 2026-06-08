@@ -110,20 +110,23 @@ interface shooter{
     slot: u64,
     version: u64,
     lamports: u64,
-    rentepoch: u64,
     accountid: u64,
     owner: u64,
     datasize: u32,
   }
+
   record accountv1{
     header: header,
     body: list<u8>,
   }
+
   record tokenaccountv1{
     id: u64,
     owner: u64,
     mint: u64,
     amount: u64,
+    slot: u64,
+    version: u64,
   }
 
   record slotstatus{
@@ -131,14 +134,30 @@ interface shooter{
     status: u8,
   }
 
+  record eventitem{
+    ack: list<u32>,
+    commitslot: option<u64>,
+    commit: option<commit>,
+    txdata: option<list<u8>>,
+    txborder: option<list<u32>>,
+    tokendata: option<list<u8>>,
+    tokenborder: option<list<u32>>,
+    accountdata: option<list<u8>>,
+    accountborder: option<list<u32>>,
+    slotstatus: list<slotstatus>,
+
+  }
+
   resource client {
     // return the next account. error if there is no more accounts to process.
     subscribe: func(id: u64,filter: u32,depth: u32)->result<u32,error-code>;
+    bulksubscribe: func(sub: list<tuple<u64,u32,u32>>)->result<list<u32>,error-code>;
     // get notifications on when there is information to read
     poll: func()->u32;
     // when the poll says data is available, call the read function
     // list<u8>,list<u32>=[]tx
-    read: func()->tuple<option<u32>,option<u64>,option<commit>,list<u8>,list<u32>,list<tokenaccountv1>,list<accountv1>,list<slotstatus>>;
+    read: func()->eventitem;
+    ignore: func()->tuple<accountv1,tokenaccountv1>;
     cancel: func(subid:u32);
   }
 

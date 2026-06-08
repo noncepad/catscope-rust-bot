@@ -1,35 +1,47 @@
 use crate::{
-    catscope::witbot::{shooter::Header, transactionprocessor},
+    catscope::witbot::{
+        shooter::{Header, Tokenaccountv1},
+        transactionprocessor,
+    },
     err::CatscopeGuestError,
-    graph::{AccountId, Graph, Subscription},
+    graph::{AccountId, Graph, Lamports, Subscription},
+    token::TokenDatabase,
     tx::ComputeUnit,
-    util::account_id_from_pubkey,
+    util::{account_id_from_pubkey, pubkey_from_account_id, rc_unlock},
 };
 use bincode;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::{
     hash::Hash,
-    message::Instruction,
+    message::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signature},
     signer::Signer,
     transaction::Transaction,
 };
 use solana_sdk_ids::system_program::ID as SystemProgramID;
-use std::collections::{HashMap, HashSet, VecDeque};
-
+use spl_associated_token_account::{
+    get_associated_token_address, instruction::create_associated_token_account,
+};
+use std::{
+    cell::UnsafeCell,
+    collections::{HashMap, HashSet, VecDeque},
+    rc::Rc,
+};
 pub struct Wallet {
     m_key: HashMap<AccountId, SignerStatus>,
     q_ix: VecDeque<Instruction>,
     compute: ComputeUnit,
+    token: TokenDatabase,
     sys_id: AccountId,
     tx_data: Box<[u8; 4 * 1024]>,
     payer: Option<AccountId>,
+    m_cache_pubkey: HashMap<AccountId, Pubkey>,
     hs_required: HashSet<AccountId>,
 }
 
 struct SignerStatus {
-    key: Box<Keypair>,
+    key: Rc<UnsafeCell<Keypair>>,
     header: Header,
     sub: Subscription,
 }
@@ -43,7 +55,9 @@ impl Default for Wallet {
 impl Wallet {
     pub fn new() -> Self {
         Self {
+            m_cache_pubkey: HashMap::default(),
             payer: None,
+            token: TokenDatabase::default(),
             tx_data: Box::new([0u8; 4 * 1024]),
             m_key: HashMap::default(),
             q_ix: VecDeque::default(),
@@ -63,21 +77,27 @@ impl Wallet {
     /// This also includes doing a graph subscription to get Lamport updates.
     pub fn append_key(
         &mut self,
-        key: Box<Keypair>,
+        keypair: Rc<UnsafeCell<Keypair>>,
         g1: &mut Graph,
     ) -> Result<AccountId, CatscopeGuestError> {
+        let key = rc_unlock(&keypair);
         let pubkey = key.pubkey();
         let signer = account_id_from_pubkey(&pubkey);
-        let sub = g1.subscribe(signer, u32::MAX, 1)?;
+        // get SOL and token accounts
+        let sub = g1.subscribe(crate::graph::SubscriptionRequest {
+            root: signer,
+            filter_weight: u32::MAX,
+            depth: 2,
+        })?;
+
         self.m_key.insert(
             signer,
             SignerStatus {
-                key,
+                key: keypair,
                 header: Header {
                     slot: 0,
                     version: 0,
                     lamports: 0,
-                    rentepoch: 0,
                     accountid: 0,
                     owner: 0,
                     datasize: 0,
@@ -98,7 +118,25 @@ impl Wallet {
 
     pub fn payer_pubkey(&self) -> Option<Pubkey> {
         let payer_id = self.payer?;
-        Some(self.m_key.get(&payer_id)?.key.pubkey())
+        let ss = self.m_key.get(&payer_id)?;
+        let keypair = rc_unlock(&ss.key);
+        Some(keypair.pubkey())
+    }
+
+    /// Update the signer system account status (includes SOL balance).
+    pub fn on_token(&mut self, a: &Tokenaccountv1, is_final: bool) -> bool {
+        let x = self.m_key.contains_key(&a.owner);
+        if x {
+            self.token.on_token(a, is_final);
+        }
+        x
+    }
+
+    pub fn token(&self) -> &TokenDatabase {
+        &self.token
+    }
+    pub fn token_mut(&mut self) -> &mut TokenDatabase {
+        &mut self.token
     }
 
     /// Update the signer system account status (includes SOL balance).
@@ -112,6 +150,30 @@ impl Wallet {
         } else {
             false
         }
+    }
+
+    pub fn balance_sol(&self, signer_account_id: &AccountId) -> Option<Lamports> {
+        let ss = self.m_key.get(signer_account_id)?;
+        Some(ss.header.lamports)
+    }
+    fn pubkey_from_account_id(&mut self, account_id: &AccountId) -> Option<Pubkey> {
+        if let Some(pubkey) = self.m_cache_pubkey.get(account_id) {
+            Some(*pubkey)
+        } else {
+            let pubkey = pubkey_from_account_id(account_id)?;
+            self.m_cache_pubkey.insert(*account_id, pubkey);
+            Some(pubkey)
+        }
+    }
+    /// Derive the ATA for `owner`+`mint`, append a `CreateIdempotent` instruction,
+    /// and return the ATA pubkey. Returns `None` if no payer is set.
+    pub fn append_create_ata(&mut self, owner: AccountId, mint: AccountId) -> Option<AccountId> {
+        let owner_pubkey = self.pubkey_from_account_id(&owner)?;
+        let mint_pubkey = self.pubkey_from_account_id(&mint)?;
+        let ix = make_ata_instruction(&owner_pubkey, &owner_pubkey, &mint_pubkey);
+        let ata_address: Pubkey = get_associated_token_address(&owner_pubkey, &mint_pubkey);
+        self.append_ix(ix, 5_000);
+        Some(account_id_from_pubkey(&ata_address))
     }
 
     /// Append an instruction.
@@ -149,7 +211,7 @@ impl Wallet {
         self.compute = 0;
         //let _payer = self.payer.as_ref().unwrap();
         let ss = self.m_key.get(self.payer.as_ref().unwrap()).unwrap();
-        let keypair = &ss.key;
+        let keypair = rc_unlock(&ss.key);
         let signer_pubkey = keypair.pubkey();
         let mut tx =
             Transaction::new_signed_with_payer(&l_ix, Some(&signer_pubkey), &[keypair], blockhash);
@@ -163,4 +225,14 @@ impl Wallet {
 
         Some((signature, &self.tx_data[0..size]))
     }
+}
+
+fn make_ata_instruction(payer: &Pubkey, wallet_owner: &Pubkey, token_mint: &Pubkey) -> Instruction {
+    // This creates the actual instruction object ready to be packed into a transaction
+    create_associated_token_account(
+        payer,          // Account paying for the RAM allocation rent
+        wallet_owner,   // Authority/Owner of the new token account
+        token_mint,     // The token mint
+        &spl_token::ID, // Token program ID (Default SPL Token)
+    )
 }

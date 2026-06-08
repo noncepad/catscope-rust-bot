@@ -3,7 +3,7 @@ use solana_sdk::clock::Slot;
 use crate::{
     catscope::witbot::shooter::{Accountv1, Header, Tokenaccountv1},
     err::CatscopeGuestError,
-    graph::Commit,
+    graph::{Commit, LowLatencyAccountUpdate},
     txview::TransactionList,
 };
 
@@ -18,8 +18,7 @@ pub trait EventCallback {
 pub enum Event {
     Stdin(Vec<u8>),
     Commit(Commit),
-    Account(AccountWrapper),
-    Token(Vec<Tokenaccountv1>),
+    LowLatency(LowLatencyAccountUpdate),
     SlotStatus(Slot, SlotStatus),
     Transaction(TransactionList),
 }

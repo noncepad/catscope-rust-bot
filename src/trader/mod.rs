@@ -28,6 +28,8 @@
 
 pub mod arb;
 pub mod dex;
+pub mod portfolio;
+pub mod pricegraph;
 pub mod types;
 
 use crate::{
@@ -35,10 +37,10 @@ use crate::{
     graph::AccountId,
     trader::{
         dex::{
-            DexPool,
             kamino::KaminoReserve,
             orca::OrcaWhirlpool,
             raydium::{RaydiumAmmPool, RaydiumAmmSwapConfig},
+            DexPool,
         },
         types::{DexType, PoolPrice, PriceUpdate, SwapParams, TraderError},
     },
@@ -96,7 +98,10 @@ impl DexTrader {
         };
         self.pools.insert(
             pool_id,
-            DexPool::RaydiumAmm { state: placeholder, swap_config },
+            DexPool::RaydiumAmm {
+                state: placeholder,
+                swap_config,
+            },
         );
     }
 
@@ -114,6 +119,7 @@ impl DexTrader {
             token_mint_b: 0,
             vault_a: 0,
             vault_b: 0,
+            liquidity: 0,
             sqrt_price_x64: 0,
             tick_current_index: 0,
             tick_spacing: 64,
@@ -121,7 +127,8 @@ impl DexTrader {
             reserve_a: 0,
             reserve_b: 0,
         };
-        self.pools.insert(pool_id, DexPool::OrcaWhirlpool { state: placeholder });
+        self.pools
+            .insert(pool_id, DexPool::OrcaWhirlpool { state: placeholder });
     }
 
     /// Register a Kamino Lending reserve (price feed only; no swap IX).
@@ -132,7 +139,8 @@ impl DexTrader {
             price_usd: 0.0,
             mint_decimals: 0,
         };
-        self.pools.insert(reserve_id, DexPool::KaminoLending { state: placeholder });
+        self.pools
+            .insert(reserve_id, DexPool::KaminoLending { state: placeholder });
     }
 
     // ─── Account & token update handlers ─────────────────────────────────────
@@ -149,10 +157,14 @@ impl DexTrader {
         // Register vault accounts after we learn their IDs from the pool state.
         let (va, vb) = pool.vault_accounts();
         if let Some(v) = va {
-            if v != 0 { self.vault_to_pool.insert(v, pool_id); }
+            if v != 0 {
+                self.vault_to_pool.insert(v, pool_id);
+            }
         }
         if let Some(v) = vb {
-            if v != 0 { self.vault_to_pool.insert(v, pool_id); }
+            if v != 0 {
+                self.vault_to_pool.insert(v, pool_id);
+            }
         }
 
         Some(update)
@@ -183,12 +195,7 @@ impl DexTrader {
     /// Constant-product quote (no IX built).
     ///
     /// Returns `None` if the pool is unregistered or reserves are unknown.
-    pub fn quote(
-        &self,
-        pool_id: AccountId,
-        input_mint: AccountId,
-        amount_in: u64,
-    ) -> Option<u64> {
+    pub fn quote(&self, pool_id: AccountId, input_mint: AccountId, amount_in: u64) -> Option<u64> {
         Some(self.price(pool_id)?.quote(input_mint, amount_in))
     }
 
@@ -199,17 +206,20 @@ impl DexTrader {
     /// The DEX protocol is selected automatically from which pool was registered
     /// under `params.pool`. `params.min_amount_out` is the slippage guard.
     pub fn swap(&mut self, params: &SwapParams, wallet: &mut Wallet) -> Result<(), TraderError> {
-        let pool = self.pools.get(&params.pool)
+        let pool = self
+            .pools
+            .get(&params.pool)
             .ok_or(TraderError::UnknownPool(params.pool))?;
 
         match pool {
             DexPool::RaydiumAmm { state, swap_config } => {
-                let cfg = swap_config.as_ref()
-                    .ok_or(TraderError::MissingConfig("RaydiumAmmSwapConfig not configured"))?;
+                let cfg = swap_config.as_ref().ok_or(TraderError::MissingConfig(
+                    "RaydiumAmmSwapConfig not configured",
+                ))?;
                 dex::raydium::build_swap_ix(params.pool, state, cfg, params, wallet)
             }
             DexPool::OrcaWhirlpool { state } => {
-                dex::orca::build_swap_ix(params.pool, state, params, wallet)
+                state.build_swap_ix_pda(params.pool, params, wallet)
             }
             DexPool::KaminoLending { .. } => Err(TraderError::MissingConfig(
                 "Kamino reserves do not support direct swap instructions; \

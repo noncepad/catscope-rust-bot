@@ -1,11 +1,12 @@
 use crate::graph::EdgeManager;
+use crate::message::{MessageDeserializer, MessageSerializer, Parser};
 use crate::{
     catscope::witbot::general::{self, stdin},
     err::CatscopeGuestError,
     event::{Event, EventCallback, PollEvent},
     util::rc_unlock_mut,
 };
-use crate::{log_debug, log_warn};
+use crate::{log_debug, log_warn, TradingSetup};
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
     collections::{HashMap, VecDeque},
@@ -18,6 +19,7 @@ pub trait EventHandler {
         poller: EventPoller,
         rc_edgemgr: Rc<UnsafeCell<EdgeManager>>,
         args: &[String],
+        trading: &TradingSetup,
     ) -> Result<(), CatscopeGuestError>;
     fn on_unload(&mut self) -> Result<(), CatscopeGuestError>;
     fn on_event(&mut self, event: Event) -> Result<(), CatscopeGuestError>;
@@ -30,6 +32,7 @@ pub fn run(
 ) -> Result<(), CatscopeGuestError> {
     let rc_ip;
     let rc_edgemgr = Rc::new(UnsafeCell::new(EdgeManager::default()));
+    let tp = Box::new(TradingSetup::default());
     {
         let is_alive = Rc::new(Cell::new(true));
         rc_ip = Rc::new(UnsafeCell::new(InnerEventPoller {
@@ -42,7 +45,8 @@ pub fn run(
             inner: rc_ip.clone(),
         };
         let mut h = handler.borrow_mut();
-        h.on_load(poller, rc_edgemgr.clone(), args.as_slice())?;
+
+        h.on_load(poller, rc_edgemgr.clone(), args.as_slice(), &tp)?;
     }
     let ip = rc_unlock_mut(&rc_ip);
     let mut r = Ok(());
@@ -53,6 +57,7 @@ pub fn run(
             PollEvent::Stdin => {
                 log_debug!("run - 1 - stdin");
                 // this is hard coded
+
                 let data = stdin(0);
                 assert!(!data.is_empty());
                 ip.q_event.push_back(Event::Stdin(data));
@@ -96,7 +101,7 @@ pub fn run(
 
 pub type IsAlive = Rc<Cell<bool>>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EventPoller {
     is_alive: IsAlive,
     inner: Rc<UnsafeCell<InnerEventPoller>>,
