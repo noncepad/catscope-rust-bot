@@ -32,6 +32,7 @@ pub mod wallet;
 struct Component;
 
 impl Guest for Component {
+    /// This is the entry point for the bot.
     fn run() -> Result<(), ()> {
         let args = std::env::args();
         let mut l_arg = Vec::new();
@@ -48,9 +49,13 @@ impl Guest for Component {
         Ok(())
     }
 }
+/// Load in configuration data during build time to save on memory
+/// during runtime.
 pub mod trading_config {
     include!(concat!(env!("OUT_DIR"), "/trading_data.rs"));
 }
+/// Load in configuration data during build time to save on memory
+/// during runtime.
 pub mod orca_config {
     include!(concat!(env!("OUT_DIR"), "/orca_data.rs"));
 }

@@ -1,0 +1,10 @@
+[package]
+name = "orca_whirlpools_macros"
+version = "1.0.5"
+edition = "2021"
+description = "Patched: wasm_expose is a no-op for WASI targets."
+
+[lib]
+proc-macro = true
+
+[dependencies]

@@ -1,0 +1,25 @@
+[package]
+name = "orca_whirlpools_core"
+version = "2.1.0"
+edition = "2021"
+authors = ["team@orca.so"]
+description = "Orca's core rust package (patched: no wasm-bindgen/tokio for WASI)."
+
+[lib]
+name = "orca_whirlpools_core"
+path = "src/lib.rs"
+
+[features]
+default = ["floats", "swap"]
+floats = ["dep:libm"]
+swap = []
+
+[dependencies]
+ethnum = "^1.1"
+libm = { version = ">=0.1, <0.3", optional = true }
+orca_whirlpools_macros = { version = "1.0.5" }
+
+[dev-dependencies]
+approx = "^0"
+proptest = "^1"
+rstest = "^0.26"

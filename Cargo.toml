@@ -1,6 +1,6 @@
 [package]
 name = "catscope-rust-bot"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 
 [dependencies]
@@ -28,6 +28,9 @@ x25519-dalek = { version = "2", default-features = false, features = [
 #catscope-zerohop = { version = "0.1.3", features = ["wasmonly"] }
 serde = "1"
 serde_json = "1"
+ethnum = "1.5"
+
+orca_whirlpools_core = { version = "2.1.0" }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -51,5 +54,7 @@ panic = "abort"
 debug = 1
 
 
-#[patch.crates-io]
+[patch.crates-io]
+orca_whirlpools_core = { path = "vendor/orca_whirlpools_core" }
+orca_whirlpools_macros = { path = "vendor/orca_whirlpools_macros" }
 #catscope-zerohop = { path = "../catscope-zerohop" }
