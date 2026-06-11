@@ -21,7 +21,7 @@ use solana_sdk::{
 };
 use solana_sdk_ids::system_program::ID as SystemProgramID;
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account,
+    get_associated_token_address, instruction::create_associated_token_account_idempotent,
 };
 use std::{
     cell::UnsafeCell,
@@ -172,6 +172,7 @@ impl Wallet {
         let mint_pubkey = self.pubkey_from_account_id(&mint)?;
         let ix = make_ata_instruction(&owner_pubkey, &owner_pubkey, &mint_pubkey);
         let ata_address: Pubkey = get_associated_token_address(&owner_pubkey, &mint_pubkey);
+        self.require_signer(owner);
         self.append_ix(ix, 5_000);
         Some(account_id_from_pubkey(&ata_address))
     }
@@ -210,11 +211,16 @@ impl Wallet {
         }
         self.compute = 0;
         //let _payer = self.payer.as_ref().unwrap();
+        let mut l_keypair = Vec::with_capacity(self.m_key.len());
+        for (_, ss) in self.m_key.iter() {
+            let keypair = rc_unlock(&ss.key);
+            l_keypair.push(keypair);
+        }
         let ss = self.m_key.get(self.payer.as_ref().unwrap()).unwrap();
         let keypair = rc_unlock(&ss.key);
         let signer_pubkey = keypair.pubkey();
         let mut tx =
-            Transaction::new_signed_with_payer(&l_ix, Some(&signer_pubkey), &[keypair], blockhash);
+            Transaction::new_signed_with_payer(&l_ix, Some(&signer_pubkey), &l_keypair, blockhash);
         let signature = *tx.signatures.first().unwrap();
         let size = bincode::serde::encode_into_slice(
             &mut tx,
@@ -228,11 +234,10 @@ impl Wallet {
 }
 
 fn make_ata_instruction(payer: &Pubkey, wallet_owner: &Pubkey, token_mint: &Pubkey) -> Instruction {
-    // This creates the actual instruction object ready to be packed into a transaction
-    create_associated_token_account(
-        payer,          // Account paying for the RAM allocation rent
-        wallet_owner,   // Authority/Owner of the new token account
-        token_mint,     // The token mint
-        &spl_token::ID, // Token program ID (Default SPL Token)
+    create_associated_token_account_idempotent(
+        payer,
+        wallet_owner,
+        token_mint,
+        &spl_token::ID,
     )
 }

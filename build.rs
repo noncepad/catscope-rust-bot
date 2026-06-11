@@ -20,6 +20,9 @@ struct OrcaInput {
     list: Vec<OrcaPoolConfig>,
 }
 
+/// Tell cargo at compile time to add trading configuration
+/// data to the binary so that the bot in the validator
+/// does not have to waste time fetching data.
 fn main() {
     // 1. Tell Cargo to rerun this script ONLY if graph.json changes
     println!("cargo:rerun-if-changed=graph.json");

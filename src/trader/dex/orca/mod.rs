@@ -43,12 +43,6 @@
 //! a_to_b                 (bool, true = token_a in → token_b out)
 //! ```
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    hash::BuildHasherDefault,
-    u32,
-};
-
 use crate::{
     catscope::witbot::shooter::{self, Header, Tokenaccountv1},
     err::CatscopeGuestError,
@@ -61,11 +55,20 @@ use crate::{
     wallet::Wallet,
     TradingSetup,
 };
+use orca_whirlpools_core::{
+    swap_quote_by_input_token, TickArrayFacade, TickArrays, TickFacade, WhirlpoolFacade,
+    TICK_ARRAY_SIZE,
+};
 use solana_sdk::{
     clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
     transaction::TransactionError,
+};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    hash::BuildHasherDefault,
+    u32,
 };
 
 // ─── Program IDs ─────────────────────────────────────────────────────────────
@@ -93,8 +96,8 @@ const OFF_VAULT_B: usize = 213;
 
 const MIN_WHIRLPOOL_LEN: usize = OFF_VAULT_B + 32;
 
-/// Number of initialized ticks per tick-array account.
-const TICK_ARRAY_SIZE: i32 = 88;
+/// Tick span covered by one tick-array account (ticks × tick_spacing).
+const TICKS_PER_ARRAY: i32 = TICK_ARRAY_SIZE as i32;
 
 // ─── Tick-array account offsets ───────────────────────────────────────────────
 // layout: discriminator(8) + start_tick_index(4) + ticks(88×113) + whirlpool(32)
@@ -163,7 +166,7 @@ impl OrcaWhirlpool {
 
     /// Compute the start tick index for the tick array covering `tick`.
     fn tick_array_start(&self, tick: i32) -> i32 {
-        let size = TICK_ARRAY_SIZE * self.tick_spacing as i32;
+        let size = TICKS_PER_ARRAY * self.tick_spacing as i32;
         // Floor-divide toward negative infinity
         if tick >= 0 {
             (tick / size) * size
@@ -194,7 +197,7 @@ impl OrcaWhirlpool {
     /// supplemental remaining accounts. The on-chain program selects what
     /// it needs based on `a_to_b`.
     pub fn tick_arrays(&self, pool_pk: &Pubkey) -> [Pubkey; 5] {
-        let ts = TICK_ARRAY_SIZE * self.tick_spacing as i32;
+        let ts = TICKS_PER_ARRAY * self.tick_spacing as i32;
         let start_0 = self.tick_array_start(self.tick_current_index);
         [
             self.tick_array_pda(pool_pk, start_0),
@@ -249,6 +252,20 @@ impl OrcaWhirlpool {
         id.sort();
         id
     }
+
+    /// Build a `WhirlpoolFacade` for use with `orca_whirlpools_core` quote functions.
+    pub fn to_facade(&self) -> WhirlpoolFacade {
+        WhirlpoolFacade {
+            tick_spacing: self.tick_spacing,
+            fee_rate: self.fee_rate,
+            liquidity: self.liquidity,
+            sqrt_price: self.sqrt_price_x64,
+            tick_current_index: self.tick_current_index,
+            // Setting fee_tier_index_seed == tick_spacing signals no adaptive fee.
+            fee_tier_index_seed: self.tick_spacing.to_le_bytes(),
+            ..WhirlpoolFacade::default()
+        }
+    }
     /// Append an Orca Whirlpool `swap_v2` instruction to the wallet queue.
     /// Build a SwapV2 instruction deriving tick arrays from PDAs.
     /// Prefer `build_swap_ix` with map-resolved tick arrays when possible.
@@ -267,7 +284,7 @@ impl OrcaWhirlpool {
         };
         let pool_pk =
             pubkey_from_account_id(&pool_id).ok_or(TraderError::PubkeyResolutionFailed(pool_id))?;
-        let ts = TICK_ARRAY_SIZE * self.tick_spacing as i32;
+        let ts = TICKS_PER_ARRAY * self.tick_spacing as i32;
         let start_0 = self.tick_array_start(self.tick_current_index);
         let ta = if a_to_b {
             [
@@ -432,12 +449,14 @@ struct InfoWithVersion<M: Default> {
 }
 
 /// Parsed state of an Orca tick-array account.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ParsedTickArray {
     /// The start tick index of this array (identifies its position in the pool's range).
     pub start_tick_index: i32,
     /// Pool (whirlpool) this tick array belongs to.
     pub whirlpool: AccountId,
+    /// Full tick data ready for use with `orca_whirlpools_core` quote functions.
+    pub facade: TickArrayFacade,
 }
 
 pub struct OrcaState {
@@ -599,12 +618,15 @@ impl OrcaState {
             .get(&start_tick_index)
             .copied()
     }
+
     pub fn has_check_pool(&self) -> bool {
         self.has_check_pool
     }
+
     pub fn count(&self) -> (usize, usize, usize) {
         (self.count, self.parsed_count, self.tx_count)
     }
+
     pub fn flush_pool(&mut self, g: &Graph) -> Result<(), CatscopeGuestError> {
         let mut l_req = Vec::with_capacity(1_000);
         std::mem::swap(&mut l_req, &mut self.l_token_sub);
@@ -612,6 +634,7 @@ impl OrcaState {
         self.q_hold_sub.push_back(l_sub_id);
         Ok(())
     }
+
     /// l_account_id is sorted in ascending order
     pub fn on_tx(&mut self, ix: &CatscopeInstructionRead<'_>, slot: &Slot) {
         let l_account_id = ix.account();
@@ -633,6 +656,7 @@ impl OrcaState {
             }
         }
     }
+
     pub fn on_account(
         &mut self,
         header: &Header,
@@ -705,12 +729,47 @@ impl OrcaState {
             );
             let whirlpool = account_id_from_pubkey(&whirlpool_pk);
             let ta_id = header.accountid;
+
+            // Parse all 88 ticks from account bytes.
+            // Tick layout: initialized(1) + liquidity_net(16) + liquidity_gross(16)
+            //            + fee_growth_a(16) + fee_growth_b(16) + reward_growths(3×16) = 113 bytes
+            const TICK_BYTE_SIZE: usize = 113;
+            const TICKS_OFFSET: usize = 12; // discriminator(8) + start_tick_index(4)
+            let mut ticks = [TickFacade::default(); TICK_ARRAY_SIZE];
+            for (i, tick) in ticks.iter_mut().enumerate() {
+                let o = TICKS_OFFSET + i * TICK_BYTE_SIZE;
+                if o + TICK_BYTE_SIZE > body.len() {
+                    break;
+                }
+                tick.initialized = body[o] != 0;
+                tick.liquidity_net = i128::from_le_bytes(body[o + 1..o + 17].try_into().unwrap());
+                tick.liquidity_gross =
+                    u128::from_le_bytes(body[o + 17..o + 33].try_into().unwrap());
+                tick.fee_growth_outside_a =
+                    u128::from_le_bytes(body[o + 33..o + 49].try_into().unwrap());
+                tick.fee_growth_outside_b =
+                    u128::from_le_bytes(body[o + 49..o + 65].try_into().unwrap());
+                tick.reward_growths_outside = [
+                    u128::from_le_bytes(body[o + 65..o + 81].try_into().unwrap()),
+                    u128::from_le_bytes(body[o + 81..o + 97].try_into().unwrap()),
+                    u128::from_le_bytes(body[o + 97..o + 113].try_into().unwrap()),
+                ];
+            }
+            let facade = TickArrayFacade {
+                start_tick_index,
+                ticks,
+            };
+
             self.m_tick_array
                 .entry(ta_id)
-                .and_modify(|e| e.start_tick_index = start_tick_index)
+                .and_modify(|e| {
+                    e.start_tick_index = start_tick_index;
+                    e.facade = facade;
+                })
                 .or_insert(ParsedTickArray {
                     start_tick_index,
                     whirlpool,
+                    facade,
                 });
             self.m_pool_tick_arrays
                 .entry(whirlpool)
@@ -834,10 +893,8 @@ impl OrcaState {
             &pool.root
         };
 
-        params.set_min_amount_out(best_directional_price, max_slippage);
-
         let a_to_b = params.input_mint == whirlpool.token_mint_a;
-        let ts = TICK_ARRAY_SIZE * whirlpool.tick_spacing as i32;
+        let ts = TICKS_PER_ARRAY * whirlpool.tick_spacing as i32;
         let start_0 = whirlpool.tick_array_start(whirlpool.tick_current_index);
         let pool_pk =
             pubkey_from_account_id(&pool.id).ok_or(CatscopeGuestError::MissingPool(pool.id, 0))?;
@@ -858,7 +915,8 @@ impl OrcaState {
             ta_starts
         );
 
-        let tick_arrays: [Pubkey; 3] = ta_starts.map(|start| {
+        // Resolve tick-array pubkeys (used for the on-chain instruction).
+        let tick_array_pubkeys: [Pubkey; 3] = ta_starts.map(|start| {
             if let Some(ta_id) = self.tick_array_by_start(&pool.id, start) {
                 if let Some(pk) = pubkey_from_account_id(&ta_id) {
                     log_warn!("  ta start={} -> map id={} pk={}", start, ta_id, pk);
@@ -870,7 +928,58 @@ impl OrcaState {
             pk
         });
 
-        whirlpool.build_swap_ix(pool.id, &tick_arrays, params, wallet)?;
+        // Resolve tick-array facades (used for the quote calculation).
+        // If a tick array has not been seen on-chain yet, fall back to an empty
+        // array with the correct start index — the quote may be less accurate but
+        // the instruction will still be built and sent.
+        let get_facade = |start: i32| -> TickArrayFacade {
+            if let Some(ta_id) = self.tick_array_by_start(&pool.id, start) {
+                if let Some(pta) = self.m_tick_array.get(&ta_id) {
+                    return pta.facade;
+                }
+            }
+            TickArrayFacade {
+                start_tick_index: start,
+                ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
+            }
+        };
+        let ta0 = get_facade(ta_starts[0]);
+        let ta1 = get_facade(ta_starts[1]);
+        let ta2 = get_facade(ta_starts[2]);
+
+        // Use the CLMM library to compute an exact quote and derive min_amount_out.
+        let slippage_bps = (max_slippage * 10_000.0) as u16;
+        match swap_quote_by_input_token(
+            params.amount_in,
+            a_to_b,
+            slippage_bps,
+            whirlpool.to_facade(),
+            None, // no oracle — standard (non-adaptive-fee) pool
+            TickArrays::Three(ta0, ta1, ta2),
+            0,    // timestamp only needed for adaptive fee
+            None, // no transfer fee on token A
+            None, // no transfer fee on token B
+        ) {
+            Ok(quote) => {
+                params.min_amount_out = quote.token_min_out;
+                log_warn!(
+                    "  quote: in={} est_out={} min_out={} fee={}",
+                    quote.token_in,
+                    quote.token_est_out,
+                    quote.token_min_out,
+                    quote.trade_fee,
+                );
+            }
+            Err(e) => {
+                log_warn!(
+                    "  swap_quote failed ({:?}), falling back to spot-price estimate",
+                    e
+                );
+                params.set_min_amount_out(best_directional_price, max_slippage);
+            }
+        }
+
+        whirlpool.build_swap_ix(pool.id, &tick_array_pubkeys, params, wallet)?;
         Ok(())
     }
 }

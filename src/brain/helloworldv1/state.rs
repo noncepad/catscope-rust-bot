@@ -64,6 +64,87 @@ pub(crate) struct State {
     recycle_q: VecDeque<SlotSignatureSet>,
     o_ata_sol: Option<AccountId>,
     o_ata_usd: Option<AccountId>,
+    log_stats: LatencyStatistics,
+}
+
+#[derive(Debug)]
+struct LatencyStatistics {
+    commit_start: SystemTime,
+    commit_finish: SystemTime,
+    account_read: usize,
+    account_filtered: usize,
+    tx_read: usize,
+    tx_filtered: usize,
+    report: LatencyReportV1,
+}
+impl Default for LatencyStatistics {
+    fn default() -> Self {
+        let t = SystemTime::now();
+        Self {
+            commit_start: t,
+            commit_finish: t,
+            account_read: 0,
+            account_filtered: 0,
+            tx_read: 0,
+            tx_filtered: 0,
+            report: LatencyReportV1::default(),
+        }
+    }
+}
+impl LatencyStatistics {
+    fn on_commit_start(&mut self) {
+        self.commit_start = SystemTime::now();
+        self.report.processed_diff = self
+            .commit_start
+            .duration_since(self.commit_finish)
+            .unwrap();
+    }
+    fn on_account_processed(&mut self, count: usize) {
+        self.report.account_processed += count;
+    }
+    fn on_account_root(&mut self, count: usize) {
+        self.report.account_root += count;
+    }
+    fn on_tx_processed_filter(&mut self, count: usize) {
+        self.report.tx_processed_filter += count;
+    }
+    fn on_tx_processed(&mut self, count: usize) {
+        self.report.tx_processed += count;
+    }
+    fn on_commit_finish(&mut self) -> LatencyReportV1 {
+        self.commit_finish = SystemTime::now();
+        self.report.root_diff = self
+            .commit_finish
+            .duration_since(self.commit_start)
+            .unwrap();
+        let report = self.report.clone();
+        self.report.reset();
+        report
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LatencyReportV1 {
+    pub processed_diff: std::time::Duration,
+    pub root_diff: std::time::Duration,
+    pub account_processed: usize,
+    pub account_root: usize,
+    pub tx_processed_filter: usize,
+    pub tx_processed: usize,
+    pub tx_n: u64,
+    pub tx_p50_us: u64,
+    pub tx_p99_us: u64,
+}
+impl LatencyReportV1 {
+    fn reset(&mut self) {
+        self.account_processed = 0;
+        self.account_root = 0;
+        self.tx_processed_filter = 0;
+        self.tx_processed = 0;
+        self.tx_n = 0;
+        self.tx_p50_us = 0;
+        self.tx_p99_us = 0;
+    }
 }
 
 /// make sure we do not send duplicate transactions
@@ -82,16 +163,16 @@ impl TxLatencyStats {
     fn record(&mut self, elapsed: Duration) {
         self.samples.push(elapsed.as_micros() as u64);
     }
-    fn percentile(&mut self, p: usize) -> Option<u64> {
+    fn take_stats(&mut self) -> (u64, u64, u64) {
         if self.samples.is_empty() {
-            return None;
+            return (0, 0, 0);
         }
         self.samples.sort_unstable();
-        let idx = (self.samples.len().saturating_sub(1) * p) / 100;
-        Some(self.samples[idx])
-    }
-    fn count(&self) -> usize {
-        self.samples.len()
+        let n = self.samples.len() as u64;
+        let p50 = self.samples[(self.samples.len().saturating_sub(1) * 50) / 100];
+        let p99 = self.samples[(self.samples.len().saturating_sub(1) * 99) / 100];
+        self.samples.clear();
+        (n, p50, p99)
     }
 }
 
@@ -125,10 +206,11 @@ impl State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            log_stats: LatencyStatistics::default(),
             slot_delta_since_start: 0,
             tx_count: 0,
             read_tx_count: 0,
-            direction: Direction::ToSol,
+            direction: Direction::ToUSD,
             o_orca: None,
             o_bounce: None,
             last_slot: 0,
@@ -200,7 +282,9 @@ impl<'a> StateHelper<'a> {
             );
         }
         *self.nonce += 1;
+        let mut account_count = 0;
         while let Some(ta) = llap.token() {
+            account_count += 1;
             {
                 let db = self.wallet.token_mut();
                 db.on_token(ta, false);
@@ -209,10 +293,12 @@ impl<'a> StateHelper<'a> {
         }
         let zero = [];
         while let Some(account) = llap.account() {
+            account_count += 1;
             let d = if let Some(x) = account.body { x } else { &zero };
 
             orca.on_account(account.header, d, false).unwrap();
         }
+        self.state.log_stats.on_account_processed(account_count);
         self.state.o_orca.replace(orca);
     }
 
@@ -222,7 +308,10 @@ impl<'a> StateHelper<'a> {
         let mut signature;
         let mut l_program_id = [0u64; 256];
         let mut prog_i;
+        let mut tx_processed = 0;
+        let mut tx_processed_filter = 0;
         while let Some((mut tx, result)) = transaction_list.transaction() {
+            tx_processed += 1;
             if result.is_err() {
                 continue;
             }
@@ -257,6 +346,7 @@ impl<'a> StateHelper<'a> {
                                 tx = ix.into();
                                 break 'doneix1;
                             }
+                            tx_processed_filter += 1;
                             orca.on_tx(&ix, &slot);
                             tx = ix.into();
                         }
@@ -287,12 +377,14 @@ impl<'a> StateHelper<'a> {
                                 tx = ix.into();
                                 break 'doneix1;
                             }
+                            tx_processed_filter += 1;
                             orca.on_tx(&ix, &slot);
                             tx = ix.into();
                         }
                     }
                 }
             }
+
             signature = Signature::from(*tx.signature);
             self.state.read_tx_count += 1;
             if self.state.read_tx_count % 50_000 == 0 {
@@ -310,6 +402,10 @@ impl<'a> StateHelper<'a> {
                 );
             }
         }
+        self.state.log_stats.on_tx_processed(tx_processed);
+        self.state
+            .log_stats
+            .on_tx_processed_filter(tx_processed_filter);
     }
 
     pub(crate) fn evaluate(&mut self) {
@@ -320,7 +416,7 @@ impl<'a> StateHelper<'a> {
                 let owner = self.state.wallet().unwrap();
                 let l_a = db.balance(&owner, &self.configuration.mint_sol, true);
                 if !l_a.is_empty() {
-                    panic!("got token update {l_a:?}")
+                    log_warn!("wallet already has SOL balance at init: {l_a:?}");
                 }
             } else {
                 return;
@@ -357,11 +453,8 @@ impl<'a> StateHelper<'a> {
                 .first()
                 .map(|(a, b)| (*a, *b))
                 .unwrap_or_default();
-            let p50 = self.state.tx_latency.percentile(50);
-            let p99 = self.state.tx_latency.percentile(99);
-            let n = self.state.tx_latency.count() as u64;
             log_info!(
-                "slot {}; orca count {} {} {}; has check pool {}; balance {} {}; tx latency n={} p50={:?}µs p99={:?}µs",
+                "slot {}; orca count {} {} {}; has check pool {}; balance {} {}",
                 self.state.last_slot,
                 orca_count,
                 parsed_orca_count,
@@ -369,17 +462,7 @@ impl<'a> StateHelper<'a> {
                 has_check_pool,
                 bal_sol,
                 bal_usd,
-                n,
-                p50,
-                p99,
             );
-            self.q_msg.push_back(MessageSend::Custom(
-                CustomMessageOutbound::TxLatencyReport {
-                    n,
-                    p50_us: p50.unwrap_or(0),
-                    p99_us: p99.unwrap_or(0),
-                },
-            ));
             self.state.last_print = Instant::now();
         }
         let db = self.wallet.token_mut();
@@ -626,6 +709,7 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
 
 impl<'a> CommitHook for StateHelper<'a> {
     fn start(&mut self, slot: Slot) {
+        self.state.log_stats.on_commit_start();
         assert!(self.o_commit_slot.replace(slot).is_none());
         let (_, orca_ephemeral_count, orca_tx_count) =
             if let Some(orca) = self.state.o_orca.as_ref() {
@@ -679,12 +763,14 @@ impl<'a> CommitHook for StateHelper<'a> {
         _o_m_from: Option<&HashSet<AccountId>>,
         _o_m_to: Option<&HashSet<AccountId>>,
     ) {
+        self.state.log_stats.on_account_root(1);
         let mut orca = self.state.o_orca.take().unwrap();
         orca.on_account(header, body, true).unwrap();
         self.state.o_orca.replace(orca);
     }
 
     fn on_token(&mut self, token_account: &Tokenaccountv1) {
+        self.state.log_stats.on_account_root(1);
         let db = self.wallet.token_mut();
         db.on_token(token_account, true);
     }
@@ -696,5 +782,14 @@ impl<'a> CommitHook for StateHelper<'a> {
             orca.flush_pool(self.graph).expect("flush pool");
             self.state.o_orca.replace(orca);
         }
+        let mut report = self.state.log_stats.on_commit_finish();
+        let (tx_n, tx_p50_us, tx_p99_us) = self.state.tx_latency.take_stats();
+        report.tx_n = tx_n;
+        report.tx_p50_us = tx_p50_us;
+        report.tx_p99_us = tx_p99_us;
+        self.q_msg
+            .push_back(MessageSend::Custom(CustomMessageOutbound::LatencyReportV1(
+                report,
+            )));
     }
 }

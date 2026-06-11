@@ -3,6 +3,7 @@ use std::{cell::UnsafeCell, rc::Rc};
 use solana_sdk::{signature::Keypair, signer::Signer};
 
 use crate::{
+    brain::helloworldv1::state::LatencyReportV1,
     err::CatscopeGuestError,
     message::{KeyValuePair, MessageDeserializer, MessageSerializer},
 };
@@ -22,6 +23,7 @@ const CUSTOM_KEY_FLAG_ECHO_REQUEST: u8 = 1;
 const CUSTOM_KEY_FLAG_ECHO_RESPONSE: u8 = 2;
 const CUSTOM_KEY_FLAG_WALLET: u8 = 3;
 const CUSTOM_KEY_FLAG_TX_LATENCY: u8 = 4;
+const CUSTOM_KEY_FLAG_LATENCY_REPORT_V1: u8 = 5;
 
 impl MessageDeserializer for CustomMessageInbound {
     fn deserialize(&mut self, body: &[u8]) -> Result<usize, CatscopeGuestError> {
@@ -67,13 +69,7 @@ impl MessageDeserializer for CustomMessageInbound {
 
 pub(crate) enum CustomMessageOutbound {
     EchoResponse(String),
-    /// p50 and p99 round-trip latency in microseconds for outbound transactions.
-    /// Fields: (n, p50_us, p99_us). p50/p99 are 0 when n == 0.
-    TxLatencyReport {
-        n: u64,
-        p50_us: u64,
-        p99_us: u64,
-    },
+    LatencyReportV1(LatencyReportV1),
 }
 
 impl MessageSerializer for CustomMessageOutbound {
@@ -87,16 +83,16 @@ impl MessageSerializer for CustomMessageOutbound {
                 };
                 kvp.len()
             }
-            Self::TxLatencyReport { .. } => {
-                // key: 1 byte flag; value: 3 × u64 = 24 bytes
-                1 + 1 + 2 + 24
+            Self::LatencyReportV1(_) => {
+                // key_len(1) + key(1) + value_len(2) + 9×u64(72)
+                1 + 1 + 2 + 72
             }
         }
     }
     fn is_empty(&self) -> bool {
         match self {
             Self::EchoResponse(s) => s.is_empty(),
-            Self::TxLatencyReport { .. } => false,
+            Self::LatencyReportV1(_) => false,
         }
     }
     fn serialize(&self, buffer: &mut [u8]) {
@@ -109,12 +105,30 @@ impl MessageSerializer for CustomMessageOutbound {
                 };
                 kvp.serialize(buffer);
             }
-            Self::TxLatencyReport { n, p50_us, p99_us } => {
-                let key = [CUSTOM_KEY_FLAG_TX_LATENCY];
-                let mut value = [0u8; 24];
-                value[0..8].copy_from_slice(&n.to_le_bytes());
-                value[8..16].copy_from_slice(&p50_us.to_le_bytes());
-                value[16..24].copy_from_slice(&p99_us.to_le_bytes());
+            Self::LatencyReportV1(report) => {
+                let key = [CUSTOM_KEY_FLAG_LATENCY_REPORT_V1];
+                let mut value = [0u8; 72];
+                let mut i = 0;
+                value[i..(i + 8)]
+                    .copy_from_slice(&(report.processed_diff.as_nanos() as u64).to_le_bytes());
+                i += 8;
+                value[i..(i + 8)]
+                    .copy_from_slice(&(report.root_diff.as_nanos() as u64).to_le_bytes());
+                i += 8;
+                value[i..(i + 8)].copy_from_slice(&(report.account_processed as u64).to_le_bytes());
+                i += 8;
+                value[i..(i + 8)].copy_from_slice(&(report.account_root as u64).to_le_bytes());
+                i += 8;
+                value[i..(i + 8)]
+                    .copy_from_slice(&(report.tx_processed_filter as u64).to_le_bytes());
+                i += 8;
+                value[i..(i + 8)].copy_from_slice(&(report.tx_processed as u64).to_le_bytes());
+                i += 8;
+                value[i..(i + 8)].copy_from_slice(&report.tx_n.to_le_bytes());
+                i += 8;
+                value[i..(i + 8)].copy_from_slice(&report.tx_p50_us.to_le_bytes());
+                i += 8;
+                value[i..(i + 8)].copy_from_slice(&report.tx_p99_us.to_le_bytes());
                 let kvp = KeyValuePair {
                     key: &key,
                     value: &value,
