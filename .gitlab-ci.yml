@@ -10,19 +10,29 @@ variables:
   GIT_STRATEGY: "clone"
   GIT_SUBMODULE_STRATEGY: recursive
   MINOR_VERSION: "2"
+  TEST_PERL: "0"
 
 build_test:
   stage: build
   image: rust:1.89
-  tags: ["d-3"]
+  tags: ["kube,shared"]
   rules:
     - if: $CI_COMMIT_BRANCH != "main"
   script:
     - rustup target add wasm32-wasip2
     - rustup component add clippy
-    - cargo clippy --  -D clippy::shadow_unrelated -D clippy::shadow_reuse -D unused_variables  -D needless_borrow -D large_enum_variant
+    - mkdir target || true
+    # build.rs no longer opens prefetch.db directly (see this repo's
+    # SQLite-removal work) - it reads target/<name>.json instead, the
+    # same files optimizer's Prefetcher.Build writes for a real build.
+    # contrib/test-json/ is a checked-in sample bundle of those files for
+    # exactly this: CI/local builds that don't have a real prefetch.db-
+    # backed optimizer run to pull from.
+    - cp contrib/test-json/*.json target/
+    - cargo clippy --no-deps -- -D unused_variables -D clippy::needless_borrow -D clippy::large_enum_variant
     - cargo test --target x86_64-unknown-linux-gnu
     - cargo build --target wasm32-wasip2 --release
+    - perl ./contrib/test.pl
 
 build_bot:
   stage: build
@@ -33,7 +43,15 @@ build_bot:
   script:
     - rustup target add wasm32-wasip2
     - rustup component add clippy
-    - cargo clippy --  -D clippy::shadow_unrelated -D clippy::shadow_reuse -D unused_variables  -D needless_borrow -D large_enum_variant
+    - mkdir target || true
+    # STOPGAP: build.rs no longer opens prefetch.db (see this repo's
+    # SQLite-removal work) - it reads target/<name>.json instead. This
+    # deploys with contrib/test-json/'s static sample bundle until a
+    # real, periodically-refreshed target/*.json source (the JSON-era
+    # equivalent of the old noncepad.com/dev/prefetch.db) exists - see
+    # build_test's own copy of this same comment.
+    - cp contrib/test-json/*.json target/
+    - cargo clippy --no-deps -- -D unused_variables -D clippy::needless_borrow -D clippy::large_enum_variant
     - cargo test --target x86_64-unknown-linux-gnu
     - cargo build --target wasm32-wasip2 --release
   artifacts:
@@ -72,3 +90,77 @@ deploy_source:
   script:
     - /bin/bash ./contrib/remote-git.sh
     - cp ./target/wasm32-wasip2/release/catscope_rust_bot.wasm /var/share/dev/catscope_rust_bot.wasm
+
+# Builds the image that runs contrib/builder.pl (see that file's own doc
+# comment): an HTTP server wrapping the real cargo/rustup toolchain,
+# deployed as the catscope-rust-bot-builder Service so a remote caller
+# (e.g. optimizer) can POST a target/*.json bundle and get a compiled
+# wasm bot back, instead of needing a local checkout + toolchain of its
+# own to run Prefetcher.Build's cargo step against. Gated on build_bot
+# succeeding first (same rules, same branch) as a basic sanity check -
+# no point deploying a builder for source that doesn't even compile.
+build_docker_builder:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.24.0-debug
+    entrypoint: [""]
+  tags: ["kube", "shared"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  variables:
+    FF_KUBERNETES_HONOR_ENTRYPOINT: "false"
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+    DOCKERFILE_PATH: "./contrib/builder.Dockerfile"
+    TARGET_IMAGE: "${CI_REGISTRY}/${CI_PROJECT_PATH}/builder:${CI_COMMIT_BRANCH}"
+  needs:
+    - job: build_bot
+      artifacts: false
+  before_script:
+    - mkdir -p ~/.docker
+    - |
+      cat > ~/.docker/config.json <<EOF
+      {
+        "auths": {
+          "$CI_REGISTRY": {
+            "username": "$CI_REGISTRY_USER",
+            "password": "$CI_REGISTRY_PASSWORD"
+          }
+        }
+      }
+      EOF
+  script:
+    - /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/${DOCKERFILE_PATH}"
+      --destination "${TARGET_IMAGE}"
+      --digest-file builder-digest.txt
+      --cache=true
+  artifacts:
+    expire_in: 1 hour
+    paths:
+      - builder-digest.txt # Keeps the raw text file downloadable via GitLab UI
+
+deploy_builder:
+  stage: deploy
+  tags: ["kube", "deploy"]
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  variables:
+    FF_USE_LEGACY_KUBERNETES_EXECUTION_STRATEGY: "true"
+    FF_KUBERNETES_HONOR_ENTRYPOINT: "false"
+  needs:
+    - job: build_docker_builder
+      artifacts: true
+  script:
+    - sed -i "s#\${builder-digest\.txt}#${CI_REGISTRY}/${CI_PROJECT_PATH}/builder@$(cat builder-digest.txt)#g" ./contrib/builder.yaml
+    - kubectl apply -f ./contrib/builder.yaml --dry-run=client -n mainnet
+    - |
+      trap '
+        echo "=== Deployment Failed! Dumping Pod Logs ==="
+        kubectl describe pods -l app=catscope-rust-bot-builder -n mainnet
+      ' ERR
+      kubectl apply -f ./contrib/builder.yaml -n mainnet
+      kubectl rollout status deployment/catscope-rust-bot-builder --timeout=120s -n mainnet

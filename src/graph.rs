@@ -3,7 +3,7 @@ use crate::{
         self, Accountv1, Client, Commit as ShooterCommit, Header, Tokenaccountv1,
     },
     err::CatscopeGuestError,
-    event::{AccountWrapper, Event, EventCallback},
+    event::{Event, EventCallback},
     event_loop::EventPoller,
     log_warn,
     txview::TransactionList,
@@ -11,24 +11,64 @@ use crate::{
 };
 use crate::{log_debug, log_info};
 use solana_sdk::clock::Slot;
-use std::collections::{HashMap, VecDeque};
 use std::{
     cell::{RefCell, UnsafeCell},
     collections::HashSet,
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub type AccountId = u64;
+
+/// Total subscription ids ever sent (`Graph::bulk_subscribe`/`subscribe`
+/// -- every id in every successful call's result), and total acks ever
+/// received for them (`eventitem.ack`, wired up in
+/// `Graph::on_event` below -- previously read but never used, per this
+/// session's earlier research into `wit/component.wit`'s ack mechanism).
+/// Process-wide, not per-`Graph` instance, since callers besides
+/// `testperpv1` create their own `Graph`/subscribe independently and the
+/// consumer of this signal ([`all_subscriptions_acked`]) needs a single
+/// global answer either way.
+static SUBSCRIPTIONS_SENT: AtomicU64 = AtomicU64::new(0);
+static SUBSCRIPTIONS_ACKED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether every subscription id sent so far has been acknowledged by
+/// the validator. `false` until at least one has been sent *and* every
+/// one sent has come back acked -- real motivation:
+/// `util::PubkeyAccountIdCache`'s startup-capacity downgrade (see its
+/// own doc comment) uses this as the "the startup subscription burst is
+/// done" signal.
+pub fn all_subscriptions_acked() -> bool {
+    let sent = SUBSCRIPTIONS_SENT.load(Ordering::Relaxed);
+    sent > 0 && SUBSCRIPTIONS_ACKED.load(Ordering::Relaxed) >= sent
+}
+
+/// Raw `(acked, sent)` subscription counts backing
+/// [`all_subscriptions_acked`] -- exposed for diagnostic logging of real
+/// sync progress (e.g. "38214/41982 acked, still catching up") instead of
+/// just the coarse all-or-nothing boolean. Acked here means the
+/// *subscribe request itself* was acknowledged by the validator/gateway,
+/// not that the account's first real data update has arrived yet -- see
+/// this module's `SUBSCRIPTIONS_SENT`/`SUBSCRIPTIONS_ACKED` doc comment.
+pub fn subscription_ack_counts() -> (u64, u64) {
+    (
+        SUBSCRIPTIONS_ACKED.load(Ordering::Relaxed),
+        SUBSCRIPTIONS_SENT.load(Ordering::Relaxed),
+    )
+}
 pub type Weight = u32;
 pub type Depth = u8;
 pub type TokenAmount = u64;
 pub type Lamports = u64;
 
+/// Accounts requested per bigcommit.read() call while draining a large commit.
+const BIGCOMMIT_BATCH_SIZE: u32 = 2_000;
+
 #[derive(Clone)]
 pub struct Graph {
-    edgemgr: Rc<RefCell<EdgeManager>>,
     poller: EventPoller,
     inner: Rc<RefCell<InnerGraph>>,
+    read_count: usize,
 }
 
 #[derive(Debug)]
@@ -62,16 +102,29 @@ impl Graph {
             poller: poller.clone(),
         }));
         let g = Self {
-            edgemgr: Rc::new(RefCell::new(EdgeManager::default())),
             poller: poller.clone(),
             inner,
+            read_count: 0,
         };
         let g1 = Rc::new(UnsafeCell::new(g));
         poller.register(event_id, g1.clone());
         Ok(g1)
     }
-    /// Add a graph subset to streaming updates.
-    pub fn bulk_subscribe(
+    /// Add a graph subset to streaming updates. Deliberately **not**
+    /// `pub` -- `bulk_subscribe`/`subscribe` (the WIT `bulksubscribe`
+    /// call underneath) are confirmed blocking calls on the validator
+    /// side, and a caller building its own unbounded/unpaced batch is
+    /// exactly the bug that produced this session's real `stdio timeout`
+    /// hangs (traced to `flush_pool`'s per-sub-dex accumulators each
+    /// firing their own uncapped `bulk_subscribe` call). Every caller
+    /// must go through [`SubscriptionQueue`] instead -- either its paced
+    /// [`SubscriptionQueue::flush`] (bounded, spread across slots) or,
+    /// for genuinely small/fixed/immediate batches that need results
+    /// correlated back synchronously, [`SubscriptionQueue::subscribe_now`].
+    /// Module-private on purpose: only code in this file can reach this
+    /// method, so that invariant is enforced by the compiler, not just
+    /// convention.
+    fn bulk_subscribe(
         &self,
         l_req: Vec<SubscriptionRequest>,
     ) -> Result<Vec<Subscription>, CatscopeGuestError> {
@@ -81,6 +134,7 @@ impl Graph {
             l_full.push((req.root, req.filter_weight, req.depth as u32));
         }
         let l_sub_id = mx.client.bulksubscribe(l_full.as_slice())?;
+        SUBSCRIPTIONS_SENT.fetch_add(l_sub_id.len() as u64, Ordering::Relaxed);
         let mut l_sub = Vec::with_capacity(l_sub_id.len());
         for id in l_sub_id {
             l_sub.push(Subscription {
@@ -96,12 +150,14 @@ impl Graph {
         let id = mx
             .client
             .subscribe(req.root, req.filter_weight, req.depth as u32)?;
+        SUBSCRIPTIONS_SENT.fetch_add(1, Ordering::Relaxed);
         Ok(Subscription {
             id,
             inner: self.inner.clone(),
         })
     }
 }
+#[derive(Debug)]
 pub struct SubscriptionRequest {
     pub root: AccountId,
     pub filter_weight: Weight,
@@ -110,8 +166,9 @@ pub struct SubscriptionRequest {
 impl EventCallback for Graph {
     fn on_event(&mut self) -> Result<bool, CatscopeGuestError> {
         let mx = self.inner.borrow();
+        self.read_count += 1;
         let mut item = mx.client.read();
-        //let l_ack = item.ack;
+        let l_ack = item.ack;
         let o_slot = item.commitslot;
         let o_commit = item.commit;
         let l_sws = item.slotstatus;
@@ -147,35 +204,52 @@ impl EventCallback for Graph {
                 .event(Event::SlotStatus(sws.slot, sws.status.try_into().unwrap()));
         }
 
-        if let Some(inner_commit) = o_commit {
+        if let Some(bigcommit) = o_commit {
+            // A commit too large to deliver in one eventitem arrives as a
+            // bigcommit resource instead of an inline commit record. Drain it
+            // in batches and reassemble one combined commit — border offsets
+            // in each batch are relative to that batch's own data, so they
+            // need to be rebased onto the concatenated buffer as we go.
+            let slot = bigcommit.slot();
+            let mut data = Vec::new();
+            let mut border = Vec::new();
+            loop {
+                let batch = bigcommit.read(BIGCOMMIT_BATCH_SIZE);
+                let base = data.len() as u32;
+                for b in &batch.border {
+                    border.push(*b + base);
+                }
+                data.extend_from_slice(&batch.data);
+                if bigcommit.done() {
+                    break;
+                }
+            }
             log_warn!(
-                "Graph::on_event - 5 - border {}; data {}; edgeadd {}",
-                inner_commit.border.len(),
-                inner_commit.data.len(),
-                inner_commit.edgeadd.len()
+                "Graph::on_event - 5 - border {}; data {}; read_count {}",
+                border.len(),
+                data.len(),
+                self.read_count,
             );
-            self.poller.event(Event::Commit(Commit::new(
-                self.edgemgr.clone(),
-                inner_commit,
-            )));
+            self.read_count = 0;
+            let inner_commit = ShooterCommit { slot, data, border };
+            self.poller.event(Event::Commit(Commit::new(inner_commit)));
         } else if let Some(slot) = o_slot {
-            log_debug!("Graph::on_event - 6 - {slot}");
+            if slot.is_multiple_of(10) {
+                log_warn!("Graph::on_event - 6 - read_count {}", self.read_count,);
+            }
+            self.read_count = 0;
             let inner_commit = ShooterCommit {
                 slot,
                 data: vec![],
                 border: vec![],
-                edgeadd: vec![],
-                edgeremove: vec![],
             };
-            self.poller.event(Event::Commit(Commit::new(
-                self.edgemgr.clone(),
-                inner_commit,
-            )));
+            self.poller.event(Event::Commit(Commit::new(inner_commit)));
         }
 
-        //if !l_ack.is_empty() {
-        //log_debug!("Graph::on_event - 7 - {l_ack:?}");
-        //}
+        if !l_ack.is_empty() {
+            SUBSCRIPTIONS_ACKED.fetch_add(l_ack.len() as u64, Ordering::Relaxed);
+            log_debug!("Graph::on_event - 7 - {l_ack:?}");
+        }
 
         Ok(true)
     }
@@ -243,77 +317,15 @@ fn parse_accounts(data: &[u8], borders: &[u32]) -> Vec<Accountv1> {
 }
 
 pub struct Commit {
-    rc_edgemgr: Rc<RefCell<EdgeManager>>,
     commit: ShooterCommit,
 }
 
-#[derive(Default)]
-pub struct EdgeManager {
-    /// from->to
-    m_from: HashMap<AccountId, HashSet<AccountId>>,
-    /// to -> from
-    m_to: HashMap<AccountId, HashSet<AccountId>>,
-}
-
 impl Commit {
-    fn new(rc_edgemgr: Rc<RefCell<EdgeManager>>, sc: ShooterCommit) -> Self {
-        let mut edgemgr = rc_edgemgr.borrow_mut();
+    fn new(sc: ShooterCommit) -> Self {
         if sc.slot % 100 == 0 {
             log_info!("shooter commit {} - 1", sc.slot);
         }
-        {
-            assert_eq!(sc.edgeadd.len() % 2, 0);
-            let n = sc.edgeadd.len() / 2;
-            for i in 0..n {
-                let from = sc.edgeadd[i * 2];
-                let to = sc.edgeadd[i * 2 + 1];
-                {
-                    let m_to = edgemgr.m_from.entry(from).or_default();
-                    if !m_to.insert(to) {
-                        //log_debug!("duplicate edgeadd: from={} to={}", from, to);
-                    }
-                }
-                {
-                    let m_from = edgemgr.m_to.entry(to).or_default();
-                    m_from.insert(from);
-                }
-            }
-            log_debug!("shooter commit {} - 2 - n {}", sc.slot, n);
-        }
-        {
-            assert_eq!(sc.edgeremove.len() % 2, 0);
-            let n = sc.edgeremove.len() / 2;
-            for i in 0..n {
-                let from = sc.edgeremove[i * 2];
-                let to = sc.edgeremove[i * 2 + 1];
-                {
-                    if let Some(m_to) = edgemgr.m_from.get_mut(&from) {
-                        if !m_to.remove(&to) {
-                            //log_warn!("edgeremove: missing to={} in m_from[{}]", to, from);
-                        } else if m_to.is_empty() {
-                            edgemgr.m_from.remove(&from);
-                        }
-                    } else {
-                        //log_warn!("edgeremove: missing m_from entry for from={}", from);
-                    }
-                }
-                {
-                    if let Some(m_from) = edgemgr.m_to.get_mut(&to) {
-                        m_from.remove(&from);
-                        if m_from.is_empty() {
-                            edgemgr.m_to.remove(&to);
-                        }
-                    }
-                }
-                log_debug!("shooter commit {} - 3 - n {}", sc.slot, n);
-            }
-        }
-        log_debug!("shooter commit {} - 4", sc.slot);
-        drop(edgemgr);
-        Self {
-            rc_edgemgr,
-            commit: sc,
-        }
+        Self { commit: sc }
     }
 
     /// Process a commit.
@@ -370,6 +382,13 @@ impl Commit {
                     border_count - token_count
                 );
             }
+            // Two checkpoints (1/2, 3/4) -- live evidence narrowed a real
+            // hang to somewhere in the second half of this loop (border
+            // and the 1/2 checkpoint both fired, `commit:done` never
+            // did), so the 3/4 mark bisects that now-known region
+            // further; the 1/2 mark stays for symmetry/regression watch.
+            let is_checkpoint =
+                border_count != 0 && (i == border_count / 2 || i == 3 * border_count / 4);
             finish = *f1 as usize;
             if finish - start == token_len {
                 let subbuf = &data[start..finish];
@@ -377,6 +396,24 @@ impl Commit {
                 dst_buf.copy_from_slice(subbuf);
                 token_count += 1;
                 hook.on_token(&token_account);
+                // One extra checkpoint at the loop's midpoint -- same
+                // proportional-volume reasoning as `commit:border`/
+                // `commit:done` (one more line per commit, not a new
+                // per-record log). Bisects a hang localized to *inside*
+                // this loop (border fires, done doesn't) down to which
+                // half, and which specific record was just dispatched
+                // right before it -- real, live-observed need: after
+                // routing every `bulk_subscribe` call through
+                // `SubscriptionQueue`, a hang was still traced to
+                // somewhere in this loop for an otherwise ordinary-sized
+                // commit.
+                if is_checkpoint {
+                    log_warn!(
+                        "commit:mid - slot {slot}; border {i}/{border_count}; last dispatched token owner={} mint={}",
+                        token_account.owner,
+                        token_account.mint,
+                    );
+                }
             } else if header_len <= finish - start {
                 let header_subbuf = &data[start..(start + header_len)];
                 let dst_buf = as_bytes_mut(&mut header);
@@ -395,16 +432,36 @@ impl Commit {
                     &zerodata
                 };
 
-                let edgemgr = self.rc_edgemgr.borrow();
-                let m_from = edgemgr.m_from.get(&header.accountid);
-                let m_to = edgemgr.m_to.get(&header.accountid);
-                hook.on_account(&header, d, m_from, m_to);
+                hook.on_account(&header, d);
+                // See the matching checkpoint in the token branch above.
+                if is_checkpoint {
+                    log_warn!(
+                        "commit:mid - slot {slot}; border {i}/{border_count}; last dispatched account accountid={} owner={}",
+                        header.accountid,
+                        header.owner,
+                    );
+                }
             } else {
                 panic!("bad account length")
             }
 
             start = finish;
         }
+        // Bookends the `commit:border 0/{border_count}; ...` line logged
+        // at the top of this loop -- that line already fires once per
+        // commit in practice (border_count is always well under the
+        // 1_000 progress-log interval for this codebase's real commits),
+        // so this is a matched pair, not a new log-volume source. Lets a
+        // real hang be localized: if a commit's `commit:border` line
+        // appears but this one never does, the freeze is inside the
+        // on_account/on_token loop above; if both appear but nothing
+        // from `hook.finish()` ever follows, the freeze is inside
+        // `finish()` instead (e.g. a `bulk_subscribe` call that never
+        // returns).
+        log_warn!(
+            "commit:done - slot {slot}; border {border_count}/{border_count}; token {token_count}; other {}",
+            border_count - token_count
+        );
         hook.finish();
     }
 }
@@ -425,16 +482,92 @@ impl Drop for Subscription {
         }
     }
 }
+
+/// Paces subscription requests across multiple slots instead of firing
+/// them all in one `bulk_subscribe` call. Real, live-observed motivation:
+/// `subscribe`/`bulk_subscribe` are blocking calls on the validator side
+/// -- a single `bulk_subscribe` for, say, ~32,000 accounts (this
+/// codebase's own real Raydium/Orca/lending-reserve startup burst)
+/// blocks the guest for however long the host takes to service the
+/// *entire* batch in one round-trip, not just this account's own real
+/// work. Queue requests here as they're discovered (`push`/`extend`),
+/// then call [`Self::flush`] once per slot -- typically from
+/// `CommitHook::finish` -- to drain a bounded number of them into one
+/// `bulk_subscribe` call instead.
+///
+/// Resulting [`Subscription`]s are kept alive internally; nothing else
+/// needs to hold onto them (same "just don't let it drop" role every
+/// existing `_subscriptions: Vec<Subscription>` field in this codebase
+/// already plays, e.g. `RaydiumAmm`/`OrcaState`) -- the request's
+/// *meaning* (which pool/reserve/account a given `AccountId` maps to)
+/// is expected to already be tracked separately by the caller (every
+/// existing `Xxx::new` in this codebase already builds its own
+/// `m_pool`/`m_bank`-style map keyed by `AccountId` before subscribing,
+/// independent of the `Subscription` handle itself), so this queue
+/// doesn't need to correlate results back to individual requests.
+#[derive(Debug, Default)]
+pub struct SubscriptionQueue {
+    pending: std::collections::VecDeque<SubscriptionRequest>,
+    subscriptions: Vec<Subscription>,
+}
+
+impl SubscriptionQueue {
+    pub fn push(&mut self, req: SubscriptionRequest) {
+        self.pending.push_back(req);
+    }
+
+    pub fn extend(&mut self, reqs: impl IntoIterator<Item = SubscriptionRequest>) {
+        self.pending.extend(reqs);
+    }
+
+    /// How many requests are still queued, not yet sent.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// How many subscriptions this queue has sent and is keeping alive.
+    pub fn active_count(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    /// Drain up to `max_per_flush` queued requests into one bounded
+    /// `bulk_subscribe` call, keeping the resulting subscriptions alive
+    /// internally. No-op (`Ok(0)`) if the queue is empty. Returns how
+    /// many requests this call actually sent.
+    pub fn flush(&mut self, g: &Graph, max_per_flush: usize) -> Result<usize, CatscopeGuestError> {
+        if self.pending.is_empty() || max_per_flush == 0 {
+            return Ok(0);
+        }
+        let n = self.pending.len().min(max_per_flush);
+        let batch: Vec<SubscriptionRequest> = self.pending.drain(..n).collect();
+        let subs = g.bulk_subscribe(batch)?;
+        self.subscriptions.extend(subs);
+        Ok(n)
+    }
+
+    /// Subscribe to every one of `reqs` immediately, in one bounded
+    /// `bulk_subscribe` call, returning the raw [`Subscription`] handles
+    /// instead of retaining them internally -- for callers that need
+    /// per-request correlation `flush`'s "just keep them alive" contract
+    /// can't give them (e.g. wallet-authority tracking, which hands each
+    /// resulting `Subscription` back to whichever protocol's request
+    /// produced it), or a small fixed one-shot batch that doesn't need
+    /// pacing across slots (e.g. a `PhoenixMarket`'s 3-item second-hop
+    /// discovery). Still the *only* other path to the underlying host
+    /// call besides `flush` -- callers are responsible for keeping
+    /// `reqs.len()` small, since this is not paced.
+    pub fn subscribe_now(
+        g: &Graph,
+        reqs: Vec<SubscriptionRequest>,
+    ) -> Result<Vec<Subscription>, CatscopeGuestError> {
+        g.bulk_subscribe(reqs)
+    }
+}
+
 /// Process finalized account state.
 pub trait CommitHook {
     fn start(&mut self, slot: Slot);
-    fn on_account(
-        &mut self,
-        header: &Header,
-        body: &[u8],
-        o_m_from: Option<&HashSet<AccountId>>,
-        o_m_to: Option<&HashSet<AccountId>>,
-    );
+    fn on_account(&mut self, header: &Header, body: &[u8]);
     fn on_token(&mut self, token_account: &Tokenaccountv1);
     fn finish(&mut self);
 }

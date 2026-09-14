@@ -222,7 +222,6 @@ impl<'a> CatscopeInstructionRead<'a> {
 //  [8..16] slot:        Ok(Slot) value, little-endian
 
 /// Encode `Result<Slot, TransactionError>` into exactly 16 bytes.
-
 /// Decode `Result<Slot, TransactionError>` from 16 bytes produced by [`result_to_bytes`].
 pub fn result_from_bytes(
     buf: &[u8; 16],

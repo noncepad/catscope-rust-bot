@@ -1,6 +1,6 @@
 [package]
 name = "catscope-rust-bot"
-version = "0.3.5"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -14,9 +14,11 @@ solana-compute-budget-interface = "3.0.0"
 spl-token = { version = "9", features = ["no-entrypoint"] }
 spl-associated-token-account = "8"
 solana-system-interface = { version = "2.0.0", features = ["bincode"] }
+solana-nonce = { version = "3.0.0", features = ["serde"] }
 wincode = { version = "0.3.1", features = ["derive"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 chacha20poly1305 = "0.10"
+twox-hash = "2.1.2"
 hkdf = "0.12"
 sha2 = "0.10"
 curve25519-dalek = { version = "4", default-features = false, features = [
@@ -31,6 +33,7 @@ serde_json = "1"
 ethnum = "1.5"
 
 orca_whirlpools_core = { version = "2.1.0" }
+solana-clmm-raydium = { version = "0.3.0" }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -47,7 +50,7 @@ crate-type = ["cdylib"]
 
 [profile.release]
 #opt-level = "z"
-opt-level = 1
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
@@ -57,4 +60,5 @@ debug = 1
 [patch.crates-io]
 orca_whirlpools_core = { path = "vendor/orca_whirlpools_core" }
 orca_whirlpools_macros = { path = "vendor/orca_whirlpools_macros" }
+solana-clmm-raydium = { path = "vendor/solana_clmm_raydium" }
 #catscope-zerohop = { path = "../catscope-zerohop" }
