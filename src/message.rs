@@ -12,7 +12,7 @@ use std::{
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-const ENV_MOTHERSHIP_PUBKEY: &str = "MOTHERSHIP_PUBKEY";
+pub(crate) const ENV_MOTHERSHIP_PUBKEY: &str = "MOTHERSHIP_PUBKEY";
 pub struct Parser<C: Default, MIn: MessageDeserializer, MOut: MessageSerializer> {
     mothership_pubkey: Pubkey,
     keypair: Rc<UnsafeCell<Keypair>>,
@@ -63,10 +63,38 @@ pub trait InboundMesasgeHandler<C: Sized + Default, MIn: MessageDeserializer, MO
 }
 type WalletFlag = u8;
 const WalleFlagEphemeral: WalletFlag = 0;
+
+/// Reserved `KeyValuePair` key for [`MessageSend::CommonAddressUpdate`],
+/// carried inside the same `COMMAND_CUSTOM` encrypted pipe every brain
+/// module's own `Custom(M)` payload already uses (see that variant's doc
+/// comment) -- so it must never collide with any per-strategy
+/// `CUSTOM_KEY_FLAG_*`/`KeyFlag*` value. Every per-strategy scheme in this
+/// codebase stays below 100 (arbv1's tops out at 6); this is deliberately
+/// far above that, and any future shared (non-per-strategy) message added
+/// here should also stay in the 200+ range to keep the two namespaces
+/// visibly separated.
+pub const COMMON_KEY_FLAG_ACCOUNT_USAGE: u8 = 200;
+
+/// Bytes per [`MessageSend::CommonAddressUpdate`] entry on the wire: a
+/// 32-byte pubkey plus a 4-byte little-endian usage count.
+const ACCOUNT_USAGE_ENTRY_SIZE: usize = 36;
+
 pub enum MessageSend<M> {
     Wallet(WalletFlag, Pubkey),
     Pong(SystemTime),
     Custom(M),
+    /// Reports the sending bot's most-referenced non-signer accounts
+    /// (pubkey, cumulative-since-process-start usage count), so
+    /// `optimizer alt` can build a real Address Lookup Table from what the
+    /// bot has actually touched instead of scanning transaction history
+    /// via RPC. Shared across every brain module (unlike `Custom(M)`,
+    /// which is per-strategy) -- see `Wallet::top_account_usage`, the
+    /// only producer. Rides the same `COMMAND_CUSTOM` encrypted pipe as
+    /// `Custom`, keyed by `COMMON_KEY_FLAG_ACCOUNT_USAGE`, so every
+    /// existing `instance.StdoutCustom` subscription on the Go side picks
+    /// it up with just one more `switch` case -- no new transport-level
+    /// command tag needed.
+    CommonAddressUpdate(Vec<(Pubkey, u32)>),
 }
 impl<MOut: MessageSerializer> MessageSend<MOut> {
     pub(crate) fn tag(&self) -> u8 {
@@ -74,6 +102,7 @@ impl<MOut: MessageSerializer> MessageSend<MOut> {
             MessageSend::Pong(_) => COMMAND_PONG,
             MessageSend::Custom(_) => COMMAND_CUSTOM,
             MessageSend::Wallet(_, _) => COMMAND_WALLET,
+            MessageSend::CommonAddressUpdate(_) => COMMAND_CUSTOM,
         }
     }
     pub(crate) fn size(&self) -> usize {
@@ -81,6 +110,10 @@ impl<MOut: MessageSerializer> MessageSend<MOut> {
             MessageSend::Pong(_) => 8,
             MessageSend::Wallet(_, _) => 1 + 1 + 2 + std::mem::size_of::<Pubkey>(),
             MessageSend::Custom(x) => 2 + x.len() + 20,
+            MessageSend::CommonAddressUpdate(entries) => {
+                // KeyValuePair(key_len=1, key=1, value_len=2, value=2+n*36) + cipher overhead(20), same shape as Custom above.
+                2 + (1 + 1 + 2 + 2 + entries.len() * ACCOUNT_USAGE_ENTRY_SIZE) + 20
+            }
         }
     }
 }
@@ -195,7 +228,7 @@ impl<C: Sized + Default, MIn: MessageDeserializer> MessageInboundParser<C, MIn> 
     {
         let end = self.index + data.len();
         log_warn!(
-            "HelloWorldV1Hook::event - stdin++++++++++++++++++++++++++++++++++++++ data {}; end {}",
+            "MessageInbound::on_data - stdin++++++++++++++++++++++++++++++++++++++ data {}; end {}",
             data.len(),
             end
         );
@@ -227,7 +260,7 @@ impl<C: Sized + Default, MIn: MessageDeserializer> MessageInboundParser<C, MIn> 
                 }
                 // borrow of self.buffer ends here; action is fully owned
             };
-            log_warn!("HelloWorldV1Hook::event - stdin++++++++++++++++++++++++++++++++++++++ action; cursor {cursor}; consumed {consumed}");
+            log_warn!("MessageInbound::on_data - stdin++++++++++++++++++++++++++++++++++++++ action; cursor {cursor}; consumed {consumed}");
 
             cursor += consumed;
             f(action);
@@ -404,6 +437,44 @@ impl MessageOutbound {
                 {
                     let subbuf = &mut wb[j..];
                     payload.serialize(subbuf);
+                }
+                let ciphertext = self.encryptor.seal(&wb[plain_start..(plain_start + n)]);
+                let cipher_n = ciphertext.len();
+                {
+                    let subbuf = &mut wb[j..(j + 2)];
+                    j += 2;
+                    let x = cipher_n as u16;
+                    let y = x.to_le_bytes();
+                    subbuf.copy_from_slice(&y);
+                }
+                {
+                    let subbuf = &mut wb[j..(j + cipher_n)];
+                    subbuf.copy_from_slice(&ciphertext);
+                }
+                j += cipher_n;
+            }
+            MessageSend::CommonAddressUpdate(entries) => {
+                // [n_entries u16][(pubkey 32B, count u32) x n_entries], wrapped
+                // in a KeyValuePair and encrypted exactly like Custom above so
+                // it rides the same COMMAND_CUSTOM pipe every strategy's Go
+                // side already decodes via instance.StdoutCustom.
+                let mut value = vec![0u8; 2 + entries.len() * ACCOUNT_USAGE_ENTRY_SIZE];
+                value[0..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+                for (i, (pubkey, usage_count)) in entries.iter().enumerate() {
+                    let off = 2 + i * ACCOUNT_USAGE_ENTRY_SIZE;
+                    value[off..(off + 32)].copy_from_slice(pubkey.as_array());
+                    value[(off + 32)..(off + 36)].copy_from_slice(&usage_count.to_le_bytes());
+                }
+                let key = [COMMON_KEY_FLAG_ACCOUNT_USAGE];
+                let kvp = KeyValuePair {
+                    key: &key,
+                    value: &value,
+                };
+                let n = kvp.len();
+                let plain_start = j;
+                {
+                    let subbuf = &mut wb[j..];
+                    kvp.serialize(subbuf);
                 }
                 let ciphertext = self.encryptor.seal(&wb[plain_start..(plain_start + n)]);
                 let cipher_n = ciphertext.len();

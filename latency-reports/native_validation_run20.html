@@ -1,0 +1,652 @@
+<title>Native Transfer Validation Run</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #eef1f4;
+    --border: #dde2e7;
+    --text: #161b22;
+    --text-dim: #5c6773;
+    --account: #0e7c86;
+    --account-bg: #e3f3f2;
+    --tx: #a66a12;
+    --tx-bg: #f7ecd9;
+    --astra: #6a3fb5;
+    --astra-bg: #ece3f8;
+    --ok: #1a7f4e;
+    --ok-bg: #e2f5ea;
+    --unknown: #6b7280;
+    --unknown-bg: #eceef1;
+    --focus: #2f6fed;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1316;
+      --surface: #151b1f;
+      --surface-2: #1b2227;
+      --border: #28323a;
+      --text: #e7ecef;
+      --text-dim: #8a97a3;
+      --account: #4ad9c9;
+      --account-bg: #133633;
+      --tx: #f2b544;
+      --tx-bg: #3a2e10;
+      --astra: #b79aef;
+      --astra-bg: #2a2140;
+      --ok: #5fd399;
+      --ok-bg: #123023;
+      --unknown: #9aa4ae;
+      --unknown-bg: #232a30;
+      --focus: #6c9bff;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1316;
+    --surface: #151b1f;
+    --surface-2: #1b2227;
+    --border: #28323a;
+    --text: #e7ecef;
+    --text-dim: #8a97a3;
+    --account: #4ad9c9;
+    --account-bg: #133633;
+    --tx: #f2b544;
+    --tx-bg: #3a2e10;
+    --astra: #b79aef;
+    --astra-bg: #2a2140;
+    --ok: #5fd399;
+    --ok-bg: #123023;
+    --unknown: #9aa4ae;
+    --unknown-bg: #232a30;
+    --focus: #6c9bff;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: 1700px;
+    margin: 0 auto;
+    padding: 2.5rem 1.5rem 4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.75rem;
+  }
+
+  header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin: 0 0 0.35rem;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+  header .meta {
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  .banner {
+    background: var(--ok-bg);
+    color: var(--ok);
+    border: 1px solid var(--ok);
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  .caveat {
+    background: var(--unknown-bg);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    font-size: 0.82rem;
+    line-height: 1.55;
+  }
+  .caveat strong {
+    color: var(--text);
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 0.75rem;
+  }
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .stat .label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+  }
+  .stat .value {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 1.1rem;
+  }
+  .stat.astra .value { color: var(--astra); }
+  .stat.account .value { color: var(--account); }
+  .stat.tx .value { color: var(--tx); }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .toolbar .hint {
+    color: var(--text-dim);
+    font-size: 0.82rem;
+    margin-left: auto;
+  }
+  .chip {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 0.82rem;
+    padding: 0.4rem 0.85rem;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .chip:hover { border-color: var(--focus); }
+  .chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .chip[aria-pressed="true"] {
+    background: var(--text);
+    color: var(--bg);
+    border-color: var(--text);
+  }
+  .unit-toggle {
+    display: flex;
+    gap: 0.25rem;
+    background: var(--surface-2);
+    border-radius: 999px;
+    padding: 0.2rem;
+  }
+  .unit-toggle .chip {
+    border: none;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.78rem;
+  }
+  .unit-toggle .chip[aria-pressed="true"] {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  }
+
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: auto;
+    max-height: 70vh;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.86rem;
+  }
+  thead th {
+    position: sticky;
+    top: 0;
+    background: var(--surface-2);
+    text-align: left;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+  }
+  thead th:hover { color: var(--text); }
+  thead th.sorted::after {
+    content: " " attr(data-dir);
+    font-size: 0.7em;
+  }
+  tbody td {
+    padding: 0.5rem 0.8rem;
+    border-bottom: 1px solid var(--border);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: var(--surface-2); }
+  tbody tr.unresolved td { background: var(--unknown-bg); }
+
+  .lane-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.74rem;
+    font-family: "IBM Plex Sans", sans-serif;
+    font-weight: 600;
+  }
+  .lane-badge.LowLatency { background: var(--account-bg); color: var(--account); }
+  .lane-badge.Transaction { background: var(--tx-bg); color: var(--tx); }
+  .lane-badge.Commit { background: var(--ok-bg); color: var(--ok); }
+
+  .astra-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-family: "IBM Plex Sans", sans-serif;
+    font-weight: 600;
+    background: var(--astra-bg);
+    color: var(--astra);
+  }
+  .astra-badge.plain {
+    background: var(--surface-2);
+    color: var(--text-dim);
+  }
+
+  .unknown-val {
+    color: var(--unknown);
+    font-style: italic;
+  }
+  .estimate-bounded {
+    color: var(--unknown);
+    font-style: italic;
+    border-bottom: 1px dotted currentColor;
+    cursor: help;
+  }
+  .estimate-rough {
+    color: var(--unknown);
+    font-style: italic;
+    opacity: 0.7;
+    border-bottom: 1px dashed currentColor;
+    cursor: help;
+  }
+
+  .sig a {
+    color: var(--text-dim);
+    text-decoration: none;
+    border-bottom: 1px dashed var(--border);
+  }
+  .sig a:hover, .sig a:focus-visible {
+    color: var(--focus);
+    border-bottom-color: var(--focus);
+  }
+
+  .total-cell {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .bar-track {
+    width: 64px;
+    height: 6px;
+    background: var(--surface-2);
+    border-radius: 999px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .bar-fill {
+    height: 100%;
+    background: var(--astra);
+    border-radius: 999px;
+  }
+
+  footer {
+    color: var(--text-dim);
+    font-size: 0.78rem;
+    text-align: center;
+  }
+
+  .prose {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+  .prose h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: -0.005em;
+  }
+  .prose h3 {
+    font-size: 0.92rem;
+    font-weight: 600;
+    margin: 0.4rem 0 0;
+    color: var(--text);
+  }
+  .prose p, .prose li {
+    margin: 0;
+    line-height: 1.6;
+    font-size: 0.88rem;
+    color: var(--text);
+  }
+  .prose ul {
+    margin: 0;
+    padding-left: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .prose code {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    background: var(--surface-2);
+    border-radius: 4px;
+    padding: 0.05rem 0.3rem;
+    font-size: 0.85em;
+  }
+  .prose pre {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem 0.9rem;
+    overflow-x: auto;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.78rem;
+    line-height: 1.55;
+    color: var(--text);
+    margin: 0;
+  }
+  .prose .case-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+  }
+  .prose hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 0.2rem 0;
+  }
+</style>
+
+<div class="page">
+  <header>
+    <h1>Native Transfer Validation Run 3 — 20/20</h1>
+    <div class="meta">testperplatencyv1 · protocol=native · Astralane bundling + watch-both-accounts fix, rebuilt binary confirmed carrying both</div>
+  </header>
+
+  <div class="prose">
+    <h2>What this test does</h2>
+    <p><code>testperplatencyv1</code>'s native-transfer test sends real SOL transfers back and forth between two wallets, over and over, alternating direction each time: <strong>Wallet 1</strong> (the bot's own fee-paying wallet, which also covers every transaction's network fee and priority fee regardless of which direction the transfer goes) and <strong>Wallet 2</strong> (a second wallet, deterministically derived from Wallet 1, used purely as a round-trip destination -- it never pays a fee in either direction).</p>
+    <p>Each transfer races three independent, real update channels to see which one reports the transfer's confirmation first:</p>
+    <ul>
+      <li><strong>Account</strong> (internally <code>LowLatency</code>) -- a processed-tier account-balance update, the fastest tier Solana exposes.</li>
+      <li><strong>Commit</strong> -- a rooted-tier account-balance update, structurally ~32 slots (finality) behind live.</li>
+      <li><strong>Transaction</strong> -- a direct signature-confirmation, independent of either account-balance stream.</li>
+    </ul>
+    <p>Whichever lane observes the expected balance change (or the expected transaction landing) first wins and gets timed. For each confirmed transfer, the test also tries to split total latency into <strong>write</strong> (time from send until the transfer actually landed on-chain) and <strong>read</strong> (time from landing until this guest's own update stream reported it) -- see the caveat box below for exactly what that split can and can't promise.</p>
+  </div>
+
+  <div class="banner">
+    <strong>Clean sweep: 20/20 via Account, all Astralane-bundled.</strong> Every transfer this run -- both directions -- landed within 0-2 slots and was confirmed by the Account (LowLatency) lane before Commit or Transaction ever got a chance. No lane-vs-recipient lockout of any kind: the fee-math fix means a Wallet-1-recipient transfer's exact-match threshold is reachable now, and Astralane's tip-boosted landing means it usually resolves before Commit's ~32-slot rooted lag or Transaction's independent confirmation even arrive.
+  </div>
+
+  <div class="caveat">
+    <strong>Write is a lower bound, Read is an upper bound.</strong> Neither the account-update stream nor the transaction-confirmation stream carries a timestamp for exactly when inside a landing slot's block a transfer executed -- only the slot number. "Write" is measured against the first moment this guest observed the landing slot beginning, not the transfer's real execution instant, so the true write time can run up to roughly one Solana slot later (currently ~350ms, and shrinking) than what's shown. Because Read is derived as Total &minus; Write, an understated Write correspondingly overstates Read by the same margin. This is a real measurement-resolution limit of the data available, not a bug -- treat single-sample Write/Read splits as directional, not exact, especially anywhere close to that ~350ms band.
+    <br><br>
+    <strong>Dotted/dashed values are estimates, not measurements.</strong> A same-slot sample has no resolvable Write/Read split at all -- shown with a <span class="estimate-bounded">~dotted underline</span> when a real upper bound exists (the estimate is that bound's midpoint -- the true value could be anywhere from 0 up to the bound, this is just a guess at the middle), or a fainter <span class="estimate-rough">~dashed underline</span> when even that bound is unavailable (falls back to this run's own median resolved Write delay -- a much rougher prior, not tied to this specific sample at all). Hover either for the exact reasoning. Filter to "Same-slot / estimated" below to see only these rows.
+  </div>
+
+  <div class="stats">
+    <div class="stat astra">
+      <span class="label">Astralane bundle</span>
+      <span class="value">n=20 / 20</span>
+    </div>
+    <div class="stat account">
+      <span class="label">Account</span>
+      <span class="value">n=20 · p50 379ms</span>
+    </div>
+    <div class="stat">
+      <span class="label">Slots until inclusion</span>
+      <span class="value">p50=1 · p99=2</span>
+    </div>
+    <div class="stat">
+      <span class="label">Write delay (lower bound)</span>
+      <span class="value">n=18 · p50 38ms</span>
+    </div>
+    <div class="stat">
+      <span class="label">Read delay (upper bound)</span>
+      <span class="value">n=18 · p50 297ms</span>
+    </div>
+  </div>
+
+  <div class="toolbar" role="group" aria-label="Filter">
+    <button class="chip" data-filter="all" aria-pressed="true">All (20)</button>
+    <button class="chip" data-filter="unresolved" aria-pressed="false">Same-slot / estimated (2)</button>
+    <div class="unit-toggle" role="group" aria-label="Time unit">
+      <button class="chip" data-unit="us" aria-pressed="true">µs</button>
+      <button class="chip" data-unit="ms" aria-pressed="false">ms</button>
+    </div>
+    <span class="hint">Click a column header to sort</span>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th data-key="n" data-type="num">#</th>
+          <th data-key="lane" data-type="str">Update</th>
+          <th data-key="astralane_label" data-type="str">Write Path</th>
+          <th data-key="sig" data-type="str">Signature</th>
+          <th data-key="send" data-type="num">Send Slot</th>
+          <th data-key="incl" data-type="num">Inclusion Slot</th>
+          <th data-key="slots" data-type="num">Slots</th>
+          <th data-key="write_sort" data-type="num" id="th-write" title="Lower bound -- measured against first observation of the landing slot, not the transfer's real execution instant inside it.">Write ≥ (µs)</th>
+          <th data-key="read_sort" data-type="num" id="th-read" title="Upper bound -- derived as Total minus the Write lower bound, so it inherits the same ~1-slot slack in the other direction.">Read ≤ (µs)</th>
+          <th data-key="total_us" data-type="num" id="th-total">Total (µs)</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <div class="prose">
+    <h2>Investigation: transfers 4 and 7, write/read outliers in opposite directions</h2>
+    <p>Transfer 7 attributed almost all of its latency to <strong>write</strong> (326,431µs) with <strong>read</strong> near zero (4,290µs). Transfer 4 was the mirror image: <strong>write</strong> near zero (46µs), <strong>read</strong> dominant (705,714µs). Neither is a bug -- they're the write/read split correctly capturing two genuinely independent sub-latencies that happened to land at opposite extremes.</p>
+
+    <h3>Transfer 7 — write dominates, read ≈ 0</h3>
+    <pre>[20.779s] sending 1,000,000 lamports Wallet 1 -&gt; Wallet 2, sent_at ≈ 20.779s, send_slot=443989546
+[21.110s] on_account pubkey 203922733 (Wallet 1); slot 443989547        &lt;- separate account, same tick
+[21.110s] confirmed via LowLatency  write=326,431µs  read=4,290µs  total=330,722µs
+[21.110s] on_account pubkey 122477695 (Wallet 2); slot 443989547        &lt;- the actual matching update</pre>
+    <p>Nothing else is logged between 20.983s and 21.110s -- a genuine ~127ms gap where the guest is just idle, waiting on the next message from the host. <code>write_delay</code> is <code>instant_for_slot(547) - sent_at</code> -- the moment the guest's own <code>slot_clock</code> first recorded seeing evidence of slot 547 at all. <code>read_delay</code> is however much longer it took after that for the specific Wallet 2 balance-match to show up. Here, both things -- "slot 547 exists" and "Wallet 2's balance now matches" -- arrived in the same delivery batch, ~4ms apart. So virtually all of the real 330ms is genuinely attributable to write: the time for slot 547 itself to be produced, propagated, and reach this guest's subscription pipeline at all. Once it arrived, the answer was already sitting right there.</p>
+    <p><strong>Speculation on cause:</strong> nothing algorithmic -- <code>instant_for_slot</code> almost certainly got an exact match here (an exact match can only be equal to or later than the true slot-547 start, never fabricated early), and the fallback-to-earlier-slot path in that function would bias write_delay down, not up, so this isn't a measurement artifact. Most likely explanation: the geyser plugin/validator batches account-write notifications for a slot together and flushes them close to (or as part of) the <code>SlotStatus</code> signal for that slot -- when that happens, whichever account you're watching just "rides along" with the slot notice, and read collapses to near-zero. This one landed a bit slow on the network side (326ms for one slot transition is on the high end for this run, where sub-slot times were more like 40-350ms elsewhere) -- ordinary jitter, not an anomaly.</p>
+
+    <h3>Transfer 4 — the opposite: write ≈ 0, read dominates</h3>
+    <pre>[19.124s] sending 1,000,000 lamports Wallet 2 -&gt; Wallet 1, sent_at ≈ 19.124s, send_slot=443989540
+[19.585s] "578ms since previous slot's start() (target: &lt;400ms) -- ... 8271 account/token updates ..."
+[19.830s] on_account pubkey 203922733 (Wallet 1); slot 443989541
+[19.830s] confirmed via LowLatency  write=46µs  read=705,714µs  total=705,760µs</pre>
+    <p>Here <code>instant_for_slot(541)</code> resolved to essentially <code>sent_at</code> itself (46µs later) -- the guest already had a slot_clock entry for 541 nearly the instant the transfer was sent, meaning it had just seen that slot begin right around send time, by what's basically coincidental timing. But the specific account update for Wallet 1 (203922733) carrying the matching balance didn't show up until 706ms later -- a long, genuine propagation/delivery gap for that one account's write, well after the slot itself was already known to exist.</p>
+    <p><strong>Speculation on cause:</strong> two real candidates, not mutually exclusive:</p>
+    <ul>
+      <li><strong>Solana-side:</strong> the validator/geyser plugin doesn't necessarily emit every account's write for a slot at the same moment -- if Wallet 1's specific write got dispatched late relative to the rest of that slot's batch (or landed as part of a later, still-processing sub-step), the guest simply wouldn't see it until that specific delivery arrives, independent of when the slot itself became visible.</li>
+      <li><strong>Guest-side backpressure, with direct evidence of it right in this window:</strong> the very same window logged "578ms since previous slot's start() (target: &lt;400ms)" -- the guest's own commit-hook cadence was running behind its 400ms target at exactly this moment, while processing 8,271 account/token updates that tick. That's a real, self-reported sign the guest's overall event-delivery pipeline was under load right when this transfer needed its answer -- plausible enough to meaningfully contribute to the delay, though not something provable as the cause versus the Solana-side explanation from the log alone.</li>
+    </ul>
+    <p><strong>Why this is the write/read split doing its job, not a bug:</strong> these two transfers are genuinely independent failure/success modes for two different sub-latencies -- "how long until the guest learns the landing slot exists" vs. "how long after that until the specific watched account's write actually propagates." They can and do trade off in opposite directions run to run, sample to sample, which is exactly the point of splitting them instead of reporting one blended number.</p>
+  </div>
+
+  <footer>native-run.log (3rd validation run, Astralane + fix both active) · /home/naomi/work/mainnet/perp-latency2/</footer>
+</div>
+
+<script>
+  const rows = [{"n": 1, "lane": "LowLatency", "sig": "21pdDGr7TepPq8NtEmL3fXBm6DJAjs8GpaQdqFUm72mzYdiM15nAN5ivoERE7QFcccFzK4A6czUHjJDFiLxZ8har", "send": 443989534, "incl": 443989536, "slots": 2, "write_us": 154157, "write_bound_us": null, "read_us": 262684, "total_us": 416841, "astralane": true}, {"n": 2, "lane": "LowLatency", "sig": "3RiMHePSE2FEB4y7dnVpyHMVvBGq6ErUPRDwrAWWd4ZEDsvHCqRSNijvzPMa6t6iu6eEayvrYmpS4ouEB3bCPr24", "send": 443989536, "incl": 443989538, "slots": 2, "write_us": 213033, "write_bound_us": null, "read_us": 375993, "total_us": 589027, "astralane": true}, {"n": 3, "lane": "LowLatency", "sig": "5NqSzr9fi8uQS7KCrruwwqkhft8Vw86GKmehYf4vjiu9NJneYvwg2uLSWjz7E3YSDe1662SnJpydLc8q7d69guv", "send": 443989539, "incl": 443989540, "slots": 1, "write_us": 345568, "write_bound_us": null, "read_us": 252552, "total_us": 598121, "astralane": true}, {"n": 4, "lane": "LowLatency", "sig": "5A2VXUQfkSwpRXNmk6TGGVY8TS9cK9rmcw4Zq9MUXqNBK3W7wLGasbDjE67xL8o6a6ss3okWykhpZkXG9BH52Lsf", "send": 443989540, "incl": 443989541, "slots": 1, "write_us": 46, "write_bound_us": null, "read_us": 705714, "total_us": 705760, "astralane": true}, {"n": 5, "lane": "LowLatency", "sig": "rYNT5gygshYe8dupYzfdjWu4k4PcnMXqdVNGPyUWdjNjsu1X7C5HzFQYkV4fqXt9zVV8HTgP12oVytQNsVoF4cR", "send": 443989542, "incl": 443989544, "slots": 2, "write_us": 245597, "write_bound_us": null, "read_us": 330956, "total_us": 576554, "astralane": true}, {"n": 6, "lane": "LowLatency", "sig": "4MK9x26kqTwZU41sXgpEkkB6xaunN46LSapXnS6gFi3cCD9SMddMdKR9KTqN4FGrbywDJsYwP9QTGLeWnP5QU7EF", "send": 443989544, "incl": 443989545, "slots": 1, "write_us": 17359, "write_bound_us": null, "read_us": 353806, "total_us": 371165, "astralane": true}, {"n": 7, "lane": "LowLatency", "sig": "3iJ9PDuYjHXwbx9gXx3b9vFeohg989zYqz14pQgPJGAf4MQp7wj6yBZL4WNFGSK3XeSSERvXpZPLFNRb6255NL3e", "send": 443989546, "incl": 443989547, "slots": 1, "write_us": 326431, "write_bound_us": null, "read_us": 4290, "total_us": 330722, "astralane": true}, {"n": 8, "lane": "LowLatency", "sig": "3MdSmcjyr3SKJhvq8h2ZwTk9wJmRT4WdPS4FvwZF2htNq4eXogyMqQWYaz6KknQnQadtBXhtxAvknUky7PbjpYJS", "send": 443989547, "incl": 443989548, "slots": 1, "write_us": 212321, "write_bound_us": null, "read_us": 257033, "total_us": 469354, "astralane": true}, {"n": 9, "lane": "LowLatency", "sig": "knyjr4WbbbDFFGfPP3tTcLhDwiCMUaCVDFVygKuD8J22jwBRM1RdSNeJWKDGcrNvr3nPrD3FDZfh2N7VDx9yGrr", "send": 443989548, "incl": 443989550, "slots": 2, "write_us": 248969, "write_bound_us": null, "read_us": 121243, "total_us": 370213, "astralane": true}, {"n": 10, "lane": "LowLatency", "sig": "5tfwpaAAzAzup3Qq3VL7CyZLLpaCPkzouATdBAJnNHrdxu99GrEa3Zv2uMbNUpQrA3XynzcRFuzVm6qgcbQTML6W", "send": 443989550, "incl": 443989551, "slots": 1, "write_us": 56620, "write_bound_us": null, "read_us": 267697, "total_us": 324317, "astralane": true}, {"n": 11, "lane": "LowLatency", "sig": "cUGStx8gYdvNZpMXRiiqAmy3hJmMLjpMrdKPjg3Hc2nrw7jEqBTGjcWKapGURcPeTS8WC7AejFj8cLFvoRR9Rq2", "send": 443989551, "incl": 443989552, "slots": 1, "write_us": 37527, "write_bound_us": null, "read_us": 376691, "total_us": 414219, "astralane": true}, {"n": 12, "lane": "LowLatency", "sig": "4EX7FfBh2a7StpQ5d1w9Kkn3kJ1fZKYEV9MdHhKh22oC8jwnLdxgm3bD6ndbWzwpZMHvtj2mhH4RgvuEeGn9FJxe", "send": 443989552, "incl": 443989553, "slots": 1, "write_us": 56, "write_bound_us": null, "read_us": 257920, "total_us": 257976, "astralane": true}, {"n": 13, "lane": "LowLatency", "sig": "CF4F8JRHJn6299QmvGetAjjcyk2VnAQf8VdKfgiAixQfGe3bVah6dMDWdR9jpxwq72uqe4U354gVxZJKPL9b28W", "send": 443989553, "incl": 443989554, "slots": 1, "write_us": 31, "write_bound_us": null, "read_us": 312164, "total_us": 312195, "astralane": true}, {"n": 14, "lane": "LowLatency", "sig": "3Km2683ukB2bb2woyjNCpj3cgs5bfWKCHWyudk5a42hp81euAuizMsTYF3mT7ybNxUugLhh8ZyNg5SMLrKCUMbaH", "send": 443989554, "incl": 443989555, "slots": 1, "write_us": 55, "write_bound_us": null, "read_us": 331514, "total_us": 331570, "astralane": true}, {"n": 15, "lane": "LowLatency", "sig": "duEGJEsDHi1jGvCqp3Fzf7oWkvQfvqHcjM6HuMmCDBzC2CEMoRtPHGG3RRbrUfDscTKcLmt6xLY8i5aP2wBow3d", "send": 443989556, "incl": 443989556, "slots": 0, "write_us": null, "write_bound_us": null, "read_us": null, "total_us": 378593, "astralane": true}, {"n": 16, "lane": "LowLatency", "sig": "5Sh2fcr18243RhZ7myi7gTLorkh2vhXrMoi4pgLhsXWK1jniynDc3qWLFXGAvv6jfcHC21hM6R9qUErcNfaPH1oM", "send": 443989556, "incl": 443989557, "slots": 1, "write_us": 561, "write_bound_us": null, "read_us": 296526, "total_us": 297088, "astralane": true}, {"n": 17, "lane": "LowLatency", "sig": "5mrEjeqgUKxTyGZxQBw4zXFyvJJgFBfH6TTvDN4smiYMqUT45W7VRj7E1xJinprWLExEx68YGBcoQvvx7uoxRLnu", "send": 443989558, "incl": 443989558, "slots": 0, "write_us": null, "write_bound_us": null, "read_us": null, "total_us": 265735, "astralane": true}, {"n": 18, "lane": "LowLatency", "sig": "4f2GV6kcyRjCm8VZ9jkpV9DZXoF5JtnsCSeFZs4MYBvrW4u913Z3jyLyeK1difvEuNfwtSDM9rgS4o28SguBAynv", "send": 443989558, "incl": 443989559, "slots": 1, "write_us": 52, "write_bound_us": null, "read_us": 566991, "total_us": 567043, "astralane": true}, {"n": 19, "lane": "LowLatency", "sig": "2vBdPEzzCorpoXWHjYh5neMhjHFE7HayYFNQfFVd6xiouKChwx1rgq1E8HU2DBs143927EXcpLPWNtmVAgF1KWmt", "send": 443989559, "incl": 443989561, "slots": 2, "write_us": 89, "write_bound_us": null, "read_us": 255355, "total_us": 255444, "astralane": true}, {"n": 20, "lane": "LowLatency", "sig": "MbXo49NrzpeDWLoNxNCZeyitnbtbyJ3eQup9ugGwA7GN9LF6AhFf1VC9PErftrpZrZnKcpdqgZamjYWdG9PLQfM", "send": 443989560, "incl": 443989562, "slots": 2, "write_us": 211201, "write_bound_us": null, "read_us": 348726, "total_us": 559927, "astralane": true}];
+  function median(arr) {
+    if (!arr.length) return null;
+    const s = arr.slice().sort((a, b) => a - b);
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  }
+  // Last-resort prior for a same-slot sample with no real bound either --
+  // this run's own median resolved write delay. Not tied to the specific
+  // sample at all (see the "rough" tier's tooltip), but better than
+  // nothing and clearly flagged as such.
+  const fallbackWrite = median(rows.filter(r => r.write_us !== null).map(r => r.write_us));
+  rows.forEach(r => {
+    r.astralane_label = r.astralane ? "astralane" : "plain";
+    r.unresolved = r.write_us === null;
+    if (r.write_us !== null) {
+      r.write_display_us = r.write_us;
+      r.write_kind = "real";
+    } else if (r.write_bound_us !== null && r.write_bound_us !== undefined) {
+      r.write_display_us = r.write_bound_us / 2;
+      r.write_kind = "bounded";
+    } else {
+      r.write_display_us = fallbackWrite;
+      r.write_kind = "rough";
+    }
+    if (r.read_us !== null) {
+      r.read_display_us = r.read_us;
+      r.read_kind = "real";
+    } else if (r.write_display_us !== null && r.write_display_us !== undefined) {
+      r.read_display_us = Math.max(0, r.total_us - r.write_display_us);
+      r.read_kind = r.write_kind;
+    } else {
+      r.read_display_us = null;
+      r.read_kind = "real";
+    }
+    r.write_sort = r.write_display_us ?? -1;
+    r.read_sort = r.read_display_us ?? -1;
+  });
+  const maxTotal = Math.max(...rows.map(r => r.total_us));
+  const fmtUs = new Intl.NumberFormat();
+  const fmtMs = new Intl.NumberFormat(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+
+  let currentFilter = "all";
+  let sortKey = "n";
+  let sortDir = 1;
+  let unit = "us";
+  try {
+    const saved = localStorage.getItem("native-validation-unit");
+    if (saved === "us" || saved === "ms") unit = saved;
+  } catch {}
+
+  function truncSig(sig) {
+    return sig.slice(0, 6) + "…" + sig.slice(-6);
+  }
+
+  function formatDuration(us) {
+    if (us === null) return '<span class="unknown-val">unknown</span>';
+    return unit === "ms" ? fmtMs.format(us / 1000) : fmtUs.format(us);
+  }
+
+  function fmtVal(us) {
+    return unit === "ms" ? fmtMs.format(us / 1000) : fmtUs.format(us);
+  }
+
+  // kind: "real" (measured, no styling), "bounded" (midpoint of a real
+  // upper bound for this sample), "rough" (no bound either -- this run's
+  // own median resolved write, not sample-specific at all). See the
+  // caveat box's own explanation of what each tier actually means.
+  function formatEstimate(us, kind, boundUs) {
+    if (us === null || us === undefined) return '<span class="unknown-val">unknown</span>';
+    if (kind === "real") return fmtVal(us);
+    const title = kind === "bounded"
+      ? `Estimated: midpoint of this sample's real upper bound (≤${fmtVal(boundUs)}${unit === "ms" ? "ms" : "µs"}). The true value could be anywhere from 0 up to that bound -- this is a guess at the middle, not a measurement.`
+      : `Rough estimate: no bound exists for this sample either, so this falls back to this run's own median resolved write delay -- not tied to this specific sample at all.`;
+    const cls = kind === "bounded" ? "estimate-bounded" : "estimate-rough";
+    return `<span class="${cls}" title="${title}">~${fmtVal(us)}</span>`;
+  }
+
+  function updateHeaders() {
+    const suffix = unit === "ms" ? "(ms)" : "(µs)";
+    document.getElementById("th-write").firstChild.textContent = `Write ≥ ${suffix}`;
+    document.getElementById("th-read").firstChild.textContent = `Read ≤ ${suffix}`;
+    document.getElementById("th-total").firstChild.textContent = `Total ${suffix}`;
+  }
+
+  function render() {
+    updateHeaders();
+    const tbody = document.getElementById("tbody");
+    let visible = rows;
+    if (currentFilter === "unresolved") visible = rows.filter(r => r.unresolved);
+    else if (currentFilter !== "all") visible = rows.filter(r => r.astralane_label === currentFilter);
+    visible = visible.slice().sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      if (typeof av === "string") return av.localeCompare(bv) * sortDir;
+      return (av - bv) * sortDir;
+    });
+    tbody.innerHTML = visible.map(r => {
+      const pct = Math.max(4, Math.round((r.total_us / maxTotal) * 100));
+      return `<tr class="${r.unresolved ? "unresolved" : ""}">
+        <td>${r.n}</td>
+        <td><span class="lane-badge ${r.lane}">${r.lane === "LowLatency" ? "Account" : r.lane}</span></td>
+        <td><span class="astra-badge ${r.astralane ? "" : "plain"}">${r.astralane ? "astralane" : "plain"}</span></td>
+        <td class="sig"><a href="https://explorer.solana.com/tx/${r.sig}" target="_blank" rel="noopener noreferrer" title="${r.sig}">${truncSig(r.sig)}</a></td>
+        <td>${r.send}</td>
+        <td>${r.incl}</td>
+        <td>${r.slots}</td>
+        <td>${formatEstimate(r.write_display_us, r.write_kind, r.write_bound_us)}</td>
+        <td>${formatEstimate(r.read_display_us, r.read_kind, r.write_bound_us)}</td>
+        <td>
+          <div class="total-cell">
+            <span class="total-num">${formatDuration(r.total_us)}</span>
+            <span class="bar-track"><span class="bar-fill" style="width:${pct}%"></span></span>
+          </div>
+        </td>
+      </tr>`;
+    }).join("");
+  }
+
+  document.querySelectorAll(".chip[data-filter]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      currentFilter = btn.dataset.filter;
+      document.querySelectorAll(".chip[data-filter]").forEach(b => b.setAttribute("aria-pressed", b === btn));
+      render();
+    });
+  });
+
+  document.querySelectorAll(".chip[data-unit]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      unit = btn.dataset.unit;
+      document.querySelectorAll(".chip[data-unit]").forEach(b => b.setAttribute("aria-pressed", b === btn));
+      try { localStorage.setItem("native-validation-unit", unit); } catch {}
+      render();
+    });
+  });
+  document.querySelectorAll(".chip[data-unit]").forEach(b => {
+    b.setAttribute("aria-pressed", b.dataset.unit === unit ? "true" : "false");
+  });
+
+  document.querySelectorAll("thead th[data-key]").forEach(th => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.key;
+      if (sortKey === key) {
+        sortDir *= -1;
+      } else {
+        sortKey = key;
+        sortDir = 1;
+      }
+      document.querySelectorAll("thead th").forEach(h => { h.classList.remove("sorted"); h.removeAttribute("data-dir"); });
+      th.classList.add("sorted");
+      th.setAttribute("data-dir", sortDir === 1 ? "▲" : "▼");
+      render();
+    });
+  });
+
+  render();
+</script>

@@ -1,0 +1,9 @@
+# Never send target/ (gitignored, currently multi-GB of local build
+# artifacts) as part of any image's build context - builder.Dockerfile
+# deliberately doesn't run `cargo build` at image-build time at all
+# (contrib/builder.pl runs the real compile per /build request instead),
+# so nothing under target/ is ever needed in the image to begin with.
+target
+.git
+.env
+*.db

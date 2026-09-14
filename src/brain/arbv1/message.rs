@@ -1,17 +1,25 @@
-use std::{cell::UnsafeCell, rc::Rc};
-
-use solana_sdk::{signature::Keypair, signer::Signer};
-
+//! Stdin/stdout message serialization for arbv1.
+//! Mirrors the key flags defined in the Go brain's message.go.
+//! Inbound (stdin): EchoRequest, Wallet, AddressLookupTable.
+//! Outbound (stdout): EchoResponse, LatencyReportV1.
 use crate::{
-    brain::helloworldv1::state::LatencyReportV1,
+    brain::arbv1::state::LatencyReportV1,
     err::CatscopeGuestError,
     message::{KeyValuePair, MessageDeserializer, MessageSerializer},
 };
+use solana_sdk::{signature::Keypair, signer::Signer};
+use std::{cell::UnsafeCell, rc::Rc};
 
-pub(crate) enum CustomMessageInbound {
+pub enum CustomMessageInbound {
     Blank,
     EchoRequest(String),
     Wallet(Rc<UnsafeCell<Keypair>>),
+    /// Shared, cross-strategy: a live bundler tip update pushed by
+    /// `optimizer/bundler.RunTipBroadcaster`. See
+    /// `crate::bundler_message::BundlerTipUpdate`'s doc comment --
+    /// consumed by `Wallet::apply_bundler_tip_update`, not this module
+    /// directly.
+    CommonBundlerTipUpdate(crate::bundler_message::BundlerTipUpdate),
 }
 
 impl Default for CustomMessageInbound {
@@ -59,6 +67,11 @@ impl MessageDeserializer for CustomMessageInbound {
                 }
                 *self = Self::Wallet(Rc::new(UnsafeCell::new(secret_key)));
             }
+            crate::bundler_message::COMMON_KEY_FLAG_BUNDLER_TIP_UPDATE => {
+                *self = Self::CommonBundlerTipUpdate(
+                    crate::bundler_message::BundlerTipUpdate::parse(kvp.value())?,
+                );
+            }
             _ => {
                 *self = Self::Blank;
             }
@@ -67,7 +80,7 @@ impl MessageDeserializer for CustomMessageInbound {
     }
 }
 
-pub(crate) enum CustomMessageOutbound {
+pub enum CustomMessageOutbound {
     EchoResponse(String),
     LatencyReportV1(LatencyReportV1),
 }

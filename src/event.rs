@@ -1,7 +1,7 @@
 use solana_sdk::clock::Slot;
 
 use crate::{
-    catscope::witbot::shooter::{Accountv1, Header, Tokenaccountv1},
+    catscope::witbot::shooter::{Accountv1, Header},
     err::CatscopeGuestError,
     graph::{Commit, LowLatencyAccountUpdate},
     txview::TransactionList,

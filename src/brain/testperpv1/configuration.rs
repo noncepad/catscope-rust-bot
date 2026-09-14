@@ -1,3 +1,14 @@
+//! Runtime configuration for testperpv1's inter-venue perp funding-rate
+//! framework, populated from the Go brain via stdin messages (mirrors
+//! `arbv1::configuration`'s shape). `wallet` is set once `KeyFlagWallet` arrives (see
+//! `state::StateHelper::on_message`); `mint_sol`/`mint_usdc` are fixed
+//! constants, same values as `arbv1::configuration`, resolved to
+//! `AccountId` by `.set()` -- needed by
+//! `state::StateHelper::execute_spot_leg`'s `TradeRouter` calls, which
+//! route by `AccountId`, not raw `Pubkey`. Mirrors `arbv1::configuration`:
+//! `Default` stays free of `account_id_from_pubkey` (a WIT host import
+//! that aborts outside the real WASM guest runtime), only `.set()`
+//! (called from `evaluate()`, real-runtime-only) resolves them.
 use std::{cell::UnsafeCell, rc::Rc, time::Instant};
 
 use solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer as _};
@@ -15,6 +26,7 @@ pub struct Configuration {
     pub(crate) wallet: AccountId,
     pub(crate) mint_sol: AccountId,
     pub(crate) mint_usdc: AccountId,
+    #[allow(dead_code)]
     pub(crate) max_slippage: f64,
 }
 
@@ -22,7 +34,7 @@ impl Default for Configuration {
     fn default() -> Self {
         Self {
             start: Instant::now(),
-            count: Default::default(),
+            count: 0,
             wallet: Default::default(),
             mint_sol: Default::default(),
             mint_usdc: Default::default(),
@@ -30,6 +42,7 @@ impl Default for Configuration {
         }
     }
 }
+
 impl Configuration {
     pub fn set(&mut self, rc_keypair: &Rc<UnsafeCell<Keypair>>) {
         let keypair = rc_unlock(rc_keypair);

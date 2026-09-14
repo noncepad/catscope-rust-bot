@@ -1,0 +1,462 @@
+<title>Run 3 vs Run 4</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #eef1f4;
+    --border: #dde2e7;
+    --text: #161b22;
+    --text-dim: #5c6773;
+    --account: #0e7c86;
+    --account-bg: #e3f3f2;
+    --tx: #a66a12;
+    --tx-bg: #f7ecd9;
+    --astra: #6a3fb5;
+    --astra-bg: #ece3f8;
+    --ok: #1a7f4e;
+    --ok-bg: #e2f5ea;
+    --unknown: #6b7280;
+    --unknown-bg: #eceef1;
+    --focus: #2f6fed;
+    --run3: #a66a12;
+    --run3-bg: #f7ecd9;
+    --run4: #0e7c86;
+    --run4-bg: #e3f3f2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1316;
+      --surface: #151b1f;
+      --surface-2: #1b2227;
+      --border: #28323a;
+      --text: #e7ecef;
+      --text-dim: #8a97a3;
+      --account: #4ad9c9;
+      --account-bg: #133633;
+      --tx: #f2b544;
+      --tx-bg: #3a2e10;
+      --astra: #b79aef;
+      --astra-bg: #2a2140;
+      --ok: #5fd399;
+      --ok-bg: #123023;
+      --unknown: #9aa4ae;
+      --unknown-bg: #232a30;
+      --focus: #6c9bff;
+      --run3: #f2b544;
+      --run3-bg: #3a2e10;
+      --run4: #4ad9c9;
+      --run4-bg: #133633;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1316;
+    --surface: #151b1f;
+    --surface-2: #1b2227;
+    --border: #28323a;
+    --text: #e7ecef;
+    --text-dim: #8a97a3;
+    --account: #4ad9c9;
+    --account-bg: #133633;
+    --tx: #f2b544;
+    --tx-bg: #3a2e10;
+    --astra: #b79aef;
+    --astra-bg: #2a2140;
+    --ok: #5fd399;
+    --ok-bg: #123023;
+    --unknown: #9aa4ae;
+    --unknown-bg: #232a30;
+    --focus: #6c9bff;
+    --run3: #f2b544;
+    --run3-bg: #3a2e10;
+    --run4: #4ad9c9;
+    --run4-bg: #133633;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: 1500px;
+    margin: 0 auto;
+    padding: 2.5rem 1.5rem 4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.75rem;
+  }
+  header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin: 0 0 0.35rem;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+  header .meta {
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  .prose p { line-height: 1.6; }
+  .banner {
+    background: var(--ok-bg);
+    color: var(--ok);
+    border: 1px solid var(--ok);
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+
+  .compare-table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: auto;
+  }
+  table.compare {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.88rem;
+  }
+  table.compare th, table.compare td {
+    padding: 0.65rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  table.compare thead th {
+    font-family: "IBM Plex Sans", sans-serif;
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    background: var(--surface-2);
+  }
+  table.compare tbody tr:last-child td { border-bottom: none; }
+  table.compare td.metric-name {
+    font-family: "IBM Plex Sans", sans-serif;
+    color: var(--text-dim);
+    font-size: 0.82rem;
+  }
+  .run3-col { color: var(--run3); font-weight: 600; }
+  .run4-col { color: var(--run4); font-weight: 600; }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .toolbar .hint {
+    color: var(--text-dim);
+    font-size: 0.82rem;
+    margin-left: auto;
+  }
+  .chip {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 0.82rem;
+    padding: 0.4rem 0.85rem;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .chip:hover { border-color: var(--focus); }
+  .chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .chip[aria-pressed="true"] {
+    background: var(--text);
+    color: var(--bg);
+    border-color: var(--text);
+  }
+  .unit-toggle {
+    display: flex;
+    gap: 0.25rem;
+    background: var(--surface-2);
+    border-radius: 999px;
+    padding: 0.2rem;
+  }
+  .unit-toggle .chip {
+    border: none;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.78rem;
+  }
+  .unit-toggle .chip[aria-pressed="true"] {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  }
+
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: auto;
+    max-height: 70vh;
+  }
+  table.rows {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.86rem;
+  }
+  table.rows thead th {
+    position: sticky;
+    top: 0;
+    background: var(--surface-2);
+    text-align: left;
+    padding: 0.6rem 0.6rem;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+  }
+  table.rows thead th:hover { color: var(--text); }
+  table.rows thead th.sorted::after {
+    content: " " attr(data-dir);
+    font-size: 0.7em;
+  }
+  table.rows tbody td {
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  table.rows tbody tr:last-child td { border-bottom: none; }
+  table.rows tbody tr:hover td { background: var(--surface-2); }
+  table.rows tbody tr.unresolved td { background: var(--unknown-bg); }
+
+  .run-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.74rem;
+    font-family: "IBM Plex Sans", sans-serif;
+    font-weight: 600;
+  }
+  .run-badge.run3 { background: var(--run3-bg); color: var(--run3); }
+  .run-badge.run4 { background: var(--run4-bg); color: var(--run4); }
+
+  .lane-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.74rem;
+    font-family: "IBM Plex Sans", sans-serif;
+    font-weight: 600;
+    background: var(--account-bg);
+    color: var(--account);
+  }
+  .astra-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-family: "IBM Plex Sans", sans-serif;
+    font-weight: 600;
+    background: var(--astra-bg);
+    color: var(--astra);
+  }
+  .sig a {
+    color: var(--text-dim);
+    text-decoration: none;
+    border-bottom: 1px dashed var(--border);
+  }
+  .sig a:hover, .sig a:focus-visible {
+    color: var(--focus);
+    border-bottom-color: var(--focus);
+  }
+  .unknown-val {
+    color: var(--unknown);
+    font-style: italic;
+  }
+  footer {
+    color: var(--text-dim);
+    font-size: 0.78rem;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+  }
+</style>
+
+<div class="page">
+  <header>
+    <h1>Run 3 vs Run 4</h1>
+    <div class="meta">testperplatencyv1 · protocol=native · two consecutive 20/20 native-transfer runs, same day</div>
+  </header>
+
+  <div class="prose">
+    <p><strong>Run 3</strong> landed 20/20 in ~56 seconds, with one real outlier (transfer 19 stalled ~9.6s, transfer 20 landed 31 slots after send). <strong>Run 4</strong> landed 20/20 in ~21 seconds with no anomalies -- the fastest of the four runs done today. Both ran back-to-back on the same validator, same wallets, same code -- the only thing that changed between them is ordinary network/cluster conditions at the time.</p>
+  </div>
+
+  <div class="banner">
+    Both runs: 20/20 via Astralane, all 20 won by the Account/LowLatency lane. Run 4's per-transfer Account latency (p50 413ms) and Total (p50 422ms) were close to Run 3's (p50 439ms), despite finishing in under half the wall-clock time -- Run 3's total run time was dominated by the single ~9.6s stall on transfer 19, not by consistently slower per-transfer latency.
+  </div>
+
+  <div class="compare-table-wrap">
+    <table class="compare">
+      <thead>
+        <tr><th>Metric</th><th class="run3-col">Run 3 (~56s)</th><th class="run4-col">Run 4 (~21s)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="metric-name">Astralane bundle</td><td>20 / 20</td><td>20 / 20</td></tr>
+        <tr><td class="metric-name">Account (Total) latency</td><td>n=20 · p50 439ms · p99 &gt;7.9s (outlier)</td><td>n=20 · p50 422ms · p99 854ms</td></tr>
+        <tr><td class="metric-name">Slots until inclusion</td><td>p50=1 (p99 skewed by 31-slot outlier)</td><td>p50=1 · p99=2</td></tr>
+        <tr><td class="metric-name">Write (lower bound)</td><td>n=14 · p50 105ms · p99 328ms</td><td>n=13 · p50 131ms · p99 328ms</td></tr>
+        <tr><td class="metric-name">Read (upper bound)</td><td>n=14 · p50 341ms · p99 477ms</td><td>n=13 · p50 364ms · p99 548ms</td></tr>
+        <tr><td class="metric-name">Shred→Completed</td><td>n=19 · p50 57ms · p99 449ms</td><td>n=19 · p50 147ms · p99 421ms</td></tr>
+        <tr><td class="metric-name">Completed→Processed</td><td>n=15 · p50 2ms · p99 97ms</td><td>n=18 · p50 14ms · p99 117ms</td></tr>
+        <tr><td class="metric-name">Processed→Confirmed</td><td>n=14 · p50 0ms · p99 270ms</td><td>n=16 · p50 0ms · p99 182ms</td></tr>
+        <tr><td class="metric-name">Same-slot / estimated</td><td>6 / 20</td><td>7 / 20</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="toolbar" role="group" aria-label="Filter">
+    <button class="chip" data-filter="all" aria-pressed="true">All (40)</button>
+    <button class="chip" data-filter="Run 3" aria-pressed="false">Run 3 (20)</button>
+    <button class="chip" data-filter="Run 4" aria-pressed="false">Run 4 (20)</button>
+    <div class="unit-toggle" role="group" aria-label="Time unit">
+      <button class="chip" data-unit="us" aria-pressed="true">µs</button>
+      <button class="chip" data-unit="ms" aria-pressed="false">ms</button>
+    </div>
+    <span class="hint">Click a column header to sort</span>
+  </div>
+
+  <div class="table-wrap">
+    <table class="rows">
+      <thead>
+        <tr>
+          <th data-key="run" data-type="str">Run</th>
+          <th data-key="n" data-type="num">#</th>
+          <th data-key="sig" data-type="str">Signature</th>
+          <th data-key="send" data-type="num">Send Slot</th>
+          <th data-key="incl" data-type="num">Inclusion Slot</th>
+          <th data-key="slots" data-type="num">Slots</th>
+          <th data-key="write_sort" data-type="num" id="th-write">Write ≥ (µs)</th>
+          <th data-key="read_sort" data-type="num" id="th-read">Read ≤ (µs)</th>
+          <th data-key="shred_completed_sort" data-type="num" id="th-shred-completed">Shred→Completed (µs)</th>
+          <th data-key="completed_processed_sort" data-type="num" id="th-completed-processed">Completed→Processed (µs)</th>
+          <th data-key="processed_confirmed_sort" data-type="num" id="th-processed-confirmed">Processed→Confirmed (µs)</th>
+          <th data-key="total_us" data-type="num" id="th-total">Total (µs)</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <footer>native-run.attempt18.log (Run 3) + native-run.log (Run 4) · /home/naomi/work/mainnet/perp-latency2/</footer>
+</div>
+
+<script>
+  const rows = [{"run": "Run 3", "run_seconds": 56, "n": 1, "lane": "LowLatency", "sig": "5EGccMppTkSigDedETR1m1SGvMYyMxTVCR1Pt1Nas32qeJgssQoT1jRVyDYxdLNihy8Z4ibTpycxoiv73FCQDpSR", "send": 444249016, "incl": 444249017, "slots": 1, "write_bound_us": null, "write_us": 44473, "read_us": 432578, "total_us": 477052, "shred_completed_us": 224007, "completed_processed_us": 707, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 2, "lane": "LowLatency", "sig": "3GZ752pYQke9q59vdoyJ5c3GjH4B87vVjiFwwreTfywqyikMm4oweqw259C7FquAmWE7p9oavAHrFGW4hRP6GFah", "send": 444249017, "incl": 444249018, "slots": 1, "write_bound_us": null, "write_us": 8018, "read_us": 337975, "total_us": 345994, "shred_completed_us": 312594, "completed_processed_us": null, "processed_confirmed_us": 1, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 3, "lane": "LowLatency", "sig": "5pgTRZeNDn7cjXrsGQGwn3p3R6Eh3A7DR4yHRoT2yJWzW5fRgzPbV8W8DzhLouy3TyRiYbEP1bPRYW4npJQxhnSv", "send": 444249019, "incl": 444249019, "slots": 0, "write_bound_us": 199574, "write_us": null, "read_us": null, "total_us": 411403, "shred_completed_us": 442414, "completed_processed_us": null, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 4, "lane": "LowLatency", "sig": "3x7xRF7dQYkkSKwP1v3eXBhtt6Rp87HjmVpbDKaxmK7qDj9mqU9dtVAFYRK7ZVsnnxkFtZR9LqGbsrot3N949ZkS", "send": 444249020, "incl": 444249021, "slots": 1, "write_bound_us": null, "write_us": 166076, "read_us": 294292, "total_us": 460368, "shred_completed_us": 49, "completed_processed_us": 83108, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 5, "lane": "LowLatency", "sig": "5deUBrroQuKXEhKTWJcvm75yk7Fjriwi3gMqrhAqN4ErELJXV6xgFhjwKhwiUQLNje3p99CtPjGJjFNspCkZ2L5k", "send": 444249021, "incl": 444249022, "slots": 1, "write_bound_us": null, "write_us": 31886, "read_us": 254193, "total_us": 286079, "shred_completed_us": 179260, "completed_processed_us": null, "processed_confirmed_us": 174586, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 6, "lane": "LowLatency", "sig": "4Kafo8awW4mbpZgK1GxKTwnK5T3BKbAw4Cab83YKoFprPcmV8APDG7YfhEBxJzN3cpzuPAZfZmifzRnXP9d4kikR", "send": 444249023, "incl": 444249024, "slots": 1, "write_bound_us": null, "write_us": 220959, "read_us": 189480, "total_us": 410439, "shred_completed_us": 0, "completed_processed_us": 1, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 7, "lane": "LowLatency", "sig": "2ggKZKDdkVyA2pyMLAkZcm7cryJRkjVbuL7FubWUVtGmf2Sf8EndbEKgfW4qCnM4ivjjoFnmvyFFhTMB43v2TA7j", "send": 444249024, "incl": 444249025, "slots": 1, "write_bound_us": null, "write_us": 51, "read_us": 429295, "total_us": 429347, "shred_completed_us": 57103, "completed_processed_us": 99397, "processed_confirmed_us": 102317, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 8, "lane": "LowLatency", "sig": "5sHKomP3WE45CwWa6PeJyBy1PrYfqnYbCu1KBL4XWjYhfbMEXsuKCsjCorBQUnSV2Yo7NNoZ96s3mPX9ZcFYMraP", "send": 444249026, "incl": 444249026, "slots": 0, "write_bound_us": null, "write_us": null, "read_us": null, "total_us": 230965, "shred_completed_us": 156444, "completed_processed_us": 1857, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 9, "lane": "LowLatency", "sig": "4j4bNeVb2ccr4DVNYAxDv1F1HBdXDLtmrgU3CxirrfAQ655H1833CRcRXGfLuiFpyz5t4SGC73CgFM11z7HjYiu4", "send": 444249026, "incl": 444249027, "slots": 1, "write_bound_us": null, "write_us": 14, "read_us": 459163, "total_us": 459177, "shred_completed_us": 0, "completed_processed_us": 3027, "processed_confirmed_us": 259709, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 10, "lane": "LowLatency", "sig": "5GrZffRHtoo2BZ3fLtcENT38MWhAM4opasfdyxKDRrEpEY6oyz9ctDBre1BkJ3o5cQfEQ4j8up1NDLzaK3HrMj34", "send": 444249028, "incl": 444249028, "slots": 0, "write_bound_us": 235850, "write_us": null, "read_us": null, "total_us": 282948, "shred_completed_us": 376254, "completed_processed_us": null, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 11, "lane": "LowLatency", "sig": "3SWGdCbGLcvxQQcf2oLBMQomuQVamVgWjLMFbjFcSb49nHJVfBgJtRe6hgTwcYnv7vcNXUeUEi8vt72ra2Jndt9v", "send": 444249029, "incl": 444249029, "slots": 0, "write_bound_us": 283307, "write_us": null, "read_us": null, "total_us": 439066, "shred_completed_us": 10208, "completed_processed_us": 37183, "processed_confirmed_us": 271822, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 12, "lane": "LowLatency", "sig": "2PiktzLhsZ8zuVb4Np2J7Pny8xN3MCwKkQaJxpaKD2mcszNd9kk1APWpZJjPodyPG3dCyvPfQuzKEvUShULmg7fZ", "send": 444249030, "incl": 444249031, "slots": 1, "write_bound_us": null, "write_us": null, "read_us": null, "total_us": 342667, "shred_completed_us": 156319, "completed_processed_us": 2821, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 13, "lane": "LowLatency", "sig": "yUPchkaWYNH7UVvRVyPFHCLVZtCoQohGVm6w6qyyL1Edvn6KDnGoAmqThqUmaQt6eKo8QKxNR444AUQkVe1c2fj", "send": 444249030, "incl": 444249032, "slots": 2, "write_bound_us": null, "write_us": 190161, "read_us": 480123, "total_us": 670285, "shred_completed_us": 450214, "completed_processed_us": null, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 14, "lane": "LowLatency", "sig": "3JSCMaXsgnNqSUV25zv1BKBAYkzwraSoBNzZ3S9Wt98Y7TZ3kA8DyDCuKVxvMzzrDYJ9qytaS8u6MermZGFPdU4M", "send": 444249033, "incl": 444249034, "slots": 1, "write_bound_us": null, "write_us": 234625, "read_us": 368513, "total_us": 603139, "shred_completed_us": 30405, "completed_processed_us": 5936, "processed_confirmed_us": 2, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 15, "lane": "LowLatency", "sig": "5Uvimeaz4xRGBni7QmFBGBMEFegBre3jQhi9AWWH6TWz1Unhq8V1bbqM56wJsFjQ1qJayCyFgPtfs2W53pSt2rG8", "send": 444249034, "incl": 444249036, "slots": 2, "write_bound_us": null, "write_us": 247619, "read_us": 343635, "total_us": 591255, "shred_completed_us": 0, "completed_processed_us": 1, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 16, "lane": "LowLatency", "sig": "ngyonEoebN1yP3668FDt8Te8RznkXCfQuuLRYySkgeZdLt57whhRH2f7UDNVSXox9v3iaZprUYTD7TH5zBgQSum", "send": 444249036, "incl": 444249038, "slots": 2, "write_bound_us": null, "write_us": 8417, "read_us": 429774, "total_us": 438191, "shred_completed_us": 0, "completed_processed_us": 0, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 17, "lane": "LowLatency", "sig": "iQTz31YsyU89B9eFg64C1CZ5Xh519AFFfK8uX5jpkyyddy4pf3LDoArufcDvoyinnL1EZ6PTfCNwKdfnpJrZyFL", "send": 444249037, "incl": 444249039, "slots": 2, "write_bound_us": null, "write_us": 22375, "read_us": 246161, "total_us": 268536, "shred_completed_us": 0, "completed_processed_us": 1, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 18, "lane": "LowLatency", "sig": "5Br7W88B1q2p7tM2tfEcFVTq2obFFYngu4ym2F6ty1hD7LypoN7Va7zkuYYwLTPfnwYJSiBDsQo1zUWiuL7nSv2e", "send": 444249038, "incl": 444249040, "slots": 2, "write_bound_us": null, "write_us": 337340, "read_us": 189187, "total_us": 526527, "shred_completed_us": null, "completed_processed_us": 1, "processed_confirmed_us": 191245, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 19, "lane": "LowLatency", "sig": "3LwYmdz8zAFzuSWiKBPEuVkWu29zTcqNauEbQnaTnEcE4coLV95xpZFXmph2xSQ9uNcnNktXu3krNuRuiRVvGEaB", "send": 444249041, "incl": 444249042, "slots": 1, "write_bound_us": null, "write_us": null, "read_us": null, "total_us": 9606715, "shred_completed_us": 187659, "completed_processed_us": 5489, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 3", "run_seconds": 56, "n": 20, "lane": "LowLatency", "sig": "3rrxTJ3vuhsA2h1oGwYfod8Qi5ZPkMjr8kBAYzbcj2o9kD3XHymu93yUYaiCp8RNFG9LWZzRCbf1kBbkVCZzEph6", "send": 444249041, "incl": 444249072, "slots": 31, "write_bound_us": null, "write_us": 268980, "read_us": 193558, "total_us": 462538, "shred_completed_us": 19, "completed_processed_us": 0, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 1, "lane": "LowLatency", "sig": "LoaVf233VCSQb5v7LzxkMDvRMUrTYotc18V2GEqoxyTZXeLdQLmL9GyBC1TC8ehPqqhUMKonUsNVFxoftQctjHt", "send": 444250841, "incl": 444250841, "slots": 0, "write_bound_us": 163820, "write_us": null, "read_us": null, "total_us": 510649, "shred_completed_us": 425571, "completed_processed_us": 13219, "processed_confirmed_us": 5, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 2, "lane": "LowLatency", "sig": "3tqxRP8TFom9mekXE8NkXR5RqdYa38RK8qdvj8xt1E4ire1vhYAz2dKCSexkttGRSpASHTrfySwKHZyusRwVu225", "send": 444250842, "incl": 444250843, "slots": 1, "write_bound_us": null, "write_us": 14, "read_us": 412573, "total_us": 412587, "shred_completed_us": 400276, "completed_processed_us": 1, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 3, "lane": "LowLatency", "sig": "4QWSQPzvmVh8RDyhjd6MRRzi1NysH99e5dMpwJTBqYJZunwkuyCJJ8gEnFe59x5CMn399ZBLyZ7DdKr7oCeEHFbk", "send": 444250844, "incl": 444250844, "slots": 0, "write_bound_us": 233615, "write_us": null, "read_us": null, "total_us": 237839, "shred_completed_us": 247861, "completed_processed_us": 1, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 4, "lane": "LowLatency", "sig": "64Q4zNbVGMa7HZL4J8aKKX4gmG41UfArV3ubHYFzgQbzwWotZouXZhgtursUHTp4rXKxzUZbjryuSMrUEzEo3mX1", "send": 444250845, "incl": 444250845, "slots": 0, "write_bound_us": 190627, "write_us": null, "read_us": null, "total_us": 318690, "shred_completed_us": 1379, "completed_processed_us": 1, "processed_confirmed_us": 192795, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 5, "lane": "LowLatency", "sig": "3h6YjiMScg1uwW2ApNaeBRY4N5nSAMf55dXijX2q6BqLwukp3nNxjZvwKMMzKdJ2oVq48QXB5NqQ7rwfBs5wdYCp", "send": 444250846, "incl": 444250846, "slots": 0, "write_bound_us": 187528, "write_us": null, "read_us": null, "total_us": 280650, "shred_completed_us": 128246, "completed_processed_us": 20700, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 6, "lane": "LowLatency", "sig": "4ZSo3is4N59LNnTCXbnzSYNX2XcahzhhAupZ8c1qjQDnFSm4Zoooy9chGNjftX3AznJj8uj9rgDWGCmZjVpDk1AX", "send": 444250847, "incl": 444250848, "slots": 1, "write_bound_us": null, "write_us": 205730, "read_us": 169298, "total_us": 375028, "shred_completed_us": 123602, "completed_processed_us": 3473, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 7, "lane": "LowLatency", "sig": "4AyVY9f24gT6N6CuiRpHjA2jRNa8MMAPVb2KNuny3sXtvuRSBMDnEZnXhpsHBLrSf9kYBMFYew5cvXvJzfR4Xrhy", "send": 444250848, "incl": 444250849, "slots": 1, "write_bound_us": null, "write_us": 131340, "read_us": 300491, "total_us": 431832, "shred_completed_us": 111709, "completed_processed_us": 5721, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 8, "lane": "LowLatency", "sig": "3vFe9MEmZMbQs5nmazqAmWASjQF2V5yoyp2wMtAwYVboKF2p8DF81P8Fs4jw11Zi71fzqhoXxBuEitUs8M1oDhUE", "send": 444250849, "incl": 444250851, "slots": 2, "write_bound_us": null, "write_us": 423824, "read_us": 206613, "total_us": 630437, "shred_completed_us": 0, "completed_processed_us": 50044, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 9, "lane": "LowLatency", "sig": "4qJbrcDUFBXeVLfp52knxuDvHc5hPx1zrnpziExyo2LiAH6q8rkFSfGCkn194bMihNQkdpCFWXyW85BYVEbMBNts", "send": 444250851, "incl": 444250852, "slots": 1, "write_bound_us": null, "write_us": 41, "read_us": 561081, "total_us": 561123, "shred_completed_us": 191874, "completed_processed_us": 24872, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 10, "lane": "LowLatency", "sig": "3PER2aKVcN3q99x67QDxSnYXcZw4QJ9JjGV67wHeH5WG2RUBAaUiAzncACbmab1xvxgrYhtcZJzLTVuMjE1KoSXp", "send": 444250852, "incl": 444250854, "slots": 2, "write_bound_us": null, "write_us": 44426, "read_us": 197039, "total_us": 241465, "shred_completed_us": 128910, "completed_processed_us": 57340, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 11, "lane": "LowLatency", "sig": "5Vj6uW4Us7Edm8kAjCRvPXLj6ZnrsyCQ5vvVypRXAn1UNaBh6MUjbe2jZ7SaMo3JzmjkKMGV4JFfmNhxFzNsx9yc", "send": 444250854, "incl": 444250854, "slots": 0, "write_bound_us": 110319, "write_us": null, "read_us": null, "total_us": 246389, "shred_completed_us": 354443, "completed_processed_us": null, "processed_confirmed_us": 117797, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 12, "lane": "LowLatency", "sig": "4KH6g4fFhcgh6FnRpPkYcZLNe2Gz55Xg5F5vPFbqfWo6oy33mzN6154VPtjkzE5JW9SdVeitMJSBvs6CMXmNW5Gv", "send": 444250855, "incl": 444250855, "slots": 0, "write_bound_us": null, "write_us": null, "read_us": null, "total_us": 185640, "shred_completed_us": 46887, "completed_processed_us": 127020, "processed_confirmed_us": null, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 13, "lane": "LowLatency", "sig": "651kScRy8PKQ43uCMJUTz8uNgPfmcGJsp7MuGfV2Ai2jUyxk5XZXDsyGK9NjQmwJ48d1avRn1iVWCZRJm4PaCB6r", "send": 444250855, "incl": 444250856, "slots": 1, "write_bound_us": null, "write_us": 49, "read_us": 447939, "total_us": 447988, "shred_completed_us": 198150, "completed_processed_us": 13942, "processed_confirmed_us": 1, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 14, "lane": "LowLatency", "sig": "2u1MC24aDAFncLM7rDe41nftBZYJ1PXX7Xs5DJeWdE8HRdGVkmz38zKBVLpWUFjkwAn8g3DTXw5xqjp215c2uuai", "send": 444250856, "incl": 444250857, "slots": 1, "write_bound_us": null, "write_us": 2244, "read_us": 366998, "total_us": 369243, "shred_completed_us": 350580, "completed_processed_us": null, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 15, "lane": "LowLatency", "sig": "31LcKLGUp6FkfexgvfLqLyWA7RPKJykRvig71sdnKTer2LhtfGqN3m7rd34ntU14GHfvENN23xSfy1q1wfZ4xk8e", "send": 444250858, "incl": 444250859, "slots": 1, "write_bound_us": null, "write_us": 163514, "read_us": 287992, "total_us": 451507, "shred_completed_us": 30583, "completed_processed_us": 6845, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 16, "lane": "LowLatency", "sig": "3SoEVLtXqvGFjTjntVAGaEQhB3pdGQqTnHKd1dFT53RB5bc65WTxF3occRPvvZDBAECNDG7CSktdzWFBf5xfVgG7", "send": 444250859, "incl": 444250860, "slots": 1, "write_bound_us": null, "write_us": 52816, "read_us": 379699, "total_us": 432516, "shred_completed_us": null, "completed_processed_us": 67863, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 17, "lane": "LowLatency", "sig": "5UWW3nC4zzg4mAPP21SmvjtveNWmgkqgFmTjZ6psywp5v8T7RuHw2RhqEsyxpLp465K3Drc6oap8KSU6kY8zzBoR", "send": 444250861, "incl": 444250861, "slots": 0, "write_bound_us": 199788, "write_us": null, "read_us": null, "total_us": 365517, "shred_completed_us": 66848, "completed_processed_us": 48918, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 18, "lane": "LowLatency", "sig": "2kGohxCM2isAmKUfggQm6hXmzxD4p7kzrpeVsJqwxSK77RuZpamAx16morXVufQQKyD3MfWuZ4YJu4oboWgqymBy", "send": 444250862, "incl": 444250863, "slots": 1, "write_bound_us": null, "write_us": 140372, "read_us": 360458, "total_us": 500831, "shred_completed_us": 147449, "completed_processed_us": 28937, "processed_confirmed_us": 0, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 19, "lane": "LowLatency", "sig": "42PUoZdTGbccEGV5nkh4GMqJoPJ6Rc66kTtdq85GbdAmjNBEy2AYKnf7oQ5jkr5UNaPk7E7i4w1PvDdF3BxL7sXs", "send": 444250863, "incl": 444250865, "slots": 2, "write_bound_us": null, "write_us": 437387, "read_us": 410898, "total_us": 848285, "shred_completed_us": 223709, "completed_processed_us": 5883, "processed_confirmed_us": 1, "astralane": true}, {"run": "Run 4", "run_seconds": 21, "n": 20, "lane": "LowLatency", "sig": "2vz4A4jvhsvDZt3oy3yqPbR4u98v8EwtCiusTejxJepsoSL9Ddy9doHGmxTCDCNes6ccjUDbxr32EjTGiTn7cPqT", "send": 444250865, "incl": 444250867, "slots": 2, "write_bound_us": null, "write_us": 490936, "read_us": 364086, "total_us": 855022, "shred_completed_us": 225559, "completed_processed_us": 4618, "processed_confirmed_us": 0, "astralane": true}];
+  rows.forEach(r => {
+    r.write_sort = r.write_us ?? -1;
+    r.read_sort = r.read_us ?? -1;
+    r.shred_completed_sort = r.shred_completed_us ?? -1;
+    r.completed_processed_sort = r.completed_processed_us ?? -1;
+    r.processed_confirmed_sort = r.processed_confirmed_us ?? -1;
+    r.unresolved = r.write_us === null;
+  });
+
+  const fmtUs = new Intl.NumberFormat();
+  const fmtMs = new Intl.NumberFormat(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+
+  let currentFilter = "all";
+  let sortKey = "n";
+  let sortDir = 1;
+  let unit = "us";
+
+  function truncSig(sig) {
+    return sig.slice(0, 6) + "…" + sig.slice(-6);
+  }
+  function formatDuration(us) {
+    if (us === null || us === undefined) return '<span class="unknown-val">unknown</span>';
+    return unit === "ms" ? fmtMs.format(us / 1000) : fmtUs.format(us);
+  }
+  function updateHeaders() {
+    const suffix = unit === "ms" ? "(ms)" : "(µs)";
+    document.getElementById("th-write").firstChild.textContent = `Write ≥ ${suffix}`;
+    document.getElementById("th-read").firstChild.textContent = `Read ≤ ${suffix}`;
+    document.getElementById("th-total").firstChild.textContent = `Total ${suffix}`;
+    document.getElementById("th-shred-completed").firstChild.textContent = `Shred→Completed ${suffix}`;
+    document.getElementById("th-completed-processed").firstChild.textContent = `Completed→Processed ${suffix}`;
+    document.getElementById("th-processed-confirmed").firstChild.textContent = `Processed→Confirmed ${suffix}`;
+  }
+
+  function render() {
+    updateHeaders();
+    const tbody = document.getElementById("tbody");
+    let visible = rows;
+    if (currentFilter !== "all") visible = rows.filter(r => r.run === currentFilter);
+    visible = visible.slice().sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      if (typeof av === "string") return av.localeCompare(bv) * sortDir;
+      return (av - bv) * sortDir;
+    });
+    tbody.innerHTML = visible.map(r => {
+      const runClass = r.run === "Run 3" ? "run3" : "run4";
+      return `<tr class="${r.unresolved ? "unresolved" : ""}">
+        <td><span class="run-badge ${runClass}">${r.run}</span></td>
+        <td>${r.n}</td>
+        <td class="sig"><a href="https://explorer.solana.com/tx/${r.sig}" target="_blank" rel="noopener noreferrer" title="${r.sig}">${truncSig(r.sig)}</a></td>
+        <td>${r.send}</td>
+        <td>${r.incl}</td>
+        <td>${r.slots}</td>
+        <td>${formatDuration(r.write_us)}</td>
+        <td>${formatDuration(r.read_us)}</td>
+        <td>${formatDuration(r.shred_completed_us)}</td>
+        <td>${formatDuration(r.completed_processed_us)}</td>
+        <td>${formatDuration(r.processed_confirmed_us)}</td>
+        <td>${formatDuration(r.total_us)}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  document.querySelectorAll(".toolbar .chip[data-filter]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      currentFilter = btn.dataset.filter;
+      document.querySelectorAll(".toolbar .chip[data-filter]").forEach(b => b.setAttribute("aria-pressed", b === btn));
+      render();
+    });
+  });
+  document.querySelectorAll(".chip[data-unit]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      unit = btn.dataset.unit;
+      document.querySelectorAll(".chip[data-unit]").forEach(b => b.setAttribute("aria-pressed", b === btn));
+      render();
+    });
+  });
+  document.querySelectorAll("table.rows thead th[data-key]").forEach(th => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.key;
+      if (sortKey === key) {
+        sortDir *= -1;
+      } else {
+        sortKey = key;
+        sortDir = 1;
+      }
+      document.querySelectorAll("table.rows thead th").forEach(h => { h.classList.remove("sorted"); h.removeAttribute("data-dir"); });
+      th.classList.add("sorted");
+      th.setAttribute("data-dir", sortDir === 1 ? "▲" : "▼");
+      render();
+    });
+  });
+
+  render();
+</script>

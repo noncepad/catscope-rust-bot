@@ -64,6 +64,7 @@ interface transactionprocessor{
 
   // on success, return the slot
   send: func(signature: list<u8>,txdata: list<u8>)->result<_,error-code>;
+  batch: func(count: list<u16>,txdata: list<u8>,bundler:option<u8>)->result<_,error-code>;
   keygen: func()->result<u64,error-code>;
   // look up an account id by pubkey
   accountid: func(pubkey: list<u8>)->result<accidlookup,error-code>;
@@ -90,21 +91,12 @@ interface shooter{
     out-of-memory,
     timeout,
   }
-  record edge{
-    accountfrom: u64,
-    accountto: u64,
-    weight: u32, 
-  }
   record commit {
     slot: u64,
     // merge all accounts into a single byte slice
     data: list<u8>,
     // mark boders of account byte slices here
     border: list<u32>,
-    // put edges here; from->to pair, there are no weights.
-    edgeadd: list<u64>,
-    // put edges here; from->to pair, there are no weights.
-    edgeremove: list<u64>,
   }
   record header{
     slot: u64,
@@ -134,10 +126,23 @@ interface shooter{
     status: u8,
   }
 
+  // A commit too large to deliver in one eventitem. The guest reads it in
+  // batches by calling read() repeatedly until done() is true (or the
+  // returned commit's data/border are empty).
+  resource bigcommit {
+    // Slot this commit belongs to.
+    slot: func()->u64;
+    // Read up to `max` accounts as one batch. Returns a commit record with
+    // empty data/border once every account has been delivered.
+    read: func(max: u32)->commit;
+    // True once every account in this commit has been delivered.
+    done: func()->bool;
+  }
+
   record eventitem{
     ack: list<u32>,
     commitslot: option<u64>,
-    commit: option<commit>,
+    commit: option<bigcommit>,
     txdata: option<list<u8>>,
     txborder: option<list<u32>>,
     tokendata: option<list<u8>>,
@@ -162,12 +167,11 @@ interface shooter{
   }
 
 
-  pubkey-map-by-pubkey: func(pubkey: list<u8>)->result<u64,error-code>;
-  pubkey-map-by-id: func(id: u64)->result<list<u8>,error-code>;
+  pubkey-map-by-pubkey: func(pubkey: list<u8>)->result<list<u64>,error-code>;
+  pubkey-map-by-id: func(id: list<u64>)->result<list<u8>,error-code>;
   account-by-id: func(id: u64)->result<list<u8>,error-code>;
   account-by-pubkey: func(pubkey: list<u8>)->result<list<u8>,error-code>;
   connect: func()->result<client,error-code>;
   disconnect: func(connection: client);
-  neighbor: func(id: u64,downstream: bool)->list<edge>;
 }
 

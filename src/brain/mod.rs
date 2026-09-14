@@ -1,26 +1,21 @@
 use std::{cell::UnsafeCell, rc::Rc};
 
 use crate::{
-    brain::helloworldv1::{
-        message::{
-            CustomMessageInbound as HelloCustomMessageInbound,
-            CustomMessageOutbound as HelloCustomMessageOutbound,
-        },
-        HelloWorldV1Hook,
-    },
+    brain::{arbv1::ArbitrageV1Hook, testperpv1::TestPerpV1Hook},
     event_loop::EventHandler,
-    message::{MessageDeserializer, MessageSend, MessageSerializer, Parser},
-    TradingSetup,
+    message::Parser,
 };
 
-pub mod helloworldv1;
+pub mod arbv1;
+pub mod testperpv1;
 
 pub struct Merged {
     inner: Option<BotMode>,
 }
 
 enum BotMode {
-    HelloWorld(Box<HelloWorldV1Hook>),
+    Arbitrage(Box<ArbitrageV1Hook>),
+    TestPerp(Box<TestPerpV1Hook>),
 }
 
 impl Default for Merged {
@@ -29,10 +24,14 @@ impl Default for Merged {
             Ok(x) => x,
             Err(_e) => panic!("env var MODE not set"),
         };
-        let rc_parser = Rc::new(UnsafeCell::new(Parser::default()));
 
         let inner = match mode.as_str() {
-            "helloworldv1" => BotMode::HelloWorld(Box::new(HelloWorldV1Hook::new(rc_parser))),
+            "arbv1" => BotMode::Arbitrage(Box::new(ArbitrageV1Hook::new(Rc::new(
+                UnsafeCell::new(Parser::default()),
+            )))),
+            "testperpv1" => BotMode::TestPerp(Box::new(TestPerpV1Hook::new(Rc::new(
+                UnsafeCell::new(Parser::default()),
+            )))),
             _ => panic!("unknown mode {mode}",),
         };
         Self { inner: Some(inner) }
@@ -43,16 +42,18 @@ impl EventHandler for Merged {
     fn on_load(
         &mut self,
         poller: crate::event_loop::EventPoller,
-        rc_edgemgr: std::rc::Rc<std::cell::UnsafeCell<crate::graph::EdgeManager>>,
         args: &[String],
-        trading: &TradingSetup,
     ) -> Result<(), crate::err::CatscopeGuestError> {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::HelloWorld(mut x) => {
-                r = x.on_load(poller, rc_edgemgr, args, trading);
-                inner = BotMode::HelloWorld(x);
+            BotMode::Arbitrage(mut x) => {
+                r = x.on_load(poller, args);
+                inner = BotMode::Arbitrage(x);
+            }
+            BotMode::TestPerp(mut x) => {
+                r = x.on_load(poller, args);
+                inner = BotMode::TestPerp(x);
             }
         };
         self.inner.replace(inner);
@@ -63,9 +64,13 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::HelloWorld(mut x) => {
+            BotMode::Arbitrage(mut x) => {
                 r = x.on_unload();
-                inner = BotMode::HelloWorld(x);
+                inner = BotMode::Arbitrage(x);
+            }
+            BotMode::TestPerp(mut x) => {
+                r = x.on_unload();
+                inner = BotMode::TestPerp(x);
             }
         };
         self.inner.replace(inner);
@@ -79,9 +84,13 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::HelloWorld(mut x) => {
+            BotMode::Arbitrage(mut x) => {
                 r = x.on_event(event);
-                inner = BotMode::HelloWorld(x);
+                inner = BotMode::Arbitrage(x);
+            }
+            BotMode::TestPerp(mut x) => {
+                r = x.on_event(event);
+                inner = BotMode::TestPerp(x);
             }
         };
         self.inner.replace(inner);
@@ -92,9 +101,13 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::HelloWorld(mut x) => {
+            BotMode::Arbitrage(mut x) => {
                 r = x.flush();
-                inner = BotMode::HelloWorld(x);
+                inner = BotMode::Arbitrage(x);
+            }
+            BotMode::TestPerp(mut x) => {
+                r = x.flush();
+                inner = BotMode::TestPerp(x);
             }
         };
         self.inner.replace(inner);

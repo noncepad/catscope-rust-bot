@@ -1,0 +1,12 @@
+{
+    "lambda": 0.01,
+    "min_cluster_liquidity": 50000.0,
+    "token_count": 5000,
+    "core_mints": [
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "So11111111111111111111111111111111111111112",
+        "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+        "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+    ]
+}

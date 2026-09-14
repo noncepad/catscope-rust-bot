@@ -1,15 +1,36 @@
-use crate::{
-    catscope::witbot::general,
-    err::CatscopeGuestError,
-    log_debug,
-    message::{MessageAction, MessageSend, MessageSerializer},
-    util::as_bytes,
-};
+use crate::{catscope::witbot::general, message::MessageSerializer};
 use solana_sdk::pubkey::Pubkey;
 use std::{
     collections::{HashMap, VecDeque},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
     time::UNIX_EPOCH,
 };
+
+/// Cumulative time spent inside `general::stdout` (the real host stdio
+/// write) since the last [`take_flush_stats`] call, across every channel
+/// (stdout message writes *and* the log macros' own stderr writes both
+/// go through [`StdioPacket::flush`]). Real, live-observed motivation:
+/// every death this session left its last log line looking completely
+/// unremarkable -- no bookend ever caught the moment of the freeze, even
+/// after every known blocking host call (subscribe/bulk_subscribe) was
+/// paced and bookended. A log call's *own* internal buffer-overflow
+/// flush is a host write neither `log_warn!` nor any caller can bookend
+/// (the flush happens *inside* the call trying to log something), so if
+/// it's ever slow under pipe backpressure, the very message meant to
+/// report it is what's lost. This is a passive counter instead of a
+/// log-on-entry for exactly that reason -- reported later via the
+/// existing gap-since-previous-start log, the same "accumulate, don't
+/// log every call" pattern already used for `low_latency`/`evaluate`.
+static FLUSH_ELAPSED_NANOS: AtomicU64 = AtomicU64::new(0);
+static FLUSH_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Drains and returns the accumulated stdio-flush time/count since the
+/// last call -- see [`FLUSH_ELAPSED_NANOS`]'s doc comment.
+pub fn take_flush_stats() -> (std::time::Duration, u32) {
+    let nanos = FLUSH_ELAPSED_NANOS.swap(0, Ordering::Relaxed);
+    let count = FLUSH_COUNT.swap(0, Ordering::Relaxed);
+    (std::time::Duration::from_nanos(nanos), count)
+}
 
 /// Create a fixed size data packet to send out on stdout or stderr.
 pub struct StdioPacket {
@@ -83,7 +104,10 @@ impl StdioPacket {
             return;
         }
         //assert_eq!(self.channel, 1);
+        let t0 = std::time::Instant::now();
         general::stdout(self.channel, &self.buffer[0..self.size]);
+        FLUSH_ELAPSED_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
         self.size = 0;
     }
 }
