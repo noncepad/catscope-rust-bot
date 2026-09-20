@@ -1,7 +1,7 @@
 use crate::{
     brain::arbv1::{
         message::{CustomMessageInbound, CustomMessageOutbound},
-        Configuration,
+        strategy, Configuration,
     },
     catscope::witbot::shooter::{Header, Tokenaccountv1},
     err::CatscopeGuestError,
@@ -643,6 +643,23 @@ impl<'a> StateHelper<'a> {
                         },
                         None => opp,
                     };
+                    // arbv1's own strategy filter (strategy.rs) -- the one
+                    // place a coding agent should edit to change what this
+                    // bot trades. Runs after the shared structural gates
+                    // above (Bellman-Ford negative-cycle detection, exact-
+                    // quote re-verification), never replacing them.
+                    if !strategy::accept(&opp) {
+                        log_warn!(
+                            "arbitrage opportunity @ slot {}: rejected by arbv1 strategy filter \
+                             (start_token={} amount_in={} profit_bps={} hops={})",
+                            self.state.last_slot,
+                            opp.cycle.start_token(),
+                            opp.cycle.amount_in(),
+                            opp.cycle.profit_bps(),
+                            opp.cycle.hops.len(),
+                        );
+                        return;
+                    }
                     log_warn!(
                         "arbitrage opportunity @ slot {}: start_token={} amount_in={} amount_out={} \
                          profit_raw={} profit_bps={} wallet_balance={} hops={}",

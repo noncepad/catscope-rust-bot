@@ -3,6 +3,11 @@
 //! This brain runs inside the validator as a WASM component (wasm32-wasip2).
 //! Its counterpart on the Go side is `optimizer/brain/arbv1`.
 //!
+//! **To change the strategy, edit [`strategy`] only.** Everything else in
+//! this module is event plumbing (wallet bookkeeping, router glue, WASM
+//! host imports) — see `strategy.rs`'s own doc comment for why it's the
+//! one safe, self-contained place for that.
+//!
 //! # What it does
 //! - Tracks DEX pool state across Orca Whirlpool and Sanctum S Controller by
 //!   processing live account and token-balance updates from the validator.
@@ -46,6 +51,7 @@ use std::{cell::UnsafeCell, collections::VecDeque, rc::Rc};
 pub(crate) mod configuration;
 pub(crate) mod message;
 pub(crate) mod state;
+pub(crate) mod strategy;
 
 pub struct ArbitrageV1Hook {
     llap_account_count: usize,
