@@ -1,6 +1,6 @@
-//! testperpv1 -- **not a real strategy.** Originally a literal copy of
-//! the now-removed `perpfundingv1` (same `EventHandler`/`StateHelper`/
-//! module shape, same `on_load`/message handling), except `StateHelper::evaluate` is
+//! testperpv1 -- **not a real strategy.** A literal copy of
+//! `perpfundingv1` (same `EventHandler`/`StateHelper`/module shape,
+//! same `on_load`/message handling), except `StateHelper::evaluate` is
 //! replaced with a real-transaction smoke test: bootstrap a Solend
 //! obligation, deposit a small amount of USDC, withdraw it, then do the
 //! same for Kamino. Exists to close a real gap found in the session that

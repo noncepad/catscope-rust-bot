@@ -1,6 +1,7 @@
-//! Runtime configuration for testperpv1's inter-venue perp funding-rate
-//! framework, populated from the Go brain via stdin messages (mirrors
-//! `arbv1::configuration`'s shape). `wallet` is set once `KeyFlagWallet` arrives (see
+//! Runtime configuration for the inter-venue perp funding-rate framework
+//! (`perpfundingv1`), populated from the Go brain via stdin messages
+//! (mirrors `arbv1::configuration`/`phoenixperpsv1::configuration`'s
+//! shape). `wallet` is set once `KeyFlagWallet` arrives (see
 //! `state::StateHelper::on_message`); `mint_sol`/`mint_usdc` are fixed
 //! constants, same values as `arbv1::configuration`, resolved to
 //! `AccountId` by `.set()` -- needed by

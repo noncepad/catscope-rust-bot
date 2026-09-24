@@ -1,9 +1,9 @@
-//! Stdin/stdout message serialization for testperpv1.
-//! Mirrors the now-removed `phoenixperpsv1::message`'s shape exactly,
-//! trimmed to only what this strategy needs: `Wallet` (kept for
-//! harness-lifecycle consistency, unused for real sends) and
-//! `TargetAllocation` (real target-portfolio-allocation updates pushed
-//! at runtime by `optimizer/brain/testperpv1`'s `SendTargetAllocation`, see that
+//! Stdin/stdout message serialization for perpfundingv1.
+//! Mirrors `phoenixperpsv1::message`'s shape exactly, trimmed to only
+//! what this strategy needs: `Wallet` (kept for harness-lifecycle
+//! consistency, unused for real sends) and `TargetAllocation` (real
+//! target-portfolio-allocation updates pushed at runtime by
+//! `optimizer/brain/perpfundingv1`'s `SendTargetAllocation`, see that
 //! module's doc) inbound, nothing outbound yet -- there's no Go-side
 //! reply this strategy needs to send, so `CustomMessageOutbound` is a
 //! true no-op placeholder.
@@ -23,7 +23,7 @@ pub enum CustomMessageInbound {
     /// implicitly USD/stable -- no explicit USD entry. Rebalancing
     /// toward this target is what realizes profit/loss; this message
     /// only carries the target, not the rebalance itself. Mirrors the
-    /// wire format `optimizer/brain/testperpv1/message.go`'s
+    /// wire format `optimizer/brain/perpfundingv1/message.go`'s
     /// `DoTargetAllocation` encodes: a 24-byte value, 16-byte
     /// zero-padded symbol + 8-byte little-endian `f64`.
     TargetAllocation(String, f64),
@@ -157,7 +157,7 @@ mod tests {
     /// (`[1-byte key_len][key][2-byte LE value_len][value]`, per
     /// `message::KeyValuePair`'s `TryFrom`/`MessageSerializer` impls)
     /// for a single-byte key, so these tests exercise the exact bytes
-    /// `optimizer/brain/testperpv1/message.go`'s
+    /// `optimizer/brain/perpfundingv1/message.go`'s
     /// `DoTargetAllocation`/`DoWallet` produce on the wire, not just the
     /// Rust-side struct.
     fn wire_body(key: u8, value: &[u8]) -> Vec<u8> {

@@ -180,25 +180,25 @@ pub mod phoenix_config {
 pub mod symbol_mint_config {
     include!(concat!(env!("OUT_DIR"), "/symbol_mint_data.rs"));
 }
-/// A pair-trading candidate universe (`TradeUniverseSymbolRaw`), generated
-/// at build time from every distinct mint with a reserve on
-/// `trader::dex::kamino::KAMINO_MAIN_MARKET` *or*
+/// multimodelv1's broadened pair-trading candidate universe
+/// (`TradeUniverseSymbolRaw`), generated at build time from every distinct
+/// mint with a reserve on `trader::dex::kamino::KAMINO_MAIN_MARKET` *or*
 /// `trader::dex::solend::SOLEND_MAIN_MARKET` in the unified prefetch db
 /// (SQL_PATH), deduped by mint, joined against `mint_info` for real
 /// decimals. Unlike `symbol_mint_config` above (hand-curated,
 /// Phoenix+Velocity-perp-gated), this list is database-derived and not
 /// gated on perp coverage -- the pair trade itself is real Kamino *or*
 /// Solend deposit/borrow (protocol picked per-leg at runtime), no perp
-/// hedge leg.
+/// hedge leg. See `brain::multimodelv1::state::curated_symbols`.
 pub mod trade_universe_config {
     include!(concat!(env!("OUT_DIR"), "/trade_universe_data.rs"));
 }
 /// Default target portfolio allocation (`(symbol, allocation_pct)`,
 /// fraction of total portfolio value 0.0-1.0) per curated symbol, baked
 /// in at build time from `perp_funding_target_allocation` -- the same
-/// table `optimizer/brain/testperpv1`'s `SendTargetAllocation`
+/// table `optimizer/brain/perpfundingv1`'s `SendTargetAllocation`
 /// writes into at runtime. See
-/// `brain::testperpv1::state::State::target_allocation_pct`.
+/// `brain::perpfundingv1::state::State::target_allocation_pct`.
 pub mod target_allocation_config {
     include!(concat!(env!("OUT_DIR"), "/target_allocation_data.rs"));
 }

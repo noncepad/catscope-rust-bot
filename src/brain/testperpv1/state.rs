@@ -1,5 +1,5 @@
 //! Reactive decision loop for a Phoenix-perp-funding-vs-lending-rate basis
-//! trade -- mirrors `arbv1::state`'s shape
+//! trade -- mirrors `arbv1::state`/`phoenixperpsv1::state`'s shape
 //! (same `StateHelper`/`CommitHook`/`evaluate` pattern). Feeds
 //! `trader::perp_router::PerpRouter` from Phoenix's existing read-only
 //! pricing data (`trader::dex::phoenix::PhoenixState`), closes out a
@@ -413,7 +413,7 @@ impl State {
                 Some(account_id) => entry.account_id = Some(account_id),
                 None => {
                     log_error!(
-                        "testperpv1: target allocation symbol {} has no curated mint -- cannot resolve to AccountId",
+                        "perpfundingv1: target allocation symbol {} has no curated mint -- cannot resolve to AccountId",
                         symbol,
                     );
                 }
@@ -612,12 +612,12 @@ impl<'a> StateHelper<'a> {
         // Mirrors arbv1::state::on_load exactly (same
         // build_liquidity_router helper below).
         self.state.spot_router = TradeRouter::from_router(&build_liquidity_router());
-        log_info!("testperpv1: bot has been successfully uploaded to validator");
+        log_info!("perpfundingv1: bot has been successfully uploaded to validator");
     }
 
     pub(crate) fn on_slot_status(&mut self, slot: Slot, status: SlotStatus) {
         if status == SlotStatus::Dead {
-            log_info!("testperpv1: slot {slot}; status dead");
+            log_info!("perpfundingv1: slot {slot}; status dead");
         }
     }
 
@@ -665,8 +665,9 @@ impl<'a> StateHelper<'a> {
 
     pub(crate) fn mid_on_tx(&mut self, mut transaction_list: TransactionList) {
         // This mode never sends a transaction -- nothing to correlate,
-        // just drain the iterator rather than assuming it's safe to skip
-        // entirely.
+        // just drain the iterator (matches perpfundingv1::State::mid_on_tx's
+        // own identical-purpose loop, rather than assuming it's safe to
+        // skip entirely).
         while transaction_list.transaction().is_some() {}
     }
 
@@ -700,7 +701,7 @@ impl<'a> StateHelper<'a> {
         };
         if layer.edges.is_empty() {
             log_warn!(
-                "testperpv1: epoch {} closed @ slot {} -- no funding spread edges (no symbol had data from both venues, or rates were equal)",
+                "perpfundingv1: epoch {} closed @ slot {} -- no funding spread edges (no symbol had data from both venues, or rates were equal)",
                 layer.epoch_ts,
                 layer.slot,
             );
@@ -708,7 +709,7 @@ impl<'a> StateHelper<'a> {
         }
         for edge in &layer.edges {
             log_warn!(
-                "testperpv1: epoch {} @ slot {}: {} long={:?} short={:?} spread_annualized={:.3}%",
+                "perpfundingv1: epoch {} @ slot {}: {} long={:?} short={:?} spread_annualized={:.3}%",
                 layer.epoch_ts,
                 layer.slot,
                 edge.asset,
@@ -754,7 +755,7 @@ impl<'a> StateHelper<'a> {
             let delta_pct =
                 (router_price_usd - pyth_price.price_usd) / pyth_price.price_usd * 100.0;
             log_warn!(
-                "testperpv1: spot price probe @ slot {}: {} router SOL/USD={:.4} pyth SOL/USD={:.4} (conf={:.4}) delta={:+.2}%",
+                "perpfundingv1: spot price probe @ slot {}: {} router SOL/USD={:.4} pyth SOL/USD={:.4} (conf={:.4}) delta={:+.2}%",
                 last_slot,
                 direction,
                 router_price_usd,
@@ -782,7 +783,7 @@ impl<'a> StateHelper<'a> {
                 // live WASM guest, so this is the only way to get it.
                 let pool_pubkey = crate::util::pubkey_from_account_id(&hop.pool_id);
                 log_warn!(
-                    "testperpv1: spot price probe @ slot {}: {} hop {}: dex={:?} pool={} ({:?}) {} -> {} amount_in={} amount_out={}",
+                    "perpfundingv1: spot price probe @ slot {}: {} hop {}: dex={:?} pool={} ({:?}) {} -> {} amount_in={} amount_out={}",
                     last_slot,
                     direction,
                     i,
@@ -827,7 +828,7 @@ impl<'a> StateHelper<'a> {
                         if sol_in > 0.0 {
                             let router_price_usd = usdc_out / sol_in;
                             log_warn!(
-                                "testperpv1: spot price probe @ slot {}: SOL->USDC {:.9} SOL -> {:.6} USDC (price={:.4} USD/SOL, {} hop{})",
+                                "perpfundingv1: spot price probe @ slot {}: SOL->USDC {:.9} SOL -> {:.6} USDC (price={:.4} USD/SOL, {} hop{})",
                                 self.state.last_slot,
                                 sol_in,
                                 usdc_out,
@@ -846,7 +847,7 @@ impl<'a> StateHelper<'a> {
                                 .mark_pool_cooldown(failure.pool_id, planner::POOL_COOLDOWN_SLOTS);
                         }
                         log_warn!(
-                            "testperpv1: spot price probe @ slot {}: SOL->USDC rejected -- exact quote invalidated pool {} (cooling down {} slots: {})",
+                            "perpfundingv1: spot price probe @ slot {}: SOL->USDC rejected -- exact quote invalidated pool {} (cooling down {} slots: {})",
                             self.state.last_slot,
                             failure.pool_id,
                             planner::POOL_COOLDOWN_SLOTS,
@@ -857,7 +858,7 @@ impl<'a> StateHelper<'a> {
             }
             None => {
                 log_warn!(
-                    "testperpv1: spot price probe @ slot {}: no SOL->USDC route found",
+                    "perpfundingv1: spot price probe @ slot {}: no SOL->USDC route found",
                     self.state.last_slot,
                 );
             }
@@ -882,7 +883,7 @@ impl<'a> StateHelper<'a> {
                         if sol_out > 0.0 {
                             let router_price_usd = usdc_in / sol_out;
                             log_warn!(
-                                "testperpv1: spot price probe @ slot {}: USDC->SOL {:.6} USDC -> {:.9} SOL (price={:.4} USD/SOL, {} hop{})",
+                                "perpfundingv1: spot price probe @ slot {}: USDC->SOL {:.6} USDC -> {:.9} SOL (price={:.4} USD/SOL, {} hop{})",
                                 self.state.last_slot,
                                 usdc_in,
                                 sol_out,
@@ -901,7 +902,7 @@ impl<'a> StateHelper<'a> {
                                 .mark_pool_cooldown(failure.pool_id, planner::POOL_COOLDOWN_SLOTS);
                         }
                         log_warn!(
-                            "testperpv1: spot price probe @ slot {}: USDC->SOL rejected -- exact quote invalidated pool {} (cooling down {} slots: {})",
+                            "perpfundingv1: spot price probe @ slot {}: USDC->SOL rejected -- exact quote invalidated pool {} (cooling down {} slots: {})",
                             self.state.last_slot,
                             failure.pool_id,
                             planner::POOL_COOLDOWN_SLOTS,
@@ -912,7 +913,7 @@ impl<'a> StateHelper<'a> {
             }
             None => {
                 log_warn!(
-                    "testperpv1: spot price probe @ slot {}: no USDC->SOL route found",
+                    "perpfundingv1: spot price probe @ slot {}: no USDC->SOL route found",
                     self.state.last_slot,
                 );
             }
@@ -941,12 +942,12 @@ impl<'a> StateHelper<'a> {
         g.add_edge_pair(2, (0, 1.01), (3, 1.0));
         match g.detect_negative_cycle() {
             Some(cycle) => log_warn!(
-                "testperpv1: spfa smoke test OK -- found expected synthetic negative cycle: path={:?} weight={}",
+                "perpfundingv1: spfa smoke test OK -- found expected synthetic negative cycle: path={:?} weight={}",
                 cycle.path,
                 cycle.total_log_weight,
             ),
             None => log_error!(
-                "testperpv1: spfa smoke test FAILED -- no cycle found in a graph built with a guaranteed negative cycle (real wasm32 SIMD bug?)",
+                "perpfundingv1: spfa smoke test FAILED -- no cycle found in a graph built with a guaranteed negative cycle (real wasm32 SIMD bug?)",
             ),
         }
     }
@@ -1000,13 +1001,13 @@ impl<'a> StateHelper<'a> {
             .and_then(|p| p.trader_account())
             .is_none()
         {
-            log_warn!("testperpv1: bootstrap: phoenix trader_account PDA not known yet -- set_authority hasn't run");
+            log_warn!("perpfundingv1: bootstrap: phoenix trader_account PDA not known yet -- set_authority hasn't run");
             return;
         }
         let budget_usd = (FUNDING_CYCLE_MIN_MARGIN_USD / 2.0).min(self.current_usdc_value());
         if budget_usd <= 0.0 {
             log_warn!(
-                "testperpv1: bootstrap: no spare USDC to fund the Phoenix trader account yet"
+                "perpfundingv1: bootstrap: no spare USDC to fund the Phoenix trader account yet"
             );
             return;
         }
@@ -1025,14 +1026,14 @@ impl<'a> StateHelper<'a> {
         };
 
         log_warn!(
-            "testperpv1: bootstrap: registering + funding Phoenix trader account (${:.2})",
+            "perpfundingv1: bootstrap: registering + funding Phoenix trader account (${:.2})",
             budget_usd,
         );
         let Some(phoenix) = self.state.o_phoenix.as_ref() else {
             return;
         };
         if let Err(e) = phoenix.register_trader(owner, self.wallet) {
-            log_error!("testperpv1: bootstrap: phoenix register_trader failed: {e}");
+            log_error!("perpfundingv1: bootstrap: phoenix register_trader failed: {e}");
             return;
         }
         if let Err(e) = ember::deposit(
@@ -1043,11 +1044,11 @@ impl<'a> StateHelper<'a> {
             amount_raw,
             self.wallet,
         ) {
-            log_error!("testperpv1: bootstrap: ember deposit failed: {e}");
+            log_error!("perpfundingv1: bootstrap: ember deposit failed: {e}");
             return;
         }
         if let Err(e) = phoenix.deposit_funds(owner, phusd_ata, amount_raw, self.wallet) {
-            log_error!("testperpv1: bootstrap: phoenix deposit_funds failed: {e}");
+            log_error!("perpfundingv1: bootstrap: phoenix deposit_funds failed: {e}");
         }
     }
 
@@ -1073,7 +1074,7 @@ impl<'a> StateHelper<'a> {
         };
         let mint_usdc = self.configuration.mint_usdc;
         let Some((_, usdc_reserve)) = dex.solend().reserve_by_mint(mint_usdc) else {
-            log_warn!("testperpv1: bootstrap: Solend USDC reserve not observed yet");
+            log_warn!("perpfundingv1: bootstrap: Solend USDC reserve not observed yet");
             return;
         };
         let lending_market = usdc_reserve.lending_market;
@@ -1083,16 +1084,16 @@ impl<'a> StateHelper<'a> {
         // change, since a different id would derive a different, unfunded
         // account, silently orphaning any real position already open here.
         const SOLEND_OBLIGATION_ID: u8 = 0;
-        log_warn!("testperpv1: bootstrap: registering Solend obligation");
+        log_warn!("perpfundingv1: bootstrap: registering Solend obligation");
         if let Err(e) = solend::create_obligation_account(owner, SOLEND_OBLIGATION_ID, self.wallet)
         {
-            log_error!("testperpv1: bootstrap: solend create_obligation_account failed: {e}");
+            log_error!("perpfundingv1: bootstrap: solend create_obligation_account failed: {e}");
             return;
         }
         if let Err(e) =
             solend::init_obligation(owner, lending_market, SOLEND_OBLIGATION_ID, self.wallet)
         {
-            log_error!("testperpv1: bootstrap: solend init_obligation failed: {e}");
+            log_error!("perpfundingv1: bootstrap: solend init_obligation failed: {e}");
         }
     }
 
@@ -1126,15 +1127,15 @@ impl<'a> StateHelper<'a> {
             .as_ref()
             .is_some_and(|s| s.user_metadata_registered());
         if !has_user_metadata {
-            log_warn!("testperpv1: bootstrap: registering Kamino user metadata");
+            log_warn!("perpfundingv1: bootstrap: registering Kamino user metadata");
             if let Err(e) = kamino::init_user_metadata(owner, self.wallet) {
-                log_error!("testperpv1: bootstrap: kamino init_user_metadata failed: {e}");
+                log_error!("perpfundingv1: bootstrap: kamino init_user_metadata failed: {e}");
                 return;
             }
         }
-        log_warn!("testperpv1: bootstrap: registering Kamino obligation");
+        log_warn!("perpfundingv1: bootstrap: registering Kamino obligation");
         if let Err(e) = kamino::init_obligation(owner, lending_market, 0, self.wallet) {
-            log_error!("testperpv1: bootstrap: kamino init_obligation failed: {e}");
+            log_error!("perpfundingv1: bootstrap: kamino init_obligation failed: {e}");
         }
     }
 
@@ -1154,9 +1155,9 @@ impl<'a> StateHelper<'a> {
         };
         let group = account_id_from_pubkey(&marginfi::MARGINFI_MAIN_GROUP);
 
-        log_warn!("testperpv1: bootstrap: registering marginfi account");
+        log_warn!("perpfundingv1: bootstrap: registering marginfi account");
         if let Err(e) = marginfi::initialize_account_pda(group, owner, self.wallet) {
-            log_error!("testperpv1: bootstrap: marginfi initialize_account_pda failed: {e}");
+            log_error!("perpfundingv1: bootstrap: marginfi initialize_account_pda failed: {e}");
         }
     }
 
@@ -1200,14 +1201,14 @@ impl<'a> StateHelper<'a> {
             return false;
         };
         if let Err(e) = kamino_position.track_farm_user_state(farm_user_state_id, self.graph) {
-            log_error!("testperpv1: basis trade: kamino track_farm_user_state failed: {e}");
+            log_error!("perpfundingv1: basis trade: kamino track_farm_user_state failed: {e}");
             return false;
         }
         if kamino_position.farm_user_state_registered(farm_user_state_id) {
             return true;
         }
         log_warn!(
-            "testperpv1: basis trade: bootstrapping Kamino farm-user-state for reserve {}",
+            "perpfundingv1: basis trade: bootstrapping Kamino farm-user-state for reserve {}",
             reserve_id
         );
         if let Err(e) = kamino::init_obligation_farms_for_reserve(
@@ -1220,7 +1221,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: kamino init_obligation_farms_for_reserve failed: {e}"
+                "perpfundingv1: basis trade: kamino init_obligation_farms_for_reserve failed: {e}"
             );
         }
         false
@@ -1529,7 +1530,7 @@ impl<'a> StateHelper<'a> {
         };
         let Some(price_usd) = market.mark_price_usd() else {
             log_error!(
-                "testperpv1: funding cycle: {} has no oracle price yet, skipping Phoenix leg",
+                "perpfundingv1: funding cycle: {} has no oracle price yet, skipping Phoenix leg",
                 symbol
             );
             return;
@@ -1544,7 +1545,7 @@ impl<'a> StateHelper<'a> {
         let side = if long { Side::Bid } else { Side::Ask };
 
         log_warn!(
-            "testperpv1: funding cycle: opening Phoenix leg {} side={:?} num_base_lots={} (notional=${:.2})",
+            "perpfundingv1: funding cycle: opening Phoenix leg {} side={:?} num_base_lots={} (notional=${:.2})",
             symbol,
             side,
             num_base_lots,
@@ -1554,7 +1555,7 @@ impl<'a> StateHelper<'a> {
             phoenix.place_market_order(owner, asset_id, side, num_base_lots, 0, 0, self.wallet)
         {
             log_error!(
-                "testperpv1: funding cycle: Phoenix leg {} failed: {}",
+                "perpfundingv1: funding cycle: Phoenix leg {} failed: {}",
                 symbol,
                 e
             );
@@ -1562,8 +1563,9 @@ impl<'a> StateHelper<'a> {
     }
 
     /// Flattens the live Phoenix position for `symbol` to zero via an
-    /// opposite-side market order -- a proven-live liquidation-avoidance
-    /// close. No-op if nothing's open.
+    /// opposite-side market order -- same call shape as
+    /// `phoenixperpsv1::check_margin_health`'s proven-live
+    /// liquidation-avoidance close. No-op if nothing's open.
     fn close_phoenix_leg(&mut self, symbol: &str) {
         let Some(owner) = self.state.wallet() else {
             return;
@@ -1587,7 +1589,7 @@ impl<'a> StateHelper<'a> {
         let client_order_id = self.state.last_slot as u128;
 
         log_warn!(
-            "testperpv1: funding cycle: closing Phoenix leg {} side={:?} size={}",
+            "perpfundingv1: funding cycle: closing Phoenix leg {} side={:?} size={}",
             symbol,
             side,
             size,
@@ -1596,7 +1598,7 @@ impl<'a> StateHelper<'a> {
             phoenix.place_market_order(owner, asset_id, side, size, 0, client_order_id, self.wallet)
         {
             log_error!(
-                "testperpv1: funding cycle: Phoenix close {} failed: {}",
+                "perpfundingv1: funding cycle: Phoenix close {} failed: {}",
                 symbol,
                 e
             );
@@ -1689,7 +1691,7 @@ impl<'a> StateHelper<'a> {
 
         let price_usd = reserve.price_usd;
         if price_usd <= 0.0 {
-            log_error!("testperpv1: basis trade: {} has no Solend oracle price yet, skipping deposit-hedge", symbol);
+            log_error!("perpfundingv1: basis trade: {} has no Solend oracle price yet, skipping deposit-hedge", symbol);
             return;
         }
         let decimals = reserve.mint_decimals as i32;
@@ -1709,13 +1711,13 @@ impl<'a> StateHelper<'a> {
         };
 
         log_warn!(
-            "testperpv1: basis trade: opening Solend deposit-hedge {} (${:.2})",
+            "perpfundingv1: basis trade: opening Solend deposit-hedge {} (${:.2})",
             symbol,
             notional_usd,
         );
         if let Err(e) = self.execute_spot_leg(mint_usdc, mint, usdc_amount_raw) {
             log_error!(
-                "testperpv1: basis trade: deposit-hedge {} spot swap failed: {}",
+                "perpfundingv1: basis trade: deposit-hedge {} spot swap failed: {}",
                 symbol,
                 e
             );
@@ -1729,7 +1731,7 @@ impl<'a> StateHelper<'a> {
         };
         if let Err(e) = reserve.refresh_reserve(reserve_id, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: deposit-hedge {} refresh_reserve failed: {}",
+                "perpfundingv1: basis trade: deposit-hedge {} refresh_reserve failed: {}",
                 symbol,
                 e
             );
@@ -1738,7 +1740,7 @@ impl<'a> StateHelper<'a> {
         let refresh_reserves = self.solend_refresh_reserves();
         if let Err(e) = solend::refresh_obligation(obligation_id, &refresh_reserves, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: deposit-hedge {} refresh_obligation failed: {}",
+                "perpfundingv1: basis trade: deposit-hedge {} refresh_obligation failed: {}",
                 symbol,
                 e
             );
@@ -1754,7 +1756,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: deposit-hedge {} solend deposit failed: {}",
+                "perpfundingv1: basis trade: deposit-hedge {} solend deposit failed: {}",
                 symbol,
                 e
             );
@@ -1862,14 +1864,14 @@ impl<'a> StateHelper<'a> {
                 return;
             };
             log_warn!(
-                "testperpv1: basis trade: depositing ${:.2} USDC collateral for {} ${:.2} borrow-hedge",
+                "perpfundingv1: basis trade: depositing ${:.2} USDC collateral for {} ${:.2} borrow-hedge",
                 collateral_usd,
                 symbol,
                 notional_usd,
             );
             if let Err(e) = usdc_reserve.refresh_reserve(usdc_reserve_id, self.wallet) {
                 log_error!(
-                    "testperpv1: basis trade: borrow-hedge {} refresh_reserve failed: {}",
+                    "perpfundingv1: basis trade: borrow-hedge {} refresh_reserve failed: {}",
                     symbol,
                     e
                 );
@@ -1880,7 +1882,7 @@ impl<'a> StateHelper<'a> {
                 solend::refresh_obligation(obligation_id, &refresh_reserves, self.wallet)
             {
                 log_error!(
-                    "testperpv1: basis trade: borrow-hedge {} refresh_obligation failed: {}",
+                    "perpfundingv1: basis trade: borrow-hedge {} refresh_obligation failed: {}",
                     symbol,
                     e
                 );
@@ -1895,7 +1897,7 @@ impl<'a> StateHelper<'a> {
                 usdc_collateral_ata,
                 self.wallet,
             ) {
-                log_error!("testperpv1: basis trade: borrow-hedge {} USDC collateral deposit failed: {}", symbol, e);
+                log_error!("perpfundingv1: basis trade: borrow-hedge {} USDC collateral deposit failed: {}", symbol, e);
             }
             return;
         }
@@ -1918,7 +1920,7 @@ impl<'a> StateHelper<'a> {
         }
         let price_usd = reserve.price_usd;
         if price_usd <= 0.0 {
-            log_error!("testperpv1: basis trade: {} has no Solend oracle price yet, skipping borrow-hedge", symbol);
+            log_error!("perpfundingv1: basis trade: {} has no Solend oracle price yet, skipping borrow-hedge", symbol);
             return;
         }
         let decimals = reserve.mint_decimals as i32;
@@ -1931,13 +1933,13 @@ impl<'a> StateHelper<'a> {
         };
 
         log_warn!(
-            "testperpv1: basis trade: opening Solend borrow-hedge {} (${:.2})",
+            "perpfundingv1: basis trade: opening Solend borrow-hedge {} (${:.2})",
             symbol,
             notional_usd,
         );
         if let Err(e) = reserve.refresh_reserve(reserve_id, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} refresh_reserve failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} refresh_reserve failed: {}",
                 symbol,
                 e
             );
@@ -1945,7 +1947,7 @@ impl<'a> StateHelper<'a> {
         }
         if let Err(e) = usdc_reserve.refresh_reserve(usdc_reserve_id, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} USDC refresh_reserve failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} USDC refresh_reserve failed: {}",
                 symbol,
                 e
             );
@@ -1954,7 +1956,7 @@ impl<'a> StateHelper<'a> {
         let refresh_reserves = self.solend_refresh_reserves();
         if let Err(e) = solend::refresh_obligation(obligation_id, &refresh_reserves, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} refresh_obligation failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} refresh_obligation failed: {}",
                 symbol,
                 e
             );
@@ -1971,7 +1973,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} solend borrow failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} solend borrow failed: {}",
                 symbol,
                 e
             );
@@ -1982,7 +1984,7 @@ impl<'a> StateHelper<'a> {
         // this method's doc comment).
         if let Err(e) = self.execute_spot_leg(mint, mint_usdc, borrow_amount_raw) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} spot sell failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} spot sell failed: {}",
                 symbol,
                 e
             );
@@ -2044,7 +2046,7 @@ impl<'a> StateHelper<'a> {
 
         let price_usd = reserve.price_usd;
         if price_usd <= 0.0 {
-            log_error!("testperpv1: basis trade: {} has no Kamino oracle price yet, skipping deposit-hedge", symbol);
+            log_error!("perpfundingv1: basis trade: {} has no Kamino oracle price yet, skipping deposit-hedge", symbol);
             return;
         }
         let decimals = reserve.mint_decimals as i32;
@@ -2060,13 +2062,13 @@ impl<'a> StateHelper<'a> {
         };
 
         log_warn!(
-            "testperpv1: basis trade: opening Kamino deposit-hedge {} (${:.2})",
+            "perpfundingv1: basis trade: opening Kamino deposit-hedge {} (${:.2})",
             symbol,
             notional_usd,
         );
         if let Err(e) = self.execute_spot_leg(mint_usdc, mint, usdc_amount_raw) {
             log_error!(
-                "testperpv1: basis trade: deposit-hedge {} kamino spot swap failed: {}",
+                "perpfundingv1: basis trade: deposit-hedge {} kamino spot swap failed: {}",
                 symbol,
                 e
             );
@@ -2087,7 +2089,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: deposit-hedge {} kamino refresh_reserve failed: {}",
+                "perpfundingv1: basis trade: deposit-hedge {} kamino refresh_reserve failed: {}",
                 symbol,
                 e
             );
@@ -2102,7 +2104,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: deposit-hedge {} kamino refresh_obligation failed: {}",
+                "perpfundingv1: basis trade: deposit-hedge {} kamino refresh_obligation failed: {}",
                 symbol,
                 e
             );
@@ -2131,7 +2133,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: deposit-hedge {} kamino deposit failed: {}",
+                "perpfundingv1: basis trade: deposit-hedge {} kamino deposit failed: {}",
                 symbol,
                 e
             );
@@ -2228,7 +2230,7 @@ impl<'a> StateHelper<'a> {
                 return;
             };
             log_warn!(
-                "testperpv1: basis trade: depositing ${:.2} USDC collateral for {} ${:.2} Kamino borrow-hedge",
+                "perpfundingv1: basis trade: depositing ${:.2} USDC collateral for {} ${:.2} Kamino borrow-hedge",
                 collateral_usd,
                 symbol,
                 notional_usd,
@@ -2241,7 +2243,7 @@ impl<'a> StateHelper<'a> {
                 usdc_reserve.scope_prices,
                 self.wallet,
             ) {
-                log_error!("testperpv1: basis trade: borrow-hedge {} kamino USDC refresh_reserve failed: {}", symbol, e);
+                log_error!("perpfundingv1: basis trade: borrow-hedge {} kamino USDC refresh_reserve failed: {}", symbol, e);
                 return;
             }
             let (deposit_reserves, borrow_reserves) = self.kamino_refresh_reserves();
@@ -2252,7 +2254,7 @@ impl<'a> StateHelper<'a> {
                 &borrow_reserves,
                 self.wallet,
             ) {
-                log_error!("testperpv1: basis trade: borrow-hedge {} kamino refresh_obligation failed: {}", symbol, e);
+                log_error!("perpfundingv1: basis trade: borrow-hedge {} kamino refresh_obligation failed: {}", symbol, e);
                 return;
             }
             if !self.ensure_kamino_farm_ready(
@@ -2278,7 +2280,7 @@ impl<'a> StateHelper<'a> {
                 usdc_ata,
                 self.wallet,
             ) {
-                log_error!("testperpv1: basis trade: borrow-hedge {} kamino USDC collateral deposit failed: {}", symbol, e);
+                log_error!("perpfundingv1: basis trade: borrow-hedge {} kamino USDC collateral deposit failed: {}", symbol, e);
             }
             return;
         }
@@ -2301,7 +2303,7 @@ impl<'a> StateHelper<'a> {
         }
         let price_usd = reserve.price_usd;
         if price_usd <= 0.0 {
-            log_error!("testperpv1: basis trade: {} has no Kamino oracle price yet, skipping borrow-hedge", symbol);
+            log_error!("perpfundingv1: basis trade: {} has no Kamino oracle price yet, skipping borrow-hedge", symbol);
             return;
         }
         let decimals = reserve.mint_decimals as i32;
@@ -2314,7 +2316,7 @@ impl<'a> StateHelper<'a> {
         };
 
         log_warn!(
-            "testperpv1: basis trade: opening Kamino borrow-hedge {} (${:.2})",
+            "perpfundingv1: basis trade: opening Kamino borrow-hedge {} (${:.2})",
             symbol,
             notional_usd,
         );
@@ -2327,7 +2329,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} kamino refresh_reserve failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} kamino refresh_reserve failed: {}",
                 symbol,
                 e
             );
@@ -2341,7 +2343,7 @@ impl<'a> StateHelper<'a> {
             usdc_reserve.scope_prices,
             self.wallet,
         ) {
-            log_error!("testperpv1: basis trade: borrow-hedge {} kamino USDC refresh_reserve failed: {}", symbol, e);
+            log_error!("perpfundingv1: basis trade: borrow-hedge {} kamino USDC refresh_reserve failed: {}", symbol, e);
             return;
         }
         let (deposit_reserves, borrow_reserves) = self.kamino_refresh_reserves();
@@ -2353,7 +2355,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} kamino refresh_obligation failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} kamino refresh_obligation failed: {}",
                 symbol,
                 e
             );
@@ -2380,7 +2382,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} kamino borrow failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} kamino borrow failed: {}",
                 symbol,
                 e
             );
@@ -2391,7 +2393,7 @@ impl<'a> StateHelper<'a> {
         // `open_solend_borrow_leg`'s doc comment for why).
         if let Err(e) = self.execute_spot_leg(mint, mint_usdc, borrow_amount_raw) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} kamino spot sell failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} kamino spot sell failed: {}",
                 symbol,
                 e
             );
@@ -2492,7 +2494,7 @@ impl<'a> StateHelper<'a> {
                 return;
             };
             log_warn!(
-                "testperpv1: basis trade: depositing ${:.2} USDC collateral for {} ${:.2} marginfi borrow-hedge",
+                "perpfundingv1: basis trade: depositing ${:.2} USDC collateral for {} ${:.2} marginfi borrow-hedge",
                 collateral_usd,
                 symbol,
                 notional_usd,
@@ -2507,7 +2509,7 @@ impl<'a> StateHelper<'a> {
                 false,
                 self.wallet,
             ) {
-                log_error!("testperpv1: basis trade: borrow-hedge {} marginfi USDC collateral deposit failed: {}", symbol, e);
+                log_error!("perpfundingv1: basis trade: borrow-hedge {} marginfi USDC collateral deposit failed: {}", symbol, e);
             }
             return;
         }
@@ -2529,7 +2531,7 @@ impl<'a> StateHelper<'a> {
             return;
         }
         let Some(price) = dex.marginfi().price_for_bank(bank_id) else {
-            log_error!("testperpv1: basis trade: {} has no marginfi oracle price yet, skipping borrow-hedge", symbol);
+            log_error!("perpfundingv1: basis trade: {} has no marginfi oracle price yet, skipping borrow-hedge", symbol);
             return;
         };
         if price.price_usd <= 0.0 {
@@ -2551,7 +2553,7 @@ impl<'a> StateHelper<'a> {
                 .as_secs() as i64;
             if now.saturating_sub(oracle_ts) > bank.oracle_max_age as i64 {
                 log_error!(
-                    "testperpv1: basis trade: {} marginfi oracle stale ({}s old, max age {}s), skipping borrow-hedge",
+                    "perpfundingv1: basis trade: {} marginfi oracle stale ({}s old, max age {}s), skipping borrow-hedge",
                     symbol,
                     now.saturating_sub(oracle_ts),
                     bank.oracle_max_age,
@@ -2576,7 +2578,7 @@ impl<'a> StateHelper<'a> {
             .unwrap_or_default();
 
         log_warn!(
-            "testperpv1: basis trade: opening marginfi borrow-hedge {} (${:.2})",
+            "perpfundingv1: basis trade: opening marginfi borrow-hedge {} (${:.2})",
             symbol,
             notional_usd,
         );
@@ -2591,7 +2593,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} marginfi borrow failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} marginfi borrow failed: {}",
                 symbol,
                 e
             );
@@ -2602,7 +2604,7 @@ impl<'a> StateHelper<'a> {
         // `open_solend_borrow_leg`'s doc comment for why).
         if let Err(e) = self.execute_spot_leg(mint, mint_usdc, borrow_amount_raw) {
             log_error!(
-                "testperpv1: basis trade: borrow-hedge {} marginfi spot sell failed: {}",
+                "perpfundingv1: basis trade: borrow-hedge {} marginfi spot sell failed: {}",
                 symbol,
                 e
             );
@@ -2676,12 +2678,12 @@ impl<'a> StateHelper<'a> {
         };
 
         log_warn!(
-            "testperpv1: basis trade: closing Solend deposit-hedge {}",
+            "perpfundingv1: basis trade: closing Solend deposit-hedge {}",
             symbol
         );
         if let Err(e) = reserve.refresh_reserve(reserve_id, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: close deposit-hedge {} refresh_reserve failed: {}",
+                "perpfundingv1: basis trade: close deposit-hedge {} refresh_reserve failed: {}",
                 symbol,
                 e
             );
@@ -2690,7 +2692,7 @@ impl<'a> StateHelper<'a> {
         let refresh_reserves = self.solend_refresh_reserves();
         if let Err(e) = solend::refresh_obligation(obligation_id, &refresh_reserves, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: close deposit-hedge {} refresh_obligation failed: {}",
+                "perpfundingv1: basis trade: close deposit-hedge {} refresh_obligation failed: {}",
                 symbol,
                 e
             );
@@ -2708,7 +2710,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: close deposit-hedge {} solend withdraw failed: {}",
+                "perpfundingv1: basis trade: close deposit-hedge {} solend withdraw failed: {}",
                 symbol,
                 e
             );
@@ -2722,7 +2724,7 @@ impl<'a> StateHelper<'a> {
         let mint_usdc = self.configuration.mint_usdc;
         if let Err(e) = self.execute_spot_leg(mint, mint_usdc, estimated_underlying_raw) {
             log_error!(
-                "testperpv1: basis trade: close deposit-hedge {} spot sell failed: {}",
+                "perpfundingv1: basis trade: close deposit-hedge {} spot sell failed: {}",
                 symbol,
                 e
             );
@@ -2816,12 +2818,12 @@ impl<'a> StateHelper<'a> {
             .sum();
         if underlying_balance_raw < borrowed_amount {
             log_warn!(
-                "testperpv1: basis trade: closing Solend borrow-hedge {}",
+                "perpfundingv1: basis trade: closing Solend borrow-hedge {}",
                 symbol
             );
             if let Err(e) = self.execute_spot_leg(mint_usdc, mint, usdc_needed_raw) {
                 log_error!(
-                    "testperpv1: basis trade: close borrow-hedge {} buy-back failed: {}",
+                    "perpfundingv1: basis trade: close borrow-hedge {} buy-back failed: {}",
                     symbol,
                     e
                 );
@@ -2851,7 +2853,7 @@ impl<'a> StateHelper<'a> {
         };
         if let Err(e) = reserve.refresh_reserve(reserve_id, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: close borrow-hedge {} refresh_reserve failed: {}",
+                "perpfundingv1: basis trade: close borrow-hedge {} refresh_reserve failed: {}",
                 symbol,
                 e
             );
@@ -2870,7 +2872,7 @@ impl<'a> StateHelper<'a> {
         if let Some((usdc_reserve_id, usdc_reserve)) = dex.solend().reserve_by_mint(mint_usdc) {
             if let Err(e) = usdc_reserve.refresh_reserve(usdc_reserve_id, self.wallet) {
                 log_error!(
-                    "testperpv1: basis trade: close borrow-hedge {} USDC refresh_reserve failed: {}",
+                    "perpfundingv1: basis trade: close borrow-hedge {} USDC refresh_reserve failed: {}",
                     symbol,
                     e
                 );
@@ -2880,7 +2882,7 @@ impl<'a> StateHelper<'a> {
         let refresh_reserves = self.solend_refresh_reserves();
         if let Err(e) = solend::refresh_obligation(obligation_id, &refresh_reserves, self.wallet) {
             log_error!(
-                "testperpv1: basis trade: close borrow-hedge {} refresh_obligation failed: {}",
+                "perpfundingv1: basis trade: close borrow-hedge {} refresh_obligation failed: {}",
                 symbol,
                 e
             );
@@ -2895,7 +2897,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: close borrow-hedge {} solend repay failed: {}",
+                "perpfundingv1: basis trade: close borrow-hedge {} solend repay failed: {}",
                 symbol,
                 e
             );
@@ -2953,7 +2955,7 @@ impl<'a> StateHelper<'a> {
         };
 
         log_warn!(
-            "testperpv1: basis trade: closing Kamino deposit-hedge {}",
+            "perpfundingv1: basis trade: closing Kamino deposit-hedge {}",
             symbol
         );
         if let Err(e) = reserve.refresh_reserve(
@@ -2964,7 +2966,7 @@ impl<'a> StateHelper<'a> {
             reserve.scope_prices,
             self.wallet,
         ) {
-            log_error!("testperpv1: basis trade: close deposit-hedge {} kamino refresh_reserve failed: {}", symbol, e);
+            log_error!("perpfundingv1: basis trade: close deposit-hedge {} kamino refresh_reserve failed: {}", symbol, e);
             return;
         }
         let (deposit_reserves, borrow_reserves) = self.kamino_refresh_reserves();
@@ -2975,7 +2977,7 @@ impl<'a> StateHelper<'a> {
             &borrow_reserves,
             self.wallet,
         ) {
-            log_error!("testperpv1: basis trade: close deposit-hedge {} kamino refresh_obligation failed: {}", symbol, e);
+            log_error!("perpfundingv1: basis trade: close deposit-hedge {} kamino refresh_obligation failed: {}", symbol, e);
             return;
         }
         if !self.ensure_kamino_farm_ready(
@@ -3001,7 +3003,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: close deposit-hedge {} kamino withdraw failed: {}",
+                "perpfundingv1: basis trade: close deposit-hedge {} kamino withdraw failed: {}",
                 symbol,
                 e
             );
@@ -3015,7 +3017,7 @@ impl<'a> StateHelper<'a> {
         let mint_usdc = self.configuration.mint_usdc;
         if let Err(e) = self.execute_spot_leg(mint, mint_usdc, estimated_underlying_raw) {
             log_error!(
-                "testperpv1: basis trade: close deposit-hedge {} kamino spot sell failed: {}",
+                "perpfundingv1: basis trade: close deposit-hedge {} kamino spot sell failed: {}",
                 symbol,
                 e
             );
@@ -3100,12 +3102,12 @@ impl<'a> StateHelper<'a> {
             .sum();
         if underlying_balance_raw < borrowed_amount {
             log_warn!(
-                "testperpv1: basis trade: closing Kamino borrow-hedge {}",
+                "perpfundingv1: basis trade: closing Kamino borrow-hedge {}",
                 symbol
             );
             if let Err(e) = self.execute_spot_leg(mint_usdc, mint, usdc_needed_raw) {
                 log_error!(
-                    "testperpv1: basis trade: close borrow-hedge {} kamino buy-back failed: {}",
+                    "perpfundingv1: basis trade: close borrow-hedge {} kamino buy-back failed: {}",
                     symbol,
                     e
                 );
@@ -3137,7 +3139,7 @@ impl<'a> StateHelper<'a> {
             reserve.scope_prices,
             self.wallet,
         ) {
-            log_error!("testperpv1: basis trade: close borrow-hedge {} kamino refresh_reserve failed: {}", symbol, e);
+            log_error!("perpfundingv1: basis trade: close borrow-hedge {} kamino refresh_reserve failed: {}", symbol, e);
             return;
         }
         // Same reasoning as `close_solend_borrow_leg`'s identical fix:
@@ -3155,7 +3157,7 @@ impl<'a> StateHelper<'a> {
                 self.wallet,
             ) {
                 log_error!(
-                    "testperpv1: basis trade: close borrow-hedge {} kamino USDC refresh_reserve failed: {}",
+                    "perpfundingv1: basis trade: close borrow-hedge {} kamino USDC refresh_reserve failed: {}",
                     symbol,
                     e
                 );
@@ -3170,7 +3172,7 @@ impl<'a> StateHelper<'a> {
             &borrow_reserves,
             self.wallet,
         ) {
-            log_error!("testperpv1: basis trade: close borrow-hedge {} kamino refresh_obligation failed: {}", symbol, e);
+            log_error!("perpfundingv1: basis trade: close borrow-hedge {} kamino refresh_obligation failed: {}", symbol, e);
             return;
         }
         if !self.ensure_kamino_farm_ready(reserve_id, reserve.lending_market, reserve.farm_debt, 1)
@@ -3192,7 +3194,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: close borrow-hedge {} kamino repay failed: {}",
+                "perpfundingv1: basis trade: close borrow-hedge {} kamino repay failed: {}",
                 symbol,
                 e
             );
@@ -3280,12 +3282,12 @@ impl<'a> StateHelper<'a> {
             .sum();
         if (underlying_balance_raw as f64) < borrowed_amount_raw {
             log_warn!(
-                "testperpv1: basis trade: closing marginfi borrow-hedge {}",
+                "perpfundingv1: basis trade: closing marginfi borrow-hedge {}",
                 symbol
             );
             if let Err(e) = self.execute_spot_leg(mint_usdc, mint, usdc_needed_raw) {
                 log_error!(
-                    "testperpv1: basis trade: close borrow-hedge {} marginfi buy-back failed: {}",
+                    "perpfundingv1: basis trade: close borrow-hedge {} marginfi buy-back failed: {}",
                     symbol,
                     e
                 );
@@ -3317,7 +3319,7 @@ impl<'a> StateHelper<'a> {
             self.wallet,
         ) {
             log_error!(
-                "testperpv1: basis trade: close borrow-hedge {} marginfi repay failed: {}",
+                "perpfundingv1: basis trade: close borrow-hedge {} marginfi repay failed: {}",
                 symbol,
                 e
             );
@@ -3400,7 +3402,7 @@ impl<'a> StateHelper<'a> {
             return;
         };
         log_warn!(
-            "testperpv1: basis trade: closing {} -- direction reversed or no longer profitable",
+            "perpfundingv1: basis trade: closing {} -- direction reversed or no longer profitable",
             symbol,
         );
         match currently_open {
@@ -3442,7 +3444,7 @@ impl<'a> StateHelper<'a> {
             return;
         };
         log_warn!(
-            "testperpv1: idle capital: depositing ${:.2} USDC at {:?} (supply_apy={:.3}%)",
+            "perpfundingv1: idle capital: depositing ${:.2} USDC at {:?} (supply_apy={:.3}%)",
             amount_usd,
             protocol,
             apy_pct,
@@ -3501,12 +3503,12 @@ impl<'a> StateHelper<'a> {
         };
 
         if let Err(e) = usdc_reserve.refresh_reserve(usdc_reserve_id, self.wallet) {
-            log_error!("testperpv1: idle capital: solend refresh_reserve failed: {e}");
+            log_error!("perpfundingv1: idle capital: solend refresh_reserve failed: {e}");
             return;
         }
         let refresh_reserves = self.solend_refresh_reserves();
         if let Err(e) = solend::refresh_obligation(obligation_id, &refresh_reserves, self.wallet) {
-            log_error!("testperpv1: idle capital: solend refresh_obligation failed: {e}");
+            log_error!("perpfundingv1: idle capital: solend refresh_obligation failed: {e}");
             return;
         }
         if let Err(e) = usdc_reserve.deposit(
@@ -3518,7 +3520,7 @@ impl<'a> StateHelper<'a> {
             usdc_collateral_ata,
             self.wallet,
         ) {
-            log_error!("testperpv1: idle capital: solend USDC deposit failed: {e}");
+            log_error!("perpfundingv1: idle capital: solend USDC deposit failed: {e}");
         }
     }
 
@@ -3575,7 +3577,7 @@ impl<'a> StateHelper<'a> {
             usdc_reserve.scope_prices,
             self.wallet,
         ) {
-            log_error!("testperpv1: idle capital: kamino refresh_reserve failed: {e}");
+            log_error!("perpfundingv1: idle capital: kamino refresh_reserve failed: {e}");
             return;
         }
         let (deposit_reserves, borrow_reserves) = self.kamino_refresh_reserves();
@@ -3586,7 +3588,7 @@ impl<'a> StateHelper<'a> {
             &borrow_reserves,
             self.wallet,
         ) {
-            log_error!("testperpv1: idle capital: kamino refresh_obligation failed: {e}");
+            log_error!("perpfundingv1: idle capital: kamino refresh_obligation failed: {e}");
             return;
         }
         if !self.ensure_kamino_farm_ready(
@@ -3611,13 +3613,13 @@ impl<'a> StateHelper<'a> {
             usdc_ata,
             self.wallet,
         ) {
-            log_error!("testperpv1: idle capital: kamino USDC deposit failed: {e}");
+            log_error!("perpfundingv1: idle capital: kamino USDC deposit failed: {e}");
         }
     }
 
     /// marginfi half of [`Self::deploy_idle_usdc`] -- same bootstrap-gate/
-    /// deposit shape as this file's own borrow-hedge USDC-collateral
-    /// stage, minus its `has_usdc_collateral` skip. No
+    /// deposit shape as the borrow-hedge USDC-collateral stage in
+    /// `perpfundingv1::state`, minus its `has_usdc_collateral` skip. No
     /// refresh step needed -- marginfi has no `refresh_reserve`/
     /// `refresh_obligation` analog at all (confirmed: no such instruction
     /// exists -- `MarginfiState::deposit` takes the bank/account
@@ -3671,7 +3673,7 @@ impl<'a> StateHelper<'a> {
             false,
             self.wallet,
         ) {
-            log_error!("testperpv1: idle capital: marginfi USDC deposit failed: {e}");
+            log_error!("perpfundingv1: idle capital: marginfi USDC deposit failed: {e}");
         }
     }
 
@@ -3727,7 +3729,7 @@ impl<'a> StateHelper<'a> {
                 continue;
             };
             log_warn!(
-                "testperpv1: basis trade: opening {} direction={:?} (phoenix_funding={:.3}% best_borrow_apy={:.3}%)",
+                "perpfundingv1: basis trade: opening {} direction={:?} (phoenix_funding={:.3}% best_borrow_apy={:.3}%)",
                 symbol,
                 direction,
                 phoenix_rate,
@@ -3760,9 +3762,10 @@ impl<'a> StateHelper<'a> {
     }
 
     /// Real-transaction smoke test entry point -- see [`TestPhase`]'s doc
-    /// comment for the full state machine this drives through. This mode
-    /// never touches Phoenix or the funding-rate router, only
-    /// Solend/Kamino/marginfi deposit+withdraw.
+    /// comment for the full state machine this drives through. Replaces
+    /// `perpfundingv1::evaluate`'s Phoenix/epoch/basis-trade logic
+    /// entirely: this mode never touches Phoenix or the funding-rate
+    /// router, only Solend/Kamino/marginfi deposit+withdraw.
     pub(crate) fn evaluate(&mut self) {
         let t0 = std::time::Instant::now();
         self.evaluate_inner();
@@ -3817,9 +3820,9 @@ impl<'a> StateHelper<'a> {
 
         // Drains whatever this evaluate() call (or `on_message`'s Wallet
         // arm) built onto self.wallet and actually sends it -- same tail
-        // `arbv1::state::evaluate` also uses. Without this, queued
-        // instructions would sit on the wallet forever and never reach
-        // the chain.
+        // arbv1::state::evaluate/perpfundingv1::evaluate both use.
+        // Without this, queued instructions would sit on the wallet
+        // forever and never reach the chain.
         for (sig, result) in self.wallet.drain_and_send() {
             match result {
                 Ok(_) => {
@@ -4597,9 +4600,8 @@ impl<'a> StateHelper<'a> {
     /// [`Self::open_marginfi_borrow_leg`].
     ///
     /// TEMPORARILY SKIPPED (test scope only -- `open_marginfi_borrow_leg`
-    /// itself, still exercised by this mode's own production basis-trade
-    /// path, keeps its full real staleness gate). The gate is verified
-    /// correct: marginfi's
+    /// itself, still exercised by production `perpfundingv1`, keeps its
+    /// full real staleness gate). The gate is verified correct: marginfi's
     /// real per-bank `oracle_max_age` (`70` seconds for this bank) and the
     /// Switchboard feed's own `last_update_timestamp` were both
     /// live-verified against real source and cross-checked independently
@@ -4723,7 +4725,7 @@ impl<'a> StateHelper<'a> {
         };
 
         log_warn!(
-            "testperpv1: spot leg @ slot {}: {} hop{} {} -> {} amount_in={}",
+            "perpfundingv1: spot leg @ slot {}: {} hop{} {} -> {} amount_in={}",
             self.state.last_slot,
             route.hops.len(),
             if route.hops.len() == 1 { "" } else { "s" },
@@ -4828,7 +4830,7 @@ impl<'a> StateHelper<'a> {
     /// doc comment for why.
     pub(crate) fn rebalance_portfolio(&mut self) {
         let Some(owner) = self.state.wallet() else {
-            log_warn!("testperpv1: rebalance skipped -- no wallet keypair yet");
+            log_warn!("perpfundingv1: rebalance skipped -- no wallet keypair yet");
             return;
         };
         const MAX_HOPS: usize = 4;
@@ -4894,7 +4896,7 @@ impl<'a> StateHelper<'a> {
                     Some(route) => route.amount_out() as f64 / 10f64.powi(USDC_DECIMALS),
                     None => {
                         log_error!(
-                            "testperpv1: rebalance: no route to value {} ({}), skipping this pass",
+                            "perpfundingv1: rebalance: no route to value {} ({}), skipping this pass",
                             symbol,
                             account_id,
                         );
@@ -4904,7 +4906,7 @@ impl<'a> StateHelper<'a> {
             };
             let decimals = resolve_symbol_decimals(&symbol).unwrap_or(0);
             log_warn!(
-                "testperpv1: rebalance holding {}: balance={:.9} (raw {}) value=${:.2} target_pct={:.4}",
+                "perpfundingv1: rebalance holding {}: balance={:.9} (raw {}) value=${:.2} target_pct={:.4}",
                 symbol,
                 balance_raw as f64 / 10f64.powi(decimals as i32),
                 balance_raw,
@@ -4924,7 +4926,7 @@ impl<'a> StateHelper<'a> {
         }
 
         log_warn!(
-            "testperpv1: rebalance @ slot {}: total portfolio value=${:.2} (usdc=${:.2}, {} priced asset{})",
+            "perpfundingv1: rebalance @ slot {}: total portfolio value=${:.2} (usdc=${:.2}, {} priced asset{})",
             self.state.last_slot,
             total_value,
             usdc_value,
@@ -4940,7 +4942,7 @@ impl<'a> StateHelper<'a> {
         );
         if scale < 1.0 {
             log_warn!(
-                "testperpv1: rebalance: desired buys exceed available capital -- scaled to {:.4} \
+                "perpfundingv1: rebalance: desired buys exceed available capital -- scaled to {:.4} \
                  (reserving ${:.2} for funding-arb margin)",
                 scale,
                 FUNDING_CYCLE_MIN_MARGIN_USD,
@@ -4948,22 +4950,22 @@ impl<'a> StateHelper<'a> {
         }
         for (symbol, account_id, amount_in) in sells {
             log_warn!(
-                "testperpv1: rebalance SELL {} amount_in={}",
+                "perpfundingv1: rebalance SELL {} amount_in={}",
                 symbol,
                 amount_in
             );
             if let Err(e) = self.execute_spot_leg(account_id, mint_usdc, amount_in) {
-                log_error!("testperpv1: rebalance SELL {} failed: {}", symbol, e);
+                log_error!("perpfundingv1: rebalance SELL {} failed: {}", symbol, e);
             }
         }
         for (symbol, account_id, amount_in) in buys {
             log_warn!(
-                "testperpv1: rebalance BUY {} amount_in={}",
+                "perpfundingv1: rebalance BUY {} amount_in={}",
                 symbol,
                 amount_in
             );
             if let Err(e) = self.execute_spot_leg(mint_usdc, account_id, amount_in) {
-                log_error!("testperpv1: rebalance BUY {} failed: {}", symbol, e);
+                log_error!("perpfundingv1: rebalance BUY {} failed: {}", symbol, e);
             }
         }
     }
@@ -5296,12 +5298,12 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
                     let account_id = resolve_symbol_mint(&symbol);
                     if account_id.is_none() {
                         log_error!(
-                            "testperpv1: target allocation symbol {} has no curated mint -- cannot resolve to AccountId",
+                            "perpfundingv1: target allocation symbol {} has no curated mint -- cannot resolve to AccountId",
                             symbol,
                         );
                     }
                     log_warn!(
-                        "testperpv1: target allocation update: {}={} ({:?})",
+                        "perpfundingv1: target allocation update: {}={} ({:?})",
                         symbol,
                         allocation_pct,
                         account_id
@@ -5446,7 +5448,7 @@ impl<'a> CommitHook for StateHelper<'a> {
                 .as_ref()
                 .is_some_and(|s| s.registered());
             log_warn!(
-                "testperpv1 stats @ slot {slot}: phoenix_ready={} solend_registered={} kamino_registered={} marginfi_registered={} pending_epoch={:?}",
+                "perpfundingv1 stats @ slot {slot}: phoenix_ready={} solend_registered={} kamino_registered={} marginfi_registered={} pending_epoch={:?}",
                 phoenix_ready,
                 solend_registered,
                 kamino_registered,
@@ -5500,7 +5502,7 @@ impl<'a> CommitHook for StateHelper<'a> {
         self.state.slot_delta_since_start += 1;
         if let Some(phoenix) = self.state.o_phoenix.as_mut() {
             if let Err(e) = phoenix.flush_pending(self.graph) {
-                log_error!("testperpv1: failed to flush phoenix subscriptions: {e}");
+                log_error!("perpfundingv1: failed to flush phoenix subscriptions: {e}");
             }
         }
         // Breadcrumb, throttled to every 20 slots -- `bulk_subscribe`
@@ -5528,7 +5530,7 @@ impl<'a> CommitHook for StateHelper<'a> {
         let t_dex_flush = std::time::Instant::now();
         if let Some(mut dex) = self.state.o_dex.take() {
             if let Err(e) = dex.flush_pool(self.graph, MAX_SUBSCRIBES_PER_SLOT) {
-                log_error!("testperpv1: failed to flush dex subscriptions: {e}");
+                log_error!("perpfundingv1: failed to flush dex subscriptions: {e}");
             }
             // Drains a bounded slice of DexState's own queued startup
             // subscription burst (~32,000 requests across every sub-dex)

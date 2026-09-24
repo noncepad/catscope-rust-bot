@@ -709,7 +709,7 @@ impl OrcaState {
     /// keeps them alive via `q_hold_sub` -- for callers that don't defer
     /// through a shared [`crate::graph::SubscriptionQueue`] (`DexState`'s
     /// own copy uses the split [`Self::new`]/`flush_subscriptions` path
-    /// instead).
+    /// instead). Real caller: `helloworldv1`'s standalone demo instance.
     pub fn new_and_subscribe(g: &Graph) -> Result<Self, CatscopeGuestError> {
         let (mut state, l_req) = Self::new();
         let subs = SubscriptionQueue::subscribe_now(g, l_req)?;

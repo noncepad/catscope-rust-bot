@@ -124,9 +124,9 @@ fn raydium_amm_router_min_liquidity_usd() -> f64 {
 /// (`EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm`): dozens of matching
 /// pool rows, every one either near-zero or an implausible placeholder-
 /// looking balance, no real liquid market against any standard quote
-/// asset. A pair-trading dispersion strategy formerly built against this
-/// router sized real legs at roughly $10-20 notional each; its
-/// live-observed real slippage-based sizing correctly refused to open
+/// asset. `multimodelv1`'s dispersion trade type sizes real legs at
+/// roughly $10-20 notional each; live-observed real slippage-based sizing
+/// (`factor_sizing::max_safe_notional_exact`) correctly refused to open
 /// with such mints in the candidate set, converging basket size down to
 /// single-digit cents (99%+ below intended) on essentially every cycle.
 /// $2,000 gives real headroom above a $10-20 leg at the strategy's own
@@ -283,9 +283,10 @@ fn trade_router_probe_lamports() -> u64 {
 /// Temporary kill switch (2026-09-04): when set, `PHOENIX_MARKETS` is
 /// generated empty regardless of what's in prefetch.db's `phoenix_market`
 /// table, so no build of the wasm bot has any real Phoenix market to
-/// find -- `PhoenixState::markets()` (and everything downstream of it,
-/// including testperpv1's perp checks) sees an empty list and refuses
-/// rather than attempting a trade. Added after this session's real, live-confirmed
+/// find -- `PhoenixState::markets()` (and everything downstream of it:
+/// dispersion's short-index leg, perpfundingv1, phoenixperpsv1,
+/// testperpv1's perp checks) sees an empty list and refuses rather than
+/// attempting a trade. Added after this session's real, live-confirmed
 /// incident: the trading wallet's Phoenix Eternal trader account was
 /// found frozen on-chain (`TraderCapabilityFlags` denies
 /// DepositCollateral/WithdrawCollateral/RiskIncreasingTrade -- see
@@ -1728,7 +1729,7 @@ fn main() {
         // Unlike that lookup's soft warning+fallback (a router-internal
         // valuation heuristic, low stakes), a missing decimals value
         // here is a hard build failure: decimals feed directly into
-        // real trade sizing (testperpv1's rebalance math), and a
+        // real trade sizing (perpfundingv1's rebalance math), and a
         // fabricated/guessed value would silently corrupt it -- same
         // discipline as Phoenix's mark_price_usd() returning `None`
         // rather than a guess. Verified (this session) all 6 curated
@@ -1778,8 +1779,9 @@ fn main() {
     }
 
     // ── Kamino ∪ Solend reserve mints (all markets) → trade_universe_data.rs ─
-    // Originally a pair-trading candidate universe, broadened from the
-    // tiny Phoenix+Velocity-perp-gated `SYMBOL_MINT_MAP` above. That gate was
+    // multimodelv1's pair-trading candidate universe (`curated_symbols()`
+    // in `brain::multimodelv1::state`), broadened from the tiny
+    // Phoenix+Velocity-perp-gated `SYMBOL_MINT_MAP` above. That gate was
     // never actually load-bearing for this strategy: the pair trade's
     // legs are real Kamino *or* Solend deposit/borrow (protocol picked
     // per-leg at runtime, see `LendingProtocol`/`best_supply_apy`/
@@ -1951,7 +1953,7 @@ fn main() {
     // allocation per symbol into `perp_funding_target_allocation`
     // whenever it computes/sends one via
     // `CustomMessageInbound::TargetAllocation` (see
-    // `brain::testperpv1::message`'s doc) -- a fraction of total
+    // `brain::perpfundingv1::message`'s doc) -- a fraction of total
     // portfolio value (0.0-1.0), e.g. `0.30` for "target 30% of the
     // portfolio in this symbol", remainder implicitly USD/stable. This
     // bakes in whatever's currently in that table as the compile-time

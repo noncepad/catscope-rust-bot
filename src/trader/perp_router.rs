@@ -87,7 +87,7 @@
 //! # Not built in this pass
 //!
 //! No spot integration, no lending (`credit.rs` stays completely out of
-//! this), no position modeling. Consumed by `brain::testperpv1::state`
+//! this), no position modeling. Consumed by `brain::perpfundingv1::state`
 //! (real bot mode, epoch-driven `observe_phoenix`/`observe_velocity`/
 //! `close_epoch` calls) and, via [`PerpRouter::pending_rate`], by
 //! `trader::spfa::FinancialGraph` integration -- the same rate this
@@ -301,7 +301,7 @@ impl PerpRouter {
     /// rate for `symbol` (already-normalized, e.g. `"SOL"`), if that
     /// venue has reported one this epoch -- the same raw rate
     /// `close_epoch` collapses into a `FundingEdge`'s spread. Exposed so
-    /// `FinancialGraph` integration (`brain::testperpv1::state`) can
+    /// `FinancialGraph` integration (`brain::perpfundingv1::state`) can
     /// build a self-loop edge weight directly from it, without
     /// re-deriving Phoenix/Velocity's rate formulas a second time.
     /// `None` either because that venue hasn't reported this epoch yet,

@@ -6,7 +6,8 @@
 //! (`["perp_market", market_index_u16_le]` against `DRIFT_PROGRAM_ID`),
 //! confirmed live this session (see `accounts.rs`'s module doc).
 //!
-//! Deliberately **not** wired into `DexState`/`Updater`, mirroring how
+//! Deliberately **not** wired into `DexState`/`Updater` -- only
+//! `brain::perpfundingv1` constructs this, mirroring how
 //! `dex::phoenix::PhoenixState`'s authority-bearing instance is
 //! independent of the read-only one `DexState` owns.
 
@@ -62,7 +63,7 @@ pub struct VelocityState {
     user_registered: bool,
     /// Last successfully parsed `User` account -- real position data
     /// (`perp_positions`), not just the registration bool above. Needed
-    /// so a caller's open-gate/close-decision can read actual
+    /// so `perpfundingv1`'s open-gate/close-decision can read actual
     /// held size/direction instead of separate bookkeeping.
     o_drift_user: Option<drift::DriftUser>,
 }
