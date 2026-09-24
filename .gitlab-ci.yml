@@ -10,7 +10,7 @@ variables:
   GIT_STRATEGY: "clone"
   GIT_SUBMODULE_STRATEGY: recursive
   MINOR_VERSION: "2"
-  TEST_PERL: "0"
+  TEST_PERL: "1"
 
 build_test:
   stage: build
@@ -64,7 +64,7 @@ build_tar:
   tags: ["d-3"]
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
-  image: ${CI_REGISTRY}/eflam/builder/compact:main-bookworm
+  image: ${CI_REGISTRY}/eflam/builder/compact:main-trixie
   script:
     - git archive --format=tar HEAD >out.tar
   artifacts:

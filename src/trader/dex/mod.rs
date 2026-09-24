@@ -14,7 +14,7 @@ pub mod orca;
 /// (see `phoenix/mod.rs`'s module doc and
 /// `PhoenixState::add_to_pricing_router`): a perp position isn't a
 /// `TradeRouter` graph edge the way a spot swap is, so this doesn't feed
-/// the router yet. `brain::testperpv1` separately owns its own
+/// the router yet. `brain::phoenixperpsv1` separately owns its own
 /// `PhoenixState` instance for the full trader-account/margin lifecycle.
 pub mod phoenix;
 pub mod pumpfun;
@@ -181,11 +181,11 @@ impl DexState {
     }
 
     /// Exposed directly, same reasoning as [`Self::marinade`] --
-    /// `testperpv1`'s Solend-basis-trade strategy needs a
+    /// `perpfundingv1`'s Solend-basis-trade strategy needs a
     /// `SolendReserve` handle (via `SolendState::reserve_by_mint`) to
     /// build deposit/borrow/withdraw/repay instructions, and this
     /// `DexState`-owned instance is the only place that data lives (the
-    /// shared, read-only pricing instance -- `testperpv1`'s own
+    /// shared, read-only pricing instance -- `perpfundingv1`'s own
     /// `SolendPosition` only tracks its own obligation, not reserve
     /// data).
     pub fn solend(&self) -> &SolendState {
@@ -193,7 +193,7 @@ impl DexState {
     }
 
     /// Exposed directly, same reasoning as [`Self::solend`] --
-    /// `testperpv1`'s basis-trade strategy needs a `KaminoReserve`
+    /// `perpfundingv1`'s basis-trade strategy needs a `KaminoReserve`
     /// handle (via `KaminoState::reserve_by_mint`) to build
     /// deposit/borrow/withdraw/repay instructions, and this
     /// `DexState`-owned instance is the only place that data lives.
@@ -202,7 +202,7 @@ impl DexState {
     }
 
     /// Exposed directly, same reasoning as [`Self::solend`]/[`Self::kamino`]
-    /// -- `testperpv1`'s basis-trade strategy needs a `MarginfiBank`
+    /// -- `perpfundingv1`'s basis-trade strategy needs a `MarginfiBank`
     /// handle (via `MarginfiState::reserve_by_mint`) to build
     /// deposit/borrow/withdraw/repay instructions.
     pub fn marginfi(&self) -> &MarginfiState {
@@ -210,7 +210,7 @@ impl DexState {
     }
 
     /// Exposed directly, same reasoning as [`Self::solend`]/[`Self::kamino`]
-    /// -- `testperpv1`'s funding-rate basis-trade strategy needs real
+    /// -- `leveragedloopv1`'s funding-rate basis-trade strategy needs real
     /// Phoenix market data (mark price, funding accumulator) to feed
     /// `trader::perp_router::PerpRouter`. This is the shared, read-only
     /// pricing instance only -- a real trader account/margin lifecycle
@@ -225,11 +225,12 @@ impl DexState {
     /// it to `wallet`. Single dispatch point across every dex -- matches
     /// `Updater`'s existing pattern of `DexState` being the one place that
     /// knows about every sub-dex. Used by `brain::arbv1::state::
-    /// StateHelper::build_execution_plan` to build a price-graph-detected
-    /// cycle's real swap instructions directly onto the bot's own wallet,
-    /// inside a checkpoint + atomic group that gets rolled back on any
-    /// failure or non-positive net profit (see that caller's own doc
-    /// comment).
+    /// StateHelper::build_execution_plan` and `brain::multimodelv1::
+    /// state::StateHelper::execute_arbitrage_opportunity` (a port of the
+    /// former) to build a price-graph-detected cycle's real swap
+    /// instructions directly onto the bot's own wallet, inside a
+    /// checkpoint + atomic group that gets rolled back on any failure or
+    /// non-positive net profit (see either caller's own doc comment).
     pub fn execute_hop(
         &self,
         hop: &Hop,

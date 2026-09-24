@@ -944,9 +944,9 @@ fn user_metadata_pda(owner: &Pubkey) -> Pubkey {
 /// seed2_account]`): a different `id` with the same owner/market/tag
 /// produces a genuinely independent obligation PDA, not a collision. Every
 /// bot mode's own single obligation uses `id = 0`; a second, independent
-/// obligation for the same wallet in the same market (e.g. a basis-trade
-/// obligation isolated from that same mode's own leverage-loop
-/// obligation) uses `id = 1`.
+/// obligation for the same wallet in the same market (e.g.
+/// `leveragedloopv1`'s basis-trade obligation, isolated from its own
+/// leverage-loop obligation) uses `id = 1`.
 pub fn obligation_pda(owner: &Pubkey, lending_market: &Pubkey, id: u8) -> Pubkey {
     let default = Pubkey::default();
     Pubkey::find_program_address(
@@ -980,7 +980,7 @@ pub fn farms_user_state_pda(farm: &Pubkey, delegatee: &Pubkey) -> Pubkey {
 
 /// [`farms_user_state_pda`], operating on `AccountId`s directly (this
 /// bot's usual currency) instead of raw `Pubkey`s -- convenience wrapper
-/// for callers (`testperpv1::state`) that don't otherwise need to
+/// for callers (`perpfundingv1::state`) that don't otherwise need to
 /// resolve pubkeys themselves. `None` if either id fails to resolve to a
 /// real pubkey (shouldn't happen for tracked, live accounts).
 pub fn farm_user_state_id(farm: AccountId, obligation: AccountId) -> Option<AccountId> {
@@ -1376,7 +1376,7 @@ pub struct KaminoPosition {
 
 impl KaminoPosition {
     /// Pure-derivation half of the old single-shot `set_authority`
-    /// (removed -- only ever called from `testperpv1`'s
+    /// (removed -- only ever called from `perpfundingv1`/`testperpv1`'s
     /// `Wallet` message handler, alongside Phoenix/Solend/marginfi's own
     /// subscription calls). Returns the two subscription requests this
     /// authority needs -- this bot's own Kamino obligation
@@ -1899,8 +1899,8 @@ mod tests {
         // Verified against klend's own handler_init_obligation.rs: `id` is
         // part of the PDA seed, so the same owner/market/tag with a
         // different id is a genuinely independent obligation, not a
-        // collision -- what a basis-trade obligation (id=1) relies on to
-        // stay isolated from that same mode's own leverage-loop
+        // collision -- what leveragedloopv1's basis-trade obligation
+        // (id=1) relies on to stay isolated from its own leverage-loop
         // obligation (id=0).
         let lending_market = Pubkey::new_unique();
         let owner = Pubkey::new_unique();

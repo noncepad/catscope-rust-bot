@@ -114,7 +114,7 @@ fn resolve(id: AccountId) -> Result<Pubkey, TraderError> {
 /// `GlobalConfiguration` elsewhere. `user_usdc_ata`/`user_phusd_ata` must
 /// already exist (the PhUSD one typically needs
 /// `Wallet::append_create_ata` first, called before this in the same
-/// transaction -- see `testperpv1`'s bootstrap).
+/// transaction -- see `perpfundingv1`'s bootstrap).
 pub fn deposit(
     authority: AccountId,
     phusd_mint: AccountId,

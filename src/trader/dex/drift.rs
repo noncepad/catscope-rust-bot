@@ -920,8 +920,8 @@ impl DriftState {
     /// default()`, same as every other field, so an unparsed USDC-index
     /// market and an unparsed *any other* market are indistinguishable
     /// by index alone until their first real update -- acceptable here
-    /// since a real caller only proceeds once `mint`/`oracle` are
-    /// non-default, checked at the call site).
+    /// since the caller (`perpfundingv1`'s bootstrap) only proceeds once
+    /// `mint`/`oracle` are non-default, checked at the call site).
     pub fn market_by_index(&self, market_index: u16) -> Option<(AccountId, &DriftSpotMarket)> {
         self.m_market.iter().find(|(_, m)| m.market_index == market_index).map(|(id, m)| (*id, m))
     }

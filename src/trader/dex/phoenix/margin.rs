@@ -89,9 +89,9 @@ pub fn quote_lots_to_usd(quote_lots: i64) -> f64 {
 }
 
 /// Required PhUSD margin (real USD, not raw quote lots) for a *target*
-/// notional not yet opened as a real position -- e.g. a short-index leg
-/// that needs to know how much margin it will require *before* placing
-/// the order, to decide whether to top up first.
+/// notional not yet opened as a real position -- e.g. `multimodelv1`'s
+/// dispersion trade needs to know how much margin a short-index leg will
+/// require *before* placing the order, to decide whether to top up first.
 /// Wraps [`maintenance_margin_quote_lots`] against a synthetic position of
 /// the intended size (zeroed P&L/funding ledger, since it hasn't traded
 /// yet) rather than reimplementing the leverage formula, then converts the

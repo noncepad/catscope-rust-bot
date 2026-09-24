@@ -27,30 +27,15 @@ pub enum CustomMessageInbound {
     /// `DoTargetAllocation` encodes: a 24-byte value, 16-byte
     /// zero-padded symbol + 8-byte little-endian `f64`.
     TargetAllocation(String, f64),
-    /// `(lst_symbol, staking_apy)` -- real annualized SOL-per-LST
-    /// exchange-rate growth for one liquid-staking token (e.g. "jitoSOL",
-    /// `0.073` for 7.3%/yr), estimated Go-side from a live timeseries
-    /// this bot can't compute itself (no persistent storage across
-    /// restarts) -- see `optimizer/prefetch/lst-yield`'s doc comment and
-    /// `catscope-rust-bot/src/brain/leveraged_yield_farming_plan.md`'s
-    /// "Phase 0". Pushed periodically, refreshed in place (see
-    /// `on_message` below), not accumulated. Same 24-byte wire shape as
-    /// `TargetAllocation` (16-byte zero-padded symbol + 8-byte LE `f64`),
-    /// mirroring `optimizer/brain/testperpv1/message.go`'s `DoLstApy`.
-    LstApy(String, f64),
-    /// One-shot, independent of any strategy state: proves the generic
-    /// `transactionprocessor::batch` host import routed to Astralane
-    /// specifically -- a real tip payment to one of Astralane's own tip
-    /// wallets, paired with a second, deliberately inert self-transfer.
-    /// See `Wallet::test_send_astralane_tip_batch`'s doc comment (bundler
-    /// tag and tip address both sourced from
-    /// `optimizer/bundler/astralane`'s `Code()`/`Tip()`). No payload.
-    TriggerTestAstralane,
     /// Shared, cross-strategy: a live bundler tip update pushed by
     /// `optimizer/bundler.RunTipBroadcaster`. See
     /// `crate::bundler_message::BundlerTipUpdate`'s doc comment --
     /// consumed by `Wallet::apply_bundler_tip_update`, not this module
-    /// directly.
+    /// directly. Needed for the native-transfer loop's real Astralane
+    /// bundled-send path (see `StateHelper::test_native_transfer_loop`'s
+    /// doc comment) -- without this, `Wallet::select_tip_account`/
+    /// `append_bundler_tip` never see any tip data and that path always
+    /// falls back to a plain unbundled send.
     CommonBundlerTipUpdate(crate::bundler_message::BundlerTipUpdate),
 }
 
@@ -62,8 +47,6 @@ impl Default for CustomMessageInbound {
 
 const CUSTOM_KEY_FLAG_WALLET: u8 = 3;
 const CUSTOM_KEY_FLAG_TARGET_ALLOCATION: u8 = 4;
-const CUSTOM_KEY_FLAG_LST_APY: u8 = 5;
-const CUSTOM_KEY_FLAG_TRIGGER_TEST_ASTRALANE: u8 = 6;
 
 impl MessageDeserializer for CustomMessageInbound {
     fn deserialize(&mut self, body: &[u8]) -> Result<usize, CatscopeGuestError> {
@@ -106,21 +89,6 @@ impl MessageDeserializer for CustomMessageInbound {
                     .to_string();
                 let allocation_pct = f64::from_le_bytes(value[16..24].try_into().unwrap());
                 *self = Self::TargetAllocation(symbol, allocation_pct);
-            }
-            CUSTOM_KEY_FLAG_LST_APY => {
-                let value = kvp.value();
-                if value.len() != 24 {
-                    return Err(CatscopeGuestError::InsufficientBufferV2(value.len(), 24));
-                }
-                let symbol = std::str::from_utf8(&value[0..16])
-                    .unwrap_or("")
-                    .trim_end_matches('\0')
-                    .to_string();
-                let staking_apy = f64::from_le_bytes(value[16..24].try_into().unwrap());
-                *self = Self::LstApy(symbol, staking_apy);
-            }
-            CUSTOM_KEY_FLAG_TRIGGER_TEST_ASTRALANE => {
-                *self = Self::TriggerTestAstralane;
             }
             crate::bundler_message::COMMON_KEY_FLAG_BUNDLER_TIP_UPDATE => {
                 *self = Self::CommonBundlerTipUpdate(
@@ -208,41 +176,6 @@ mod tests {
         let body = wire_body(CUSTOM_KEY_FLAG_TARGET_ALLOCATION, &[0u8; 23]);
         let mut msg = CustomMessageInbound::default();
         assert!(msg.deserialize(&body).is_err());
-    }
-
-    #[test]
-    fn lst_apy_deserialize_roundtrips_symbol_and_rate() {
-        let mut value = [0u8; 24];
-        value[..7].copy_from_slice(b"jitoSOL");
-        value[16..24].copy_from_slice(&(0.073f64).to_le_bytes());
-        let body = wire_body(CUSTOM_KEY_FLAG_LST_APY, &value);
-
-        let mut msg = CustomMessageInbound::default();
-        let consumed = msg.deserialize(&body).expect("should deserialize");
-
-        assert_eq!(consumed, body.len());
-        match msg {
-            CustomMessageInbound::LstApy(symbol, staking_apy) => {
-                assert_eq!(symbol, "jitoSOL");
-                assert_eq!(staking_apy, 0.073);
-            }
-            _ => panic!("expected LstApy variant"),
-        }
-    }
-
-    #[test]
-    fn lst_apy_deserialize_rejects_wrong_length() {
-        let body = wire_body(CUSTOM_KEY_FLAG_LST_APY, &[0u8; 23]);
-        let mut msg = CustomMessageInbound::default();
-        assert!(msg.deserialize(&body).is_err());
-    }
-
-    #[test]
-    fn trigger_test_astralane_deserialize_ignores_empty_value() {
-        let body = wire_body(CUSTOM_KEY_FLAG_TRIGGER_TEST_ASTRALANE, &[]);
-        let mut msg = CustomMessageInbound::default();
-        msg.deserialize(&body).expect("should deserialize");
-        assert!(matches!(msg, CustomMessageInbound::TriggerTestAstralane));
     }
 
     #[test]

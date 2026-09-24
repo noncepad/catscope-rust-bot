@@ -24,8 +24,8 @@
 //! Solend's own "doesn't feed TradeRouter (yet)" no-ops. There is no
 //! `DexType::Phoenix*` variant in `types.rs` yet; adding real pricing
 //! would need one (see that method's doc for the shape a real
-//! implementation would take). `brain::testperpv1` still owns its own
-//! separate `PhoenixState` instance for the full trader-
+//! implementation would take). The `brain::phoenixperpsv1` strategy still
+//! owns its own separate `PhoenixState` instance for the full trader-
 //! account/margin lifecycle (registration, deposits, positions) -- that
 //! side needs a wallet authority this `DexState`-owned instance never
 //! receives, so the two are intentionally independent, not shared.
@@ -303,9 +303,10 @@ impl PhoenixState {
     /// request and keeps it alive via `self.subscriptions` -- for
     /// callers that don't defer through a shared
     /// [`crate::graph::SubscriptionQueue`] (`DexState`'s own copy uses
-    /// the split [`Self::new`]/queued-apply path instead). Real caller:
-    /// `testperpv1`'s own standalone trading instance, distinct from
-    /// `DexState`'s shared read-only pricing copy.
+    /// the split [`Self::new`]/queued-apply path instead). Real callers:
+    /// `perpfundingv1`/`phoenixperpsv1`/`testperpv1`'s own standalone
+    /// trading instances, distinct from `DexState`'s shared read-only
+    /// pricing copy.
     pub fn new_and_subscribe(g: &Graph) -> Result<Self, CatscopeGuestError> {
         let (mut state, l_req) = Self::new();
         let subs = SubscriptionQueue::subscribe_now(g, l_req)?;
@@ -404,11 +405,13 @@ impl PhoenixState {
     /// `subscribe` call itself. Paired with [`Self::apply_authority`] so
     /// this venue's request can be batched into a single `bulk_subscribe`
     /// call together with every other venue's own -- see
-    /// `testperpv1`'s `Wallet` message handler, added
+    /// `perpfundingv1`/`testperpv1`'s `Wallet` message handler, added
     /// after a real, live-observed incident: five separate one-at-a-time
     /// `subscribe` calls (this one plus Solend/Kamino/marginfi's) in that
     /// handler accounted for ~26 seconds of stall in one run (traced via
-    /// `CommitHook::start`'s own timing diagnostics).
+    /// `CommitHook::start`'s own timing diagnostics). Not used by
+    /// `phoenixperpsv1`, which still calls `set_authority` directly --
+    /// this is purely additive.
     pub fn authority_subscribe_requests(&self, authority: Pubkey) -> Vec<SubscriptionRequest> {
         if self.o_authority_pk == Some(authority) {
             return Vec::new();
@@ -548,7 +551,8 @@ impl PhoenixState {
     /// **Placeholder** -- called by `Updater::batch_router` (via
     /// `DexState::batch_router`, so it runs on `arbv1`'s normal per-commit
     /// cadence), currently a documented no-op. This is the hook point for
-    /// feeding Phoenix's live mark prices into `TradeRouter` --
+    /// feeding Phoenix's live mark prices into `TradeRouter`, same spirit
+    /// as `should_open_position` in `brain::phoenixperpsv1::state` --
     /// intentionally left for later, not designed here.
     ///
     /// What a real implementation would need to resolve first (not solved
