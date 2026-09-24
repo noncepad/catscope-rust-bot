@@ -26,11 +26,14 @@
 //! Solend-hedge legs (swapping the underlying asset in/out of USDC).
 use crate::{
     atl_config,
-    brain::testperpv1::{
+    brain::testlatencylitev1::{
         message::{CustomMessageInbound, CustomMessageOutbound},
         Configuration,
     },
-    catscope::witbot::shooter::{Header, Tokenaccountv1},
+    catscope::witbot::{
+        shooter::{Header, Tokenaccountv1},
+        transactionprocessor,
+    },
     drift_config,
     err::CatscopeGuestError,
     event::SlotStatus,
@@ -66,7 +69,7 @@ use solana_sdk::{
     clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::Keypair,
+    signature::{Keypair, Signature},
     signer::Signer,
 };
 use solana_system_interface::instruction::transfer as system_transfer;
@@ -74,7 +77,7 @@ use std::{
     cell::UnsafeCell,
     collections::{HashMap, VecDeque},
     rc::Rc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Both Phoenix and Velocity settle funding on a real hourly cadence --
@@ -184,7 +187,7 @@ struct TargetAllocationEntry {
 /// this bot never calls), but `WithdrawMarginfi` still uses the same
 /// fire-once-then-cooldown-advance shape for consistency with the other
 /// two withdraw phases, not because it's strictly required here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum TestPhase {
     #[default]
     SwapToUsdc,
@@ -213,7 +216,398 @@ pub(crate) enum TestPhase {
     RepayKamino,
     BorrowMarginfi,
     RepayMarginfi,
+    /// Selected instead of `SwapToUsdc` (and everything after it) when
+    /// `TestProtocol::Native` is chosen -- a self-contained loop, not a
+    /// bootstrap/deposit/withdraw sequence, so it's a single phase rather
+    /// than several. See [`StateHelper::test_native_transfer_loop`] for
+    /// the real state machine (deliberately not modeled as more `TestPhase`
+    /// variants, since there's no natural bootstrap/deposit/withdraw
+    /// split for a plain System Program transfer -- just "send, then wait
+    /// for a read, then send the other way").
+    NativeTransferLoop,
     Done,
+}
+
+/// Which real update channel actually delivered a native-transfer's
+/// confirmation first -- see [`StateHelper::test_native_transfer_loop`]'s
+/// doc comment for why this can't be predicted in advance (all three
+/// channels update the same underlying `Wallet::on_account`-tracked SOL
+/// balance; whichever event happens to arrive first wins the race).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UpdateLane {
+    /// `Event::LowLatency` -- accounts as soon as "processed" (this
+    /// codebase's own doc comments elsewhere put this at ~400ms).
+    LowLatency,
+    /// `Event::Commit` -- accounts once "rooted"/finalized (~12s, per the
+    /// same doc comments).
+    Commit,
+    /// `Event::Transaction` -- the transaction's own signature observed
+    /// confirmed, independent of either account-update channel above.
+    Transaction,
+}
+
+/// Send->confirm latency samples for one [`TestPhase`] -- microsecond
+/// samples, same shape as `helloworldv1::state::TxLatencyStats`, but kept
+/// per-phase here (one instance per `TestPhase` in `State::tx_latency`)
+/// instead of a single aggregate bucket, since the whole point of this
+/// module is comparing latency *across* phases (a plain Solend deposit vs.
+/// a Kamino farm-gated borrow, say), not just an overall number.
+/// Non-destructive: unlike `helloworldv1`'s version, [`Self::stats`]
+/// doesn't clear `samples` on read, because a phase's samples are only
+/// ever read once, at the point `evaluate_inner` advances past that
+/// phase for good -- there's nothing left to reset for.
+#[derive(Debug, Default)]
+pub(crate) struct TxLatencyStats {
+    samples: Vec<u64>,
+}
+
+impl TxLatencyStats {
+    fn record(&mut self, elapsed: std::time::Duration) {
+        self.samples.push(elapsed.as_micros() as u64);
+    }
+    /// `(n, p50_us, p99_us)` -- `(0, 0, 0)` if no samples were ever
+    /// recorded for this phase (e.g. it advanced via the withdraw phases'
+    /// fire-once-then-cooldown-advance path without ever landing a
+    /// confirmed tx yet at report time).
+    fn stats(&self) -> (u64, u64, u64) {
+        percentiles(&self.samples)
+    }
+}
+
+/// `(n, p50, p99)` over `samples` -- `(0, 0, 0)` for an empty slice.
+/// Shared by [`TxLatencyStats::stats`] and the native-transfer write/read
+/// breakdown below (`StateHelper::report_native_stats`), which needs the
+/// exact same n/p50/p99 shape over plain `u64` distributions that aren't
+/// always microsecond durations (slot counts, in one case).
+fn percentiles(samples: &[u64]) -> (u64, u64, u64) {
+    if samples.is_empty() {
+        return (0, 0, 0);
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len() as u64;
+    let p50 = sorted[(sorted.len().saturating_sub(1) * 50) / 100];
+    let p99 = sorted[(sorted.len().saturating_sub(1) * 99) / 100];
+    (n, p50, p99)
+}
+
+/// Which protocol's deposit<->withdraw cycle to actually run, read once
+/// (via [`Self::from_env`]) from the `TEST_PROTOCOL` env var
+/// (`solend`/`kamino`/`marginfi`, case-insensitive) -- lets a real run
+/// spend real transaction fees against just one protocol at a time
+/// instead of all three plus every borrow/repay leg in one go. Unset (or
+/// an unrecognized value) preserves the original full-sequence behavior
+/// via `State::o_target_protocol` being `None` -- see that field's doc
+/// comment for how the two call sites that check it fall back.
+/// One account a pending native transfer can be confirmed through --
+/// `check_native_transfer_arrival` races *both* of a transfer's
+/// participants independently (see `NativePending::watches`), not just
+/// the recipient, so whichever one's own update channel happens to
+/// deliver first still gets to claim the confirmation.
+///
+/// Real, live-verified 2026-09-03: watching only the recipient used to
+/// mean an owner-recipient transfer could *only* ever be confirmed via
+/// the Transaction (signature) lane, never Account/Commit, no matter how
+/// promptly those delivered -- `owner`'s own balance delta on that side
+/// bundles together the amount received *and* the fee it pays as this
+/// wallet's permanent fee payer, and the old fee estimate silently
+/// undercounted the real cost (missing the priority fee entirely -- see
+/// `Wallet::priority_fee_lamports`), so the exact-match threshold below
+/// was permanently unreachable. `wallet2`, by contrast, never pays a fee
+/// in either direction (see the funding-wait check in
+/// `test_native_transfer_loop`, which requires `owner` alone to cover
+/// `owner_overhead`), so its delta is always exactly `±amount` -- no fee
+/// model needed at all on that side. Watching both means: the `owner`
+/// leg still races (now with the *exact* real fee folded in, not an
+/// estimate), and the `wallet2` leg is a second, fee-free shot at the
+/// same confirmation that can win first regardless of whether the
+/// `owner`-side math is ever exactly right.
+#[derive(Debug, Clone, Copy)]
+struct NativeWatch {
+    account: AccountId,
+    /// This account's own balance (raw lamports) at the moment this
+    /// transfer was sent.
+    baseline_lamports: u64,
+    /// The exact number of lamports this account's balance is expected to
+    /// change by once this transfer lands -- positive for a gain,
+    /// negative for a loss. Always the real, exact value, never an
+    /// estimate (see this struct's own doc comment for why that's
+    /// achievable for both participants). `check_native_transfer_arrival`
+    /// requires the *exact* threshold this implies to be reached, not
+    /// just any change in the expected direction -- necessary, not just
+    /// defensive: real, live-verified 2026-09-01 that a *bare*
+    /// `now > baseline` check lets a stray/unrelated lamport increase on
+    /// the recipient (observed: origin still unidentified, but real
+    /// on-chain confirmations showed a small excess crediting the wrong
+    /// pending transfer) falsely satisfy the claim -- which let the loop
+    /// advance and re-issue a *second* same-direction send before the
+    /// first one's real effect had landed, producing two genuine
+    /// `insufficient lamports` on-chain failures once the sender's true
+    /// balance ran out.
+    delta_lamports: i64,
+}
+
+/// One in-flight native SOL transfer, from the moment it's sent until
+/// whichever [`UpdateLane`] notices either participant's balance change
+/// first. See `State::o_native_pending`'s doc comment for the
+/// take()-as-claim pattern this is used with.
+#[derive(Debug, Clone, Copy)]
+struct NativePending {
+    sent_at: std::time::Instant,
+    /// Both participants' independent arrival watches -- always exactly
+    /// `[from, to]`, in that order, but checked without regard to order:
+    /// `check_native_transfer_arrival` just looks for whichever one
+    /// matches `account_id`. See [`NativeWatch`]'s doc comment for why
+    /// both are worth watching instead of just the recipient.
+    watches: [NativeWatch; 2],
+    /// This transfer's own transaction signature, filled in by
+    /// `evaluate_inner`'s send loop right after `Wallet::assemble()`
+    /// produces it (unknown at the moment `test_native_transfer_loop`
+    /// queues the instruction -- signing happens later, in `assemble()`).
+    /// `mid_on_tx` checks a confirming signature against this before
+    /// crediting the Transaction lane -- see that check's own doc comment
+    /// for the bug this guards against (a *different*, older native
+    /// transfer's delayed confirmation arriving while this one is still
+    /// the pending one, and getting misattributed to it).
+    sig: Option<Signature>,
+    /// The freshest slot number this guest had observed (via
+    /// `Event::SlotStatus`, tracked in `State::slot_clock`) at the moment
+    /// this transfer was sent -- approximates the first slot this
+    /// transaction could possibly have been included in (its first real
+    /// leader opportunity). Compared against the transfer's actual
+    /// inclusion slot (from the winning lane's own account/commit/
+    /// transaction-result slot) to separate write/landing delay from
+    /// read-propagation delay -- see [`NativeTransferSample`].
+    send_slot: Slot,
+}
+
+/// One completed native transfer's full write->read breakdown -- built by
+/// `StateHelper::record_native_read`, one per confirmed transfer, kept in
+/// `State::native_samples`. Answers the question this instrumentation
+/// exists for: is a slow write→read cycle caused by the transaction being
+/// slow to *land* (write delay: send -> actual on-chain inclusion), or by
+/// slow *propagation back to the guest* once it's already landed (read
+/// delay: inclusion -> the winning lane observing it)?
+#[derive(Debug, Clone, Copy)]
+struct NativeTransferSample {
+    send_slot: Slot,
+    /// The slot this transfer's transaction actually landed in --
+    /// read directly off whichever real source resolved it: an account
+    /// update's own `header.slot` (LowLatency/Commit) or the confirmed
+    /// transaction's own `Ok(slot)` result (Transaction lane, from
+    /// `TransactionList::transaction()` -- previously discarded here,
+    /// see `mid_on_tx`).
+    inclusion_slot: Slot,
+    slots_until_inclusion: u64,
+    /// Wall-clock time from send until this guest's own validator first
+    /// received evidence of `inclusion_slot`'s block at all
+    /// (`SlotStatus::FirstShredReceived`), looked up against this guest's
+    /// own local slot clock (`State::slot_clock`) -- a real measured
+    /// duration, not `slots_until_inclusion` times an assumed ~350ms/slot
+    /// constant (see `SLOT_TIMING_TARGET_MS`'s own doc comment on why
+    /// that constant isn't a safe stand-in for real slot timing).
+    ///
+    /// This guest has no channel exposing the leader's own internal
+    /// clock -- `FirstShredReceived` (the earliest evidence *this*
+    /// validator, a downstream observer, ever gets that the leader built
+    /// and started broadcasting the block) is the best available proxy
+    /// for "the leader saw/included this transfer," not a literal
+    /// timestamp of the leader's own inclusion decision. A genuine
+    /// *lower* bound: the leader must have already included the transfer
+    /// by the time any shred of that block reaches us.
+    ///
+    /// `None` whenever this can't be resolved to a real positive
+    /// duration -- either `inclusion_slot` aged out of `slot_clock`
+    /// entirely (a write delay long enough to exceed
+    /// `SLOT_CLOCK_CAPACITY` slots), or `slot_clock`'s recorded
+    /// `FirstShredReceived` instant for `inclusion_slot` turned out to be
+    /// at or before `sent_at` (a same-slot sample -- this guest was
+    /// already mid-slot when it sent). Real, live-user-caught bug
+    /// 2026-09-02: this used to `map` straight to `Instant::duration_since`,
+    /// which silently saturates a same-or-earlier instant to
+    /// `Duration::ZERO` instead of `None` -- producing a fake
+    /// `write_delay = 0`, which then made `read_delay = total_latency - 0
+    /// = total_latency`, misattributing the *entire* unresolvable
+    /// same-slot write time onto the read lane. See
+    /// `write_delay_upper_bound` for what this reports instead when a
+    /// real value can't be resolved at all.
+    write_delay: Option<std::time::Duration>,
+    /// Only meaningful when `write_delay` is `None` (always `None`
+    /// itself otherwise). The wall-clock instant this guest first
+    /// observed *some* slot strictly after `inclusion_slot` reach
+    /// `FirstShredReceived` (already sitting in `slot_clock` by confirm
+    /// time regardless of this transfer, since the chain keeps producing
+    /// slots continuously in the background) minus `sent_at` -- a real,
+    /// honest upper bound for a same-slot sample with no resolvable point
+    /// estimate at all: the transaction landed in `inclusion_slot`, so
+    /// this guest can't have seen its first shred any later than the
+    /// first shred of the *next* slot it saw. Not a point estimate --
+    /// reported separately from resolved `write_delay`/`read_delay`
+    /// percentiles, never blended into them. `None` if no later slot has
+    /// been observed to reach `FirstShredReceived` yet either (e.g. this
+    /// was the very last transfer of the run).
+    write_delay_upper_bound: Option<std::time::Duration>,
+    /// `total_latency - write_delay` -- the remaining time it took this
+    /// guest to notice the transfer once the leader had (at least)
+    /// started broadcasting it. Covers everything real that happens
+    /// after `FirstShredReceived`: the rest of block delivery
+    /// (`shred_to_completed`), this validator's own local replay
+    /// (`completed_to_processed`), cluster confirmation
+    /// (`processed_to_confirmed`), and this guest's own dispatch/
+    /// backpressure overhead -- none of those are subtracted back out,
+    /// since from this guest's send-to-observe perspective they're all
+    /// genuinely part of "the remaining time for us to see it." `None`
+    /// whenever `write_delay` is `None` -- see that field's doc comment.
+    /// Never derived as `total_latency - 0` as a stand-in for an
+    /// unresolved write delay.
+    read_delay: Option<std::time::Duration>,
+    /// Full send -> observed latency, same quantity `native_read_latency`
+    /// buckets by lane -- kept here too so this sample is a complete,
+    /// standalone record of the transfer. Always real and exact,
+    /// regardless of whether `write_delay`/`read_delay` resolved --
+    /// unaffected by the same-slot ambiguity those two can hit.
+    total_latency: std::time::Duration,
+    lane: UpdateLane,
+    /// Real, measured breakdown of what makes up `read_delay` -- `None`
+    /// whenever either endpoint's timestamp never resolved. All three are
+    /// independent, supplementary stats: real sub-stages of the time
+    /// between `FirstShredReceived` and this guest's own observation, but
+    /// never subtracted from `read_delay` (which already, deliberately,
+    /// counts all of them as real "time for us to see it" -- see that
+    /// field's own doc comment).
+    /// `shred_to_completed`: how long after the first shred arrived did
+    /// the rest of this slot's block finish arriving (real, measured
+    /// answer to "how spread out is block delivery here").
+    shred_to_completed: Option<std::time::Duration>,
+    /// `completed_to_processed`: this validator's own local replay time
+    /// once the block was fully assembled -- expected to be small (own
+    /// CPU work).
+    completed_to_processed: Option<std::time::Duration>,
+    /// `processed_to_confirmed`: real cluster-wide supermajority
+    /// vote-confirmation lag after this validator already replayed the
+    /// slot locally. Real, corrected 2026-09-04: originally assumed to
+    /// often be `None` because confirmation "hasn't happened yet" by
+    /// observation time -- live data showed the opposite (17/20 samples
+    /// in one run already had this resolved). Purely informational, like
+    /// the other two above -- not subtracted from `read_delay`.
+    processed_to_confirmed: Option<std::time::Duration>,
+    /// This transfer's own real ordinal position within `inclusion_slot`'s
+    /// block (Agave's real `ReplicaTransactionInfo::index`, already flowing
+    /// end-to-end through this pipeline -- see
+    /// `State::m_native_tx_index`'s doc comment for how this gets
+    /// backfilled). `None` until `mid_on_tx` happens to see this signature's
+    /// own transaction data -- which, since the Account/LowLatency lane
+    /// wins essentially every race, normally happens strictly *after* this
+    /// sample is first pushed, not at push time. Not yet used for anything
+    /// beyond transparency -- turning this into a real position-within-block
+    /// estimate (normalizing against how many transactions the block
+    /// actually had) is a separate, later step.
+    tx_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestProtocol {
+    Solend,
+    Kamino,
+    Marginfi,
+    /// Plain System Program SOL transfers, bouncing between two wallets --
+    /// deliberately protocol-agnostic (no lending-protocol accounts, no
+    /// bootstrap step, no USDC conversion needed at all). See
+    /// [`StateHelper::test_native_transfer_loop`].
+    Native,
+}
+
+impl TestProtocol {
+    fn from_env() -> Option<Self> {
+        match std::env::var("TEST_PROTOCOL").ok()?.to_lowercase().as_str() {
+            "solend" => Some(Self::Solend),
+            "kamino" => Some(Self::Kamino),
+            "marginfi" => Some(Self::Marginfi),
+            "native" => Some(Self::Native),
+            _ => None,
+        }
+    }
+    /// The `Bootstrap*` phase `test_swap_to_usdc` should jump to once
+    /// there's enough USDC, when this protocol is the one selected to
+    /// run in isolation -- skips the other two protocols' bootstrap
+    /// phases entirely (no transactions sent against them at all), not
+    /// just their deposit/withdraw cycles. `Native` never calls this --
+    /// it bypasses `SwapToUsdc` entirely from `State::default()` instead,
+    /// since it doesn't need USDC (or any bootstrap step) at all.
+    fn bootstrap_phase(self) -> TestPhase {
+        match self {
+            Self::Solend => TestPhase::BootstrapSolend,
+            Self::Kamino => TestPhase::BootstrapKamino,
+            Self::Marginfi => TestPhase::BootstrapMarginfi,
+            Self::Native => TestPhase::NativeTransferLoop,
+        }
+    }
+}
+
+/// Per-slot wall-clock timestamps for the real `SlotStatus` transitions
+/// this test's write/propagate decomposition cares about -- each set
+/// once, at the first time this guest sees that specific status for
+/// that slot number. Real signals from the validator's own geyser
+/// plugin, not something this guest infers or estimates -- traced
+/// 2026-09-04: `catscope-bot`'s `apifs.rs` imports `SlotStatus` directly
+/// from `agave_geyser_plugin_interface::geyser_plugin_interface` (the
+/// real Agave validator's own geyser type), and
+/// `catscope_zerohop::store::convert_slot_status_from`/`_to` carry every
+/// one of these six variants across the wire unstubbed -- nothing here
+/// is fabricated or dropped before it reaches this guest.
+///
+/// - `first_shred`: the first real network shred for this slot arrived
+///   at this validator (Solana's Turbine propagation) -- the earliest
+///   signal available, likely well before the block is complete, since
+///   a leader streams shreds continuously through its ~400ms slot
+///   rather than all at once at the end.
+/// - `completed`: this validator has received every shred for this slot
+///   -- the block is now fully assembled locally. `first_shred` ->
+///   `completed` is the real, measured answer to "how spread out is
+///   block delivery on this validator" -- previously only guessed at.
+/// - `processed`: this validator has locally replayed (executed) the
+///   slot -- the real "landed and its effects are visible" boundary.
+/// - `confirmed`: real cluster-wide supermajority vote acknowledgment.
+///   Originally assumed to routinely arrive *after* this guest already
+///   knows the answer via the Account lane (which only needs local
+///   `processed` state, not cluster consensus) -- real, live-measured
+///   data corrected that 2026-09-04: 17/20 samples in one run already
+///   had this resolved, meaning `Confirmed` had genuinely landed
+///   *before* the observing lane claimed the transfer in most cases.
+///   See `record_native_read`'s own doc comment for why this is
+///   subtracted from `read_delay` when resolved (and treated as zero,
+///   not unknown, when it isn't -- an unresolved `confirmed` means
+///   confirmation demonstrably hasn't happened yet within the window
+///   already measured, not that its contribution is unknown).
+/// One sample's resolved result from `StateHelper::tx_index_estimate` --
+/// see that method's doc comment. Carries the real inputs used
+/// (`tx_index`, `slot_max_tx_index`) alongside the derived estimate so a
+/// per-sample log line (and, downstream, a real per-row report column)
+/// can show its own actual numbers, not just an aggregate percentile.
+#[derive(Debug, Clone, Copy)]
+struct TxIndexEstimate {
+    tx_index: u64,
+    slot_max_tx_index: u64,
+    write_delay_estimate: std::time::Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SlotTimestamps {
+    first_shred: Option<std::time::Instant>,
+    completed: Option<std::time::Instant>,
+    processed: Option<std::time::Instant>,
+    confirmed: Option<std::time::Instant>,
+    /// Largest real Agave `ReplicaTransactionInfo::index` (`tx.index`,
+    /// this transaction's exact ordinal position within its block) seen
+    /// by `mid_on_tx` for this slot, across *every* transaction that
+    /// passed through it -- not just our own native transfers. A real,
+    /// honest lower bound on "how many transactions this block actually
+    /// had," never a guarantee we saw the block's true last transaction
+    /// (see `TX_INDEX_ESTIMATE_PLAN.md`'s "one real approximation left"
+    /// section). Feeds Phase 3's fractional position-within-block
+    /// estimate (`NativeTransferSample::tx_index` / this value); not yet
+    /// consulted anywhere -- Phase 2 only captures it.
+    max_tx_index: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -288,6 +682,175 @@ pub(crate) struct State {
     /// previous one has had a real chance to confirm. Reset to `None` on
     /// every phase transition.
     test_last_action_slot: Option<Slot>,
+    /// When this guest first started waiting on the bundler tip
+    /// broadcaster's first status, if it's currently waiting -- a real
+    /// wall-clock `Instant`, not `test_last_action_slot`. Real, live bug
+    /// 2026-09-04: this used to reuse `test_last_action_slot`/
+    /// `test_cooldown_active` (slot-number-based), which silently never
+    /// waited at all -- `last_slot` (rooted/Commit tier) is still `0`
+    /// this early in a run, so the moment the first real Commit event
+    /// arrived and jumped it to a real slot number in the hundreds of
+    /// millions, the cooldown was blown through instantly. See
+    /// `test_native_transfer_loop`'s own doc comment on the bundler-wait
+    /// gate for the real wall-clock budget this uses instead.
+    o_bundler_wait_started: Option<std::time::Instant>,
+    /// Every signature this test has sent but not yet observed on-chain,
+    /// tagged with the [`TestPhase`] that sent it and the `Instant` it was
+    /// sent at -- populated at the send point in `evaluate_inner`'s
+    /// `assemble()`/send loop, consumed by `mid_on_tx` on a match against
+    /// a real `Event::Transaction`. Mirrors `helloworldv1::State::m_sig`
+    /// (see that module's `TxLatencyStats`/`m_sig` doc comments for the
+    /// same pattern), tagged by `TestPhase` instead of `Slot` since the
+    /// signal this module cares about is per-phase latency, not
+    /// slot correlation.
+    m_sig: HashMap<Signature, (TestPhase, Instant)>,
+    /// Send->confirm latency samples, bucketed by [`TestPhase`] -- see
+    /// [`TxLatencyStats`]'s own doc comment. One entry per phase that has
+    /// sent at least one transaction so far; a phase not yet reached (or
+    /// one that never landed a confirmed tx) simply has no entry.
+    tx_latency: HashMap<TestPhase, TxLatencyStats>,
+    /// How many deposit<->withdraw cycles have completed for the protocol
+    /// currently in its Deposit/Withdraw phase pair -- see
+    /// `StateHelper::CYCLE_TARGET`. Reset to 0 every time a fresh
+    /// protocol's Deposit phase starts a new cycle sequence.
+    cycle_count: u32,
+    /// Wall-clock instant the write half of the *current* deposit or
+    /// withdraw attempt (within a cycle) was sent -- `None` once its
+    /// matching low-latency read has been observed and recorded (see
+    /// `StateHelper::record_cycle_read`), so a stray/duplicate
+    /// `on_account` update found after that can't double-count.
+    /// Distinct from `m_sig`/`tx_latency` above: this measures
+    /// write->real-state-visible-via-`on_account` latency, not
+    /// write->tx-confirmed latency -- seeing a tx's signature go by in
+    /// `Event::Transaction` doesn't mean the *account* update carrying
+    /// its effect has arrived yet, and that gap is exactly what this
+    /// field is tracking.
+    cycle_write_sent_at: Option<Instant>,
+    /// The deposited-collateral amount (raw units) observed at the
+    /// moment the current cycle's write was sent -- the read-confirmed
+    /// condition is "moved away from this baseline in the expected
+    /// direction", not a plain zero/nonzero check, because
+    /// `test_withdraw_solend`/`test_withdraw_kamino` deliberately leave a
+    /// dust remainder behind (see `StateHelper::CYCLE_DUST_RAW`), so a
+    /// plain "is there a deposit at all" check would already be true from
+    /// leftover dust before the new write even lands.
+    cycle_write_baseline_amount: u64,
+    /// Write->low-latency-read latency samples, bucketed by [`TestPhase`]
+    /// -- only ever populated for the Deposit*/Withdraw* phases (see
+    /// `cycle_write_sent_at`'s doc). Distinct from `tx_latency` above
+    /// (tx-confirm-based); this is the write->`on_account`-visible-update
+    /// latency the `CYCLE_TARGET`-repeat exists to measure. Reported via
+    /// `StateHelper::report_cycle_stats` once a protocol's `CYCLE_TARGET`
+    /// cycles complete.
+    cycle_read_latency: HashMap<TestPhase, TxLatencyStats>,
+    /// `Some` to run only one protocol's deposit<->withdraw cycle and stop
+    /// (skipping the other two protocols' bootstrap phases and every
+    /// borrow/repay leg entirely), `None` for the original full 16-phase
+    /// sequence -- see [`TestProtocol`]'s doc comment. Read once from the
+    /// `TEST_PROTOCOL` env var at construction; checked at the two places
+    /// that need to route differently: `test_swap_to_usdc` (which
+    /// `Bootstrap*` phase to jump to) and each protocol's withdraw-cycle
+    /// completion (advance to `Done` instead of the next protocol's
+    /// bootstrap).
+    o_target_protocol: Option<TestProtocol>,
+    /// The second wallet for `TestProtocol::Native`'s back-and-forth SOL
+    /// transfers -- derived deterministically from the primary child
+    /// wallet's own secret seed (HKDF-SHA256, see
+    /// `StateHelper::ensure_native_second_wallet`), not communicated by
+    /// the Go host at all. A locally-generated keypair needs no on-chain
+    /// bootstrap to *receive* a plain SOL transfer, so this is simpler
+    /// than deriving a second child key on the Go side and sending it
+    /// over -- zero Go-side changes needed. `None` until
+    /// `ensure_native_second_wallet` runs (lazily, the first time
+    /// `test_native_transfer_loop` needs it).
+    o_second_wallet: Option<AccountId>,
+    /// How many of the 100 native transfers have completed (0..100). The
+    /// very first transfer (count still 0) doubles as wallet 2's own
+    /// funding -- it starts at zero balance and this is what gives it
+    /// enough SOL to make its own return transfers later.
+    native_transfer_count: u32,
+    /// The in-flight native transfer, if any -- `None` means the next
+    /// `evaluate()` should send the next transfer (or, once
+    /// `native_transfer_count` reaches 100, report and stop).
+    /// `Option::take()` on this is the atomic "claim" a winning update
+    /// lane uses so only the *first* of the three lanes to notice the
+    /// balance change gets to record it and trigger the next send --
+    /// same pattern `cycle_write_sent_at` uses for the protocol-specific
+    /// cycles above.
+    o_native_pending: Option<NativePending>,
+    /// Write->read latency samples for native transfers, bucketed by
+    /// [`UpdateLane`] -- which of the three real update channels
+    /// (`LowLatency`/`Commit`/`Transaction`) actually delivered the
+    /// winning confirmation for a given transfer. Distinct from
+    /// `tx_latency` above (which also gets a sample for every native
+    /// transfer, under the generic `TestPhase::NativeTransferLoop` key,
+    /// via the same `Event::Transaction` correlation every other phase
+    /// uses) -- this is the per-lane breakdown the native test exists to
+    /// produce.
+    native_read_latency: HashMap<UpdateLane, TxLatencyStats>,
+    /// This guest's own local slot clock: per-slot wall-clock timestamps
+    /// for the real `SlotStatus` transitions this test's decomposition
+    /// cares about, in increasing-slot order. Lets a native transfer's
+    /// actual inclusion slot (discovered only once it confirms,
+    /// potentially several slots after it was sent) be looked up against
+    /// real wall-clock time -- see `NativeTransferSample::write_delay`'s
+    /// doc comment for why this exists instead of assuming a fixed
+    /// ms/slot constant. Bounded at `StateHelper::SLOT_CLOCK_CAPACITY`
+    /// entries (a `VecDeque` so trimming the oldest is O(1)).
+    slot_clock: VecDeque<(Slot, SlotTimestamps)>,
+    /// Largest `header.slot` seen on *any* account/token update passing
+    /// through `low_latency()` -- real, live-user-caught fix 2026-09-08
+    /// for `current_slot()`'s own staleness: `slot_clock.back()` only
+    /// advances when this guest's event loop has actually gotten around
+    /// to processing a `SlotStatus` event, which can lag well behind the
+    /// real chain tip under backpressure (e.g. right at boot, behind a
+    /// queued burst of subscription/funding traffic -- see the real
+    /// `slots_until_inclusion` anomalies this was diagnosed from).
+    /// Account/token updates arrive at far higher frequency than
+    /// `SlotStatus` events and each carries its own real slot number, so
+    /// the max of the two is always at least as fresh as `slot_clock`
+    /// alone, never less. Used only by `current_slot()` -- everything
+    /// keyed on `inclusion_slot` (the real Write/Read split) is
+    /// unaffected by this.
+    freshest_account_slot: Slot,
+    /// One entry per confirmed native transfer, in completion order --
+    /// the full write->read breakdown this instrumentation exists to
+    /// produce. See [`NativeTransferSample`].
+    native_samples: Vec<NativeTransferSample>,
+    /// Signature -> index into `native_samples`, for backfilling
+    /// [`NativeTransferSample::tx_index`] once `mid_on_tx` happens to see
+    /// that signature's own transaction data (which carries the real
+    /// `tx.index` -- this validator's own Agave geyser plugin's
+    /// `ReplicaTransactionInfo::index`, i.e. this transfer's real ordinal
+    /// position within its landing block).
+    ///
+    /// Deliberately separate from `o_native_pending`/`m_sig`'s own
+    /// signature tracking, not a reuse of either: `mid_on_tx`'s existing
+    /// `is_current_pending` check (which gates *who wins the race* --
+    /// `record_native_read` only ever runs once per transfer, whichever
+    /// lane gets there first) is correctness-critical and must not change.
+    /// But since the Account/LowLatency lane wins essentially every race
+    /// live-verified this session, `o_native_pending` is almost always
+    /// already consumed (`.take()`'d) by the time this same signature's
+    /// Transaction-lane confirmation arrives later -- gating `tx_index`
+    /// capture on that same check would mean it almost never fires. This
+    /// map has no such gate: entries are added the moment a sample is
+    /// pushed (any lane), and consulted for *every* signature `mid_on_tx`
+    /// sees, regardless of whether it's the currently-pending transfer --
+    /// removed once backfilled so it can't grow unbounded over a run.
+    m_native_tx_index: HashMap<Signature, usize>,
+    /// `true` once the end-of-run sweep (both wallets' remaining SOL back
+    /// to the real mothership/parent wallet) has been queued -- guards
+    /// against re-queuing it every subsequent `evaluate()` tick once
+    /// `native_transfer_count` reaches `NATIVE_TRANSFER_TARGET` (that
+    /// branch runs on every tick from then on, not just once). Real, live
+    /// bug 2026-09-04: before this existed, the run just sat idle in
+    /// `TestPhase::Done` forever with both test wallets' SOL still on
+    /// them -- recoverable only because `Wallet 1`'s key happens to be
+    /// deterministically derivable from the real parent key (see
+    /// `common.DeriveChildKeyFromIndex` on the Go side), not because
+    /// anything here returned it automatically.
+    native_swept: bool,
     o_rc_keypair: Option<KeypairExtra>,
     o_phoenix: Option<PhoenixState>,
     /// This bot's own Solend lending position (the second leg of every
@@ -337,21 +900,21 @@ pub(crate) struct State {
     /// Not yet consumed by any rebalance/selection logic -- see this
     /// module's plan doc for why that's a separate follow-up.
     target_allocation_pct: HashMap<String, TargetAllocationEntry>,
-    /// Real annualized SOL-per-LST staking yield per liquid-staking-token
-    /// symbol (e.g. `"jitoSOL" -> 0.073`), pushed periodically by
-    /// `optimizer watch-lst-yield` via `CustomMessageInbound::LstApy` (see
-    /// `on_message` below) -- this bot can't compute it itself (no
-    /// persistent storage across restarts, see
-    /// `leveraged_yield_farming_plan.md`'s "Phase 0"). Refreshed in place
-    /// per symbol, not accumulated; absent until at least one real update
-    /// has arrived. Read by `log_lst_loop_projection` for the
-    /// Phase-1-style read-only leverage projection -- nothing in this bot
-    /// opens a real leveraged position from this yet.
-    lst_staking_apy: HashMap<String, f64>,
 }
 
 impl Default for State {
     fn default() -> Self {
+        let o_target_protocol = TestProtocol::from_env();
+        // Native bypasses SwapToUsdc (and the whole
+        // bootstrap/deposit/withdraw shape below it) entirely -- it needs
+        // no USDC conversion and no protocol account to bootstrap, just
+        // two wallets and plain System Program transfers. Every other
+        // selection (or none) keeps the original TestPhase::default()
+        // (SwapToUsdc) starting point unchanged.
+        let test_phase = match o_target_protocol {
+            Some(TestProtocol::Native) => TestPhase::NativeTransferLoop,
+            _ => TestPhase::default(),
+        };
         Self {
             last_slot: 0,
             slot_delta_since_start: 0,
@@ -362,8 +925,25 @@ impl Default for State {
             low_latency_count_since_last_start: 0,
             evaluate_elapsed_since_last_start: std::time::Duration::ZERO,
             evaluate_count_since_last_start: 0,
-            test_phase: TestPhase::default(),
+            test_phase,
             test_last_action_slot: None,
+            o_bundler_wait_started: None,
+            m_sig: HashMap::default(),
+            tx_latency: HashMap::default(),
+            cycle_count: 0,
+            cycle_write_sent_at: None,
+            cycle_write_baseline_amount: 0,
+            cycle_read_latency: HashMap::default(),
+            o_target_protocol,
+            o_second_wallet: None,
+            native_transfer_count: 0,
+            native_swept: false,
+            o_native_pending: None,
+            native_read_latency: HashMap::default(),
+            slot_clock: VecDeque::default(),
+            freshest_account_slot: 0,
+            native_samples: Vec::default(),
+            m_native_tx_index: HashMap::default(),
             o_rc_keypair: None,
             o_phoenix: None,
             o_solend_position: None,
@@ -385,7 +965,6 @@ impl Default for State {
                     )
                 })
                 .collect(),
-            lst_staking_apy: HashMap::new(),
         }
     }
 }
@@ -577,48 +1156,230 @@ impl<'a> StateHelper<'a> {
         let n_ids = crate::util::pubkey_account_id_cache()
             .account_ids(&l_pk)
             .len();
-        log_warn!("testperpv1: batch-resolved {n_ids}/{n_pk} build-time pubkeys to account ids at startup");
-        assert!(self
-            .state
-            .o_phoenix
-            .replace(PhoenixState::new_and_subscribe(self.graph).expect("phoenix state"))
-            .is_none());
-        assert!(self
-            .state
-            .o_solend_position
-            .replace(solend::SolendPosition::default())
-            .is_none());
-        assert!(self
-            .state
-            .o_kamino_position
-            .replace(kamino::KaminoPosition::default())
-            .is_none());
-        assert!(self
-            .state
-            .o_marginfi_position
-            .replace(marginfi::MarginfiPosition::default())
-            .is_none());
-        assert!(self
-            .state
-            .o_dex
-            .replace(DexState::new().expect("dex state"))
-            .is_none());
-        // Seed spot_router's node set from the build-time liquidity
-        // router's classified mint universe -- see
-        // TradeRouter::from_router's doc comment: live pool registration
-        // (refresh_account_router/refresh_token_router) only *looks up*
-        // nodes, it never creates them, so route_slippage_aware would
-        // silently return None for every mint forever without this.
-        // Mirrors arbv1::state::on_load exactly (same
-        // build_liquidity_router helper below).
+        log_warn!("testlatencylitev1: batch-resolved {n_ids}/{n_pk} build-time pubkeys to account ids at startup");
+        // THE experimental change this whole module exists for: the real
+        // `testperplatencyv1::on_load` does all five of these
+        // unconditionally, for every protocol -- see this module's own
+        // doc comment for the real, live-measured evidence
+        // (~42,000-account DEX/lending subscription, 8,271 updates/tick)
+        // that this native-transfer test never needed any of it.
+        // `o_phoenix`/`o_solend_position`/`o_kamino_position`/
+        // `o_marginfi_position`/`o_dex` are simply left `None` here --
+        // `evaluate_inner`'s own gate is relaxed below to match, since it
+        // otherwise refuses to dispatch to *any* `TestPhase` (including
+        // `NativeTransferLoop`) until all five are populated.
+        //
+        // Not skipped: `spot_router`'s seeding just below, which builds a
+        // static routing graph from build-time config data -- no live
+        // subscription, no account IDs, nothing this experiment is
+        // trying to avoid -- kept as-is so nothing else in this copied
+        // module trips over an unexpectedly-empty router.
         self.state.spot_router = TradeRouter::from_router(&build_liquidity_router());
-        log_info!("perpfundingv1: bot has been successfully uploaded to validator");
+        log_info!("testlatencylitev1: bot has been successfully uploaded to validator (dex/solend/kamino/marginfi subscriptions skipped -- native-transfer latency experiment)");
     }
+
+    /// How many recent (slot, Instant) pairs `State::slot_clock` keeps.
+    /// Generous relative to any write delay actually observed on this
+    /// test so far (at most a couple dozen slots) -- comfortably covers
+    /// looking up an inclusion slot even under unusually heavy write
+    /// delay, without keeping the whole run's slot history around.
+    const SLOT_CLOCK_CAPACITY: usize = 500;
 
     pub(crate) fn on_slot_status(&mut self, slot: Slot, status: SlotStatus) {
         if status == SlotStatus::Dead {
             log_info!("perpfundingv1: slot {slot}; status dead");
         }
+        // Ensure this slot has an entry, in increasing-slot order (real
+        // slot numbers only ever go up, so a plain "is this newer than
+        // the last entry" check is enough to dedupe without a full scan).
+        if self.state.slot_clock.back().is_none_or(|&(s, _)| s < slot) {
+            self.state
+                .slot_clock
+                .push_back((slot, SlotTimestamps::default()));
+            if self.state.slot_clock.len() > Self::SLOT_CLOCK_CAPACITY {
+                self.state.slot_clock.pop_front();
+            }
+        }
+        // FirstShredReceived/Completed/Processed for `slot` always
+        // arrive while `slot` is at or very near `slot_clock.back()`
+        // (real-time signals about the current tip); Confirmed routinely
+        // arrives well after slot_clock has advanced many entries past
+        // it (cluster confirmation lags local processing -- see
+        // `SlotTimestamps::confirmed`'s doc comment). Search backward
+        // for the matching entry rather than assuming it's still
+        // `back()` -- bounded by `SLOT_CLOCK_CAPACITY`, so this never
+        // scans further than that.
+        let now = std::time::Instant::now();
+        if let Some((_, ts)) = self
+            .state
+            .slot_clock
+            .iter_mut()
+            .rev()
+            .find(|(s, _)| *s == slot)
+        {
+            match status {
+                SlotStatus::FirstShredReceived => {
+                    ts.first_shred.get_or_insert(now);
+                }
+                SlotStatus::Completed => {
+                    ts.completed.get_or_insert(now);
+                }
+                SlotStatus::Processed => {
+                    ts.processed.get_or_insert(now);
+                }
+                SlotStatus::Confirmed => {
+                    ts.confirmed.get_or_insert(now);
+                }
+                SlotStatus::Rooted | SlotStatus::CreatedBank | SlotStatus::Dead => {}
+            }
+        }
+    }
+
+    /// Best-effort wall-clock `Instant` for the first time this guest saw
+    /// `slot`'s first shred (`SlotStatus::FirstShredReceived`). Exact
+    /// match when available; otherwise falls back to the closest earlier
+    /// recorded slot that has one (not every slot necessarily produces
+    /// its own `SlotStatus` event to this guest), which slightly
+    /// *understates* the true write delay for that sample rather than
+    /// overstating it. `None` only if `slot` predates everything left in
+    /// `slot_clock` (aged out under an unusually large write delay, or no
+    /// `SlotStatus` event has ever arrived yet).
+    fn instant_for_slot(&self, slot: Slot) -> Option<std::time::Instant> {
+        self.state
+            .slot_clock
+            .iter()
+            .rev()
+            .filter(|&&(s, _)| s <= slot)
+            .find_map(|&(_, ts)| ts.first_shred)
+    }
+
+    /// Wall-clock `Instant` this guest first observed *some* slot
+    /// strictly after `slot` reach `FirstShredReceived` -- used only as
+    /// `NativeTransferSample::write_delay_upper_bound`'s real, honest
+    /// upper bound when `instant_for_slot(slot)` resolved to an instant
+    /// at or before the send (see that field's doc comment for why that
+    /// happens and why a point estimate isn't recoverable there). Scans
+    /// forward from the front (oldest first) since `slot_clock` is
+    /// stored in increasing-slot order -- correct regardless of slot
+    /// gaps (not every slot necessarily produces its own `SlotStatus`
+    /// event to this guest). `None` if no later slot has been observed
+    /// yet either.
+    fn instant_after_slot(&self, slot: Slot) -> Option<std::time::Instant> {
+        self.state
+            .slot_clock
+            .iter()
+            .filter(|&&(s, _)| s > slot)
+            .find_map(|&(_, ts)| ts.first_shred)
+    }
+
+    /// Same lookup as `instant_for_slot`, against `SlotTimestamps::completed`
+    /// -- used for the `shred_to_completed`/`completed_to_processed`
+    /// transparency stats.
+    fn completed_instant_for_slot(&self, slot: Slot) -> Option<std::time::Instant> {
+        self.state
+            .slot_clock
+            .iter()
+            .rev()
+            .filter(|&&(s, _)| s <= slot)
+            .find_map(|&(_, ts)| ts.completed)
+    }
+
+    /// Same lookup as `instant_for_slot`, against `SlotTimestamps::processed`
+    /// -- used only for the `completed_to_processed`/`processed_to_confirmed`
+    /// transparency stats (this validator's own local replay time and the
+    /// cluster-confirmation lag after it), not as a write/read anchor.
+    fn processed_instant_for_slot(&self, slot: Slot) -> Option<std::time::Instant> {
+        self.state
+            .slot_clock
+            .iter()
+            .rev()
+            .filter(|&&(s, _)| s <= slot)
+            .find_map(|&(_, ts)| ts.processed)
+    }
+
+    /// Same lookup as `instant_for_slot`, against `SlotTimestamps::confirmed`
+    /// -- used only for the `processed_to_confirmed` transparency stat.
+    /// Real, corrected 2026-09-04: this used to claim cluster confirmation
+    /// "routinely hasn't happened yet" by observation time -- real,
+    /// live-measured data contradicted that (17/20 samples in one run
+    /// had `processed_to_confirmed` already resolved, meaning `Confirmed`
+    /// genuinely landed *before* the observing lane claimed the transfer
+    /// in most cases). Purely informational either way -- never
+    /// subtracted from `read_delay` (see that field's own doc comment).
+    fn confirmed_instant_for_slot(&self, slot: Slot) -> Option<std::time::Instant> {
+        self.state
+            .slot_clock
+            .iter()
+            .rev()
+            .filter(|&&(s, _)| s <= slot)
+            .find_map(|&(_, ts)| ts.confirmed)
+    }
+
+    /// Records that `mid_on_tx` saw a transaction with this real `tx.index`
+    /// included in `slot` -- called for *every* transaction it sees, not
+    /// just our own native transfers, so `SlotTimestamps::max_tx_index`
+    /// tracks the largest ordinal position observed for that slot. Same
+    /// dedup/capacity discipline as `on_slot_status`: creates a new
+    /// `slot_clock` entry when `slot` is newer than everything currently
+    /// tracked; otherwise updates the matching existing entry in place.
+    /// If `slot` predates everything left in `slot_clock` (aged out) or
+    /// falls in a gap this guest never saw a `SlotStatus` event for, this
+    /// is a no-op -- same honest-lower-bound tradeoff as everywhere else
+    /// `slot_clock` is consulted, not a correctness bug.
+    fn record_tx_index_for_slot(&mut self, slot: Slot, index: u64) {
+        if self.state.slot_clock.back().is_none_or(|&(s, _)| s < slot) {
+            self.state
+                .slot_clock
+                .push_back((slot, SlotTimestamps::default()));
+            if self.state.slot_clock.len() > Self::SLOT_CLOCK_CAPACITY {
+                self.state.slot_clock.pop_front();
+            }
+        }
+        if let Some((_, ts)) = self
+            .state
+            .slot_clock
+            .iter_mut()
+            .rev()
+            .find(|(s, _)| *s == slot)
+        {
+            ts.max_tx_index = Some(ts.max_tx_index.map_or(index, |m| m.max(index)));
+        }
+    }
+
+    /// Best-effort largest `tx.index` observed for `slot` (see
+    /// `SlotTimestamps::max_tx_index`'s doc comment) -- a real, honest
+    /// lower bound on how many transactions `slot`'s block actually had.
+    /// Exact match when available; otherwise `None` (unlike
+    /// `instant_for_slot`, falling back to an earlier slot's count would
+    /// be a meaningless estimate here, not a conservative one, so this
+    /// doesn't do it). Used by `write_delay_estimate`'s fractional
+    /// position-within-block estimate.
+    fn slot_max_tx_index(&self, slot: Slot) -> Option<u64> {
+        self.state
+            .slot_clock
+            .iter()
+            .rev()
+            .find(|&&(s, _)| s == slot)
+            .and_then(|&(_, ts)| ts.max_tx_index)
+    }
+
+    /// The freshest slot number this guest has observed, or `0` before
+    /// the first `SlotStatus` event ever arrives -- used as
+    /// `NativePending::send_slot`, the "first leader opportunity" a
+    /// just-sent transfer is measured against.
+    ///
+    /// Takes the max of `slot_clock`'s own bookkeeping (fed only by
+    /// `SlotStatus` events) and `State::freshest_account_slot` (fed by
+    /// every account/token update this guest sees, far higher frequency)
+    /// -- see that field's doc comment for the real staleness bug this
+    /// fixes: `slot_clock.back()` alone can lag the true chain tip when
+    /// this guest's `SlotStatus` processing specifically falls behind,
+    /// most visibly right at boot behind a queued subscription/funding
+    /// burst, inflating `slots_until_inclusion` without `send_slot` ever
+    /// having reflected the real slot at send time.
+    fn current_slot(&self) -> Slot {
+        let from_slot_status = self.state.slot_clock.back().map_or(0, |&(s, _)| s);
+        from_slot_status.max(self.state.freshest_account_slot)
     }
 
     pub(crate) fn low_latency(&mut self, mut llap: LowLatencyAccountUpdate) {
@@ -636,7 +1397,18 @@ impl<'a> StateHelper<'a> {
         while let Some(account) = llap.account() {
             count += 1;
             let d = account.body.unwrap_or(&zero);
+            // Real-time freshest-slot signal for `current_slot()` -- see
+            // `State::freshest_account_slot`'s doc comment. Every account
+            // update carries its own real slot number regardless of
+            // whether this guest cares about the account itself.
+            self.state.freshest_account_slot =
+                self.state.freshest_account_slot.max(account.header.slot);
             self.wallet.on_account(account.header, d);
+            self.check_native_transfer_arrival(
+                account.header.accountid,
+                account.header.slot,
+                UpdateLane::LowLatency,
+            );
             if let Some(phoenix) = self.state.o_phoenix.as_mut() {
                 phoenix.on_account(account.header, d);
             }
@@ -663,12 +1435,86 @@ impl<'a> StateHelper<'a> {
         self.state.low_latency_count_since_last_start += count;
     }
 
+    /// Correlates every transaction this test has sent (tracked in
+    /// `m_sig` at the send point in `evaluate_inner`'s `assemble()`/send
+    /// loop) against real on-chain confirmations, recording send->confirm
+    /// latency bucketed by the `TestPhase` that sent it -- see this
+    /// module's doc comment and `helloworldv1::state::mid_on_tx`'s own
+    /// `m_sig`/`tx_latency` pattern, which this mirrors. Unlike
+    /// `helloworldv1`, no instruction-level filtering is needed here
+    /// (nothing in this module inspects a specific program's
+    /// instructions inside a transaction), so `tx.signature` is read
+    /// directly instead of walking `ix_inner`/`ix_outer` first.
     pub(crate) fn mid_on_tx(&mut self, mut transaction_list: TransactionList) {
-        // This mode never sends a transaction -- nothing to correlate,
-        // just drain the iterator (matches perpfundingv1::State::mid_on_tx's
-        // own identical-purpose loop, rather than assuming it's safe to
-        // skip entirely).
-        while transaction_list.transaction().is_some() {}
+        while let Some((tx, result)) = transaction_list.transaction() {
+            // `Ok(slot)` is the real slot this transaction was included
+            // in -- previously discarded here (`if result.is_err() {
+            // continue; }`), now the source of
+            // `NativeTransferSample::inclusion_slot` for the Transaction
+            // lane. Behavior for an errored transaction is unchanged:
+            // skip it, same as before.
+            let Ok(inclusion_slot) = result else {
+                continue;
+            };
+            // Track this slot's largest `tx.index` across *every*
+            // transaction seen here, not just our own native transfers --
+            // see `SlotTimestamps::max_tx_index`'s doc comment. Phase 2 of
+            // `TX_INDEX_ESTIMATE_PLAN.md`: not yet consulted anywhere,
+            // reserved for Phase 3's fractional estimate.
+            self.record_tx_index_for_slot(inclusion_slot, tx.index);
+            let signature = Signature::from(*tx.signature);
+            // Backfill `NativeTransferSample::tx_index` for this signature,
+            // if it's one of ours -- independent of `m_sig`/`o_native_pending`
+            // below and of which lane actually won this transfer's race
+            // (almost always Account/LowLatency, live-verified this
+            // session, so `o_native_pending` is usually already consumed by
+            // the time this signature's own transaction data shows up
+            // here). See `State::m_native_tx_index`'s doc comment.
+            if let Some(sample_i) = self.state.m_native_tx_index.remove(&signature) {
+                if let Some(sample) = self.state.native_samples.get_mut(sample_i) {
+                    sample.tx_index = Some(tx.index);
+                }
+            }
+            let Some((phase, sent_at)) = self.state.m_sig.remove(&signature) else {
+                continue;
+            };
+            let elapsed = sent_at.elapsed();
+            self.state
+                .tx_latency
+                .entry(phase)
+                .or_default()
+                .record(elapsed);
+            log_warn!(
+                "testlatencylitev1: {phase:?} tx {signature} confirmed on-chain -- latency {}µs",
+                elapsed.as_micros(),
+            );
+            // NOTE: this is NOT necessarily the current pending native
+            // transfer's own signature, even though only one is ever
+            // in-flight at a time -- confirmations for OLDER native
+            // transfers can (and, live-verified, routinely do) arrive
+            // late, well after a faster lane already advanced the loop
+            // past them. Real, confirmed live 2026-09-01: without the
+            // `pending.sig == Some(signature)` check below, a stale
+            // confirmation for an already-claimed earlier transfer was
+            // misattributing itself to whatever transfer happened to be
+            // pending *now* -- 39 of 60 "Transaction lane" wins in that
+            // run turned out to be exactly this, verified by cross-
+            // referencing each claimed latency against every signature's
+            // own independently-logged confirm time and finding no
+            // match. Checking the signature itself (not just the phase)
+            // is what makes this correct: only the confirmation for the
+            // transfer `o_native_pending` is actually still tracking
+            // gets to claim the Transaction lane.
+            if phase == TestPhase::NativeTransferLoop {
+                let is_current_pending = self
+                    .state
+                    .o_native_pending
+                    .is_some_and(|p| p.sig == Some(signature));
+                if is_current_pending {
+                    self.record_native_read(UpdateLane::Transaction, inclusion_slot);
+                }
+            }
+        }
     }
 
     fn current_epoch_ts() -> i64 {
@@ -845,14 +1691,19 @@ impl<'a> StateHelper<'a> {
                             self.state
                                 .spot_router
                                 .mark_pool_cooldown(failure.pool_id, planner::POOL_COOLDOWN_SLOTS);
+                            log_warn!(
+                                "perpfundingv1: spot price probe @ slot {}: SOL->USDC rejected -- exact quote invalidated pool {} (cooling down {} slots)",
+                                self.state.last_slot,
+                                failure.pool_id,
+                                planner::POOL_COOLDOWN_SLOTS,
+                            );
+                        } else {
+                            log_warn!(
+                                "perpfundingv1: spot price probe @ slot {}: SOL->USDC rejected -- pool {} not ready yet (no cooldown)",
+                                self.state.last_slot,
+                                failure.pool_id,
+                            );
                         }
-                        log_warn!(
-                            "perpfundingv1: spot price probe @ slot {}: SOL->USDC rejected -- exact quote invalidated pool {} (cooling down {} slots: {})",
-                            self.state.last_slot,
-                            failure.pool_id,
-                            planner::POOL_COOLDOWN_SLOTS,
-                            failure.coolable,
-                        );
                     }
                 }
             }
@@ -900,14 +1751,19 @@ impl<'a> StateHelper<'a> {
                             self.state
                                 .spot_router
                                 .mark_pool_cooldown(failure.pool_id, planner::POOL_COOLDOWN_SLOTS);
+                            log_warn!(
+                                "perpfundingv1: spot price probe @ slot {}: USDC->SOL rejected -- exact quote invalidated pool {} (cooling down {} slots)",
+                                self.state.last_slot,
+                                failure.pool_id,
+                                planner::POOL_COOLDOWN_SLOTS,
+                            );
+                        } else {
+                            log_warn!(
+                                "perpfundingv1: spot price probe @ slot {}: USDC->SOL rejected -- pool {} not ready yet (no cooldown)",
+                                self.state.last_slot,
+                                failure.pool_id,
+                            );
                         }
-                        log_warn!(
-                            "perpfundingv1: spot price probe @ slot {}: USDC->SOL rejected -- exact quote invalidated pool {} (cooling down {} slots: {})",
-                            self.state.last_slot,
-                            failure.pool_id,
-                            planner::POOL_COOLDOWN_SLOTS,
-                            failure.coolable,
-                        );
                     }
                 }
             }
@@ -1382,61 +2238,6 @@ impl<'a> StateHelper<'a> {
             (None, Some(k)) => Some((LendingProtocol::Kamino, k)),
             (None, None) => None,
         }
-    }
-
-    /// [`Self::best_usdc_supply_apy`]'s borrow-side counterpart -- the
-    /// debt cost side of an LST-collateral leverage loop (deposit LST,
-    /// borrow USDC), used only by [`Self::log_lst_loop_projection`]'s
-    /// read-only projection. Same Solend/Kamino cheapest-wins selection
-    /// as [`Self::best_borrow_apy`], just keyed by `mint_usdc` directly
-    /// instead of a curated symbol.
-    fn best_usdc_borrow_apy(&self) -> Option<(LendingProtocol, f64)> {
-        let mint_usdc = self.configuration.mint_usdc;
-        let dex = self.state.o_dex.as_ref()?;
-        let solend_apy = dex
-            .solend()
-            .reserve_by_mint(mint_usdc)
-            .map(|(_, r)| r.current_borrow_apy() * 100.0);
-        let kamino_apy = dex
-            .kamino()
-            .reserve_by_mint(mint_usdc)
-            .map(|(_, r)| r.current_borrow_apy() * 100.0);
-        match (solend_apy, kamino_apy) {
-            (Some(s), Some(k)) if k < s => Some((LendingProtocol::Kamino, k)),
-            (Some(s), _) => Some((LendingProtocol::Solend, s)),
-            (None, Some(k)) => Some((LendingProtocol::Kamino, k)),
-            (None, None) => None,
-        }
-    }
-
-    /// Phase 1 of `leveraged_yield_farming_plan.md`: read-only, no
-    /// transactions sent. Logs what an LST-collateral/USDC-debt leverage
-    /// loop would return at a few candidate leverage levels, using
-    /// `net_apy(L) = L*lst_staking_apy - (L-1)*usdc_borrow_apy` (the
-    /// plan's own formula -- LST *lending* supply APR is omitted, not
-    /// approximated as zero: it's confirmed near-zero in the plan's
-    /// live-checked numbers, and this bot doesn't currently track
-    /// jitoSOL/bSOL/mSOL Kamino reserves at all, so there's nothing to
-    /// read even if it mattered). No-ops for a symbol until a real
-    /// `LstApy` update has arrived for it and a real USDC borrow rate is
-    /// available -- never fabricates either input.
-    fn log_lst_loop_projection(&self, symbol: &str, staking_apy_fraction: f64) {
-        let Some((protocol, usdc_borrow_apy_pct)) = self.best_usdc_borrow_apy() else {
-            return;
-        };
-        let staking_apy_pct = staking_apy_fraction * 100.0;
-        let levels = [1.0, 2.0, 3.0];
-        let projections: Vec<String> = levels
-            .iter()
-            .map(|&l| {
-                let net_apy = l * staking_apy_pct - (l - 1.0) * usdc_borrow_apy_pct;
-                format!("{l:.1}x={net_apy:.2}%")
-            })
-            .collect();
-        log_warn!(
-            "testperpv1: LST loop projection {symbol}: staking_apy={staking_apy_pct:.3}% usdc_borrow_apy={usdc_borrow_apy_pct:.3}% ({protocol:?}) -> {}",
-            projections.join(" "),
-        );
     }
 
     /// Every reserve this bot's Kamino obligation currently has a
@@ -3780,21 +4581,23 @@ impl<'a> StateHelper<'a> {
 
     fn evaluate_inner(&mut self) {
         self.wallet.set_priority_fee(PriorityLevel::Medium);
-        // Idempotent/self-latching (2026-08-28): only actually queues the
-        // real create-nonce transaction once (Wallet::ensure_bundler_nonce_created
-        // no-ops on every call after the first, whether still unconfirmed
-        // or already Ready) -- safe to call unconditionally every tick so
-        // the durable-nonce account this wallet's Astralane landing path
-        // (Wallet::send_bundler_pair, driven by set_priority_fee(High) --
-        // see its own doc comment) needs is bootstrapped automatically at
-        // wallet load time instead of requiring a manual trigger.
-        if let Some(owner) = self.state.wallet() {
-            self.wallet.ensure_bundler_nonce_created(owner);
-        }
-        if self.state.o_dex.is_none()
-            || self.state.o_solend_position.is_none()
-            || self.state.o_kamino_position.is_none()
-            || self.state.o_marginfi_position.is_none()
+        // Real, live 2026-09-04: `o_dex`/`o_solend_position`/
+        // `o_kamino_position`/`o_marginfi_position` are never populated
+        // in this module -- see `on_load`'s own comment for why. Gating
+        // on them unconditionally (the real module's original check)
+        // would mean `NativeTransferLoop`, the only phase this module
+        // ever legitimately reaches, could never dispatch at all.
+        // Bypassed only for `TestProtocol::Native` -- if `TEST_PROTOCOL`
+        // isn't set to `native` (misconfiguration, since this module is
+        // Native-only), this still correctly refuses to run any
+        // Solend/Kamino/Marginfi phase against permanently-uninitialized
+        // state, same as the real module would for genuinely-missing
+        // state.
+        if self.state.o_target_protocol != Some(TestProtocol::Native)
+            && (self.state.o_dex.is_none()
+                || self.state.o_solend_position.is_none()
+                || self.state.o_kamino_position.is_none()
+                || self.state.o_marginfi_position.is_none())
         {
             return;
         }
@@ -3815,6 +4618,7 @@ impl<'a> StateHelper<'a> {
             TestPhase::RepayKamino => self.test_repay_kamino(),
             TestPhase::BorrowMarginfi => self.test_borrow_marginfi(),
             TestPhase::RepayMarginfi => self.test_repay_marginfi(),
+            TestPhase::NativeTransferLoop => self.test_native_transfer_loop(),
             TestPhase::Done => {}
         }
 
@@ -3823,12 +4627,39 @@ impl<'a> StateHelper<'a> {
         // arbv1::state::evaluate/perpfundingv1::evaluate both use.
         // Without this, queued instructions would sit on the wallet
         // forever and never reach the chain.
-        for (sig, result) in self.wallet.drain_and_send() {
-            match result {
+        while let Some((sig, data)) = self.wallet.assemble() {
+            match transactionprocessor::send(sig.as_array(), data) {
                 Ok(_) => {
-                    log_warn!("testperpv1: sent transaction {sig}");
+                    log_warn!("testlatencylitev1: sent transaction {sig}");
+                    // Tag this signature with the phase that sent it (the
+                    // state machine is strictly linear, so "current phase"
+                    // is unambiguous) and the send instant, so `mid_on_tx`
+                    // can compute real send->confirm latency once this
+                    // signature is observed on-chain -- see `m_sig`'s doc
+                    // comment. A stale/overwritten entry (the same
+                    // signature sent twice) can't happen: `Signature` is a
+                    // hash of the fully-signed transaction bytes, which
+                    // change on every attempt (fresh recent blockhash).
+                    let phase = self.state.test_phase;
+                    self.state.m_sig.insert(sig, (phase, Instant::now()));
+                    // Stash this send's own signature onto the pending
+                    // native transfer it belongs to, if any -- see
+                    // `NativePending::sig`'s doc comment for why
+                    // `mid_on_tx` needs this instead of just trusting any
+                    // NativeTransferLoop-phase confirmation. `is_none()`
+                    // guards against overwriting it with some *later*
+                    // tick's unrelated signature; harmless either way
+                    // since only one native transfer is ever queued/
+                    // assembled per tick.
+                    if phase == TestPhase::NativeTransferLoop {
+                        if let Some(pending) = self.state.o_native_pending.as_mut() {
+                            if pending.sig.is_none() {
+                                pending.sig = Some(sig);
+                            }
+                        }
+                    }
                 }
-                Err(e) => log_error!("testperpv1: failed to send transaction {sig}: {e}"),
+                Err(e) => log_error!("testlatencylitev1: failed to send transaction {sig}: {e}"),
             }
         }
     }
@@ -3841,18 +4672,17 @@ impl<'a> StateHelper<'a> {
     /// fires on every event, which can be many times per second, so this
     /// is what stops that from spamming duplicate transactions.
     const TEST_ACTION_COOLDOWN_SLOTS: Slot = 100;
+    /// Real wall-clock budget for `test_native_transfer_loop`'s bundler-
+    /// tip-status wait (see `o_bundler_wait_started`) -- generous
+    /// relative to the Go-side `bundler.RunTipBroadcaster`'s own real
+    /// 15-second poll interval (`tipBroadcastInterval`), so a normal
+    /// deployment always gets at least one full broadcast cycle to
+    /// deliver real status before this gives up and sends without it.
+    const BUNDLER_STATUS_WAIT_SECS: u64 = 20;
     /// Deliberately small -- this only needs to prove the code path
     /// works, not move meaningful capital. Matches the conservative end
     /// of what was manually tested for real this session (5 USDC).
     const TEST_AMOUNT_USD: f64 = 1.0;
-    /// How often (in slots) to report this wallet's most-referenced
-    /// accounts back to the optimizer via `MessageSend::
-    /// CommonAddressUpdate`, so `optimizer alt` can rank real Address
-    /// Lookup Table candidates without an RPC history scan.
-    const ACCOUNT_USAGE_REPORT_INTERVAL_SLOTS: Slot = 500;
-    /// Caps each report comfortably under `MESSAGE_MAX_SIZE` (4096
-    /// bytes): `28 + 100*36 = 3628`.
-    const ACCOUNT_USAGE_REPORT_MAX_ENTRIES: usize = 100;
 
     /// `true` while still within the cooldown window of the current
     /// phase's last action -- see [`Self::TEST_ACTION_COOLDOWN_SLOTS`].
@@ -3873,10 +4703,98 @@ impl<'a> StateHelper<'a> {
 
     /// Moves to `next`, clearing the cooldown so the new phase starts
     /// its own action fresh rather than inheriting whatever was left
-    /// from the phase just finished.
+    /// from the phase just finished. Also emits a one-line latency
+    /// report for the phase being left -- see `TxLatencyStats`'s doc
+    /// comment -- so every phase's send->confirm numbers surface exactly
+    /// once, at the point there's nothing more left to add to them,
+    /// rather than needing to be scraped out of the full per-tx log.
     fn test_advance(&mut self, next: TestPhase) {
+        let finished = self.state.test_phase;
+        let (n, p50_us, p99_us) = self
+            .state
+            .tx_latency
+            .get(&finished)
+            .map(|s| s.stats())
+            .unwrap_or((0, 0, 0));
+        log_warn!(
+            "testlatencylitev1: {finished:?} complete -- {n} confirmed tx, p50={p50_us}µs p99={p99_us}µs -- advancing to {next:?}",
+        );
         self.state.test_phase = next;
         self.state.test_last_action_slot = None;
+    }
+
+    /// Number of full deposit<->withdraw cycles to run per protocol before
+    /// moving on -- a single pass (the old behavior) only ever produces
+    /// 1-3 samples, nowhere near enough for a meaningful p50/p99. Applies
+    /// only to the Deposit/Withdraw phase pairs, not Bootstrap (one-shot,
+    /// account creation isn't repeatable) or Borrow/Repay (out of scope
+    /// for this pass -- see the gitlab issue this closes).
+    const CYCLE_TARGET: u32 = 100;
+    /// Raw units (not USD) deliberately left behind by every Solend/Kamino
+    /// withdraw in a cycle, so the obligation's deposited balance never
+    /// hits exactly zero. Necessary because a full/`_AMOUNT_MAX` withdrawal
+    /// is documented elsewhere in this file as closing the obligation
+    /// account (live-verified against mainnet) -- but *what specifically*
+    /// triggers that closure (the `_AMOUNT_MAX` sentinel itself, vs. any
+    /// withdrawal that empties the balance to zero) isn't something this
+    /// codebase has verified. Leaving a ~$0.000001 dust remainder sidesteps
+    /// that ambiguity entirely rather than betting on one theory of it --
+    /// **this still needs live validation on the first real run**: if the
+    /// obligation closes anyway, `cycle_write_baseline_amount`-based
+    /// detection below will simply stop seeing confirmations and the
+    /// phase will stall against its cooldown, which is at least a safe,
+    /// visible failure rather than a silent wrong number. Not needed for
+    /// Marginfi -- its `MarginfiAccount` is documented as NOT closed by a
+    /// full withdrawal (no separate `close` instruction is ever called).
+    const CYCLE_DUST_RAW: u64 = 1;
+
+    /// Records one write->low-latency-read latency sample for `phase` --
+    /// see `State::cycle_write_sent_at`'s doc comment for what "read"
+    /// means here (an `on_account` update making the write's effect
+    /// visible, not just seeing the transaction's signature confirmed).
+    /// No-op if no write is currently pending (`cycle_write_sent_at` is
+    /// `None`) -- guards against a stray/duplicate `on_account` update
+    /// double-counting a sample that was already recorded.
+    fn record_cycle_read(&mut self, phase: TestPhase) {
+        let Some(sent_at) = self.state.cycle_write_sent_at.take() else {
+            return;
+        };
+        let elapsed = sent_at.elapsed();
+        self.state
+            .cycle_read_latency
+            .entry(phase)
+            .or_default()
+            .record(elapsed);
+    }
+
+    /// Logs the accumulated `CYCLE_TARGET`-cycle report for one protocol's
+    /// deposit/withdraw pair once both are done -- separate n/p50/p99 for
+    /// the deposit-write->read and withdraw-write->read latency (not one
+    /// pooled number), so a difference between the two is visible.
+    fn report_cycle_stats(
+        &self,
+        protocol: &str,
+        deposit_phase: TestPhase,
+        withdraw_phase: TestPhase,
+    ) {
+        let (dn, dp50, dp99) = self
+            .state
+            .cycle_read_latency
+            .get(&deposit_phase)
+            .map(|s| s.stats())
+            .unwrap_or((0, 0, 0));
+        let (wn, wp50, wp99) = self
+            .state
+            .cycle_read_latency
+            .get(&withdraw_phase)
+            .map(|s| s.stats())
+            .unwrap_or((0, 0, 0));
+        log_warn!(
+            "testlatencylitev1: {protocol} cycle report ({} cycles) -- \
+             deposit write->read: n={dn} p50={dp50}µs p99={dp99}µs; \
+             withdraw write->read: n={wn} p50={wp50}µs p99={wp99}µs",
+            Self::CYCLE_TARGET,
+        );
     }
 
     /// Native lamports wrapped into wSOL and swapped to USDC per attempt
@@ -3900,8 +4818,13 @@ impl<'a> StateHelper<'a> {
     fn test_swap_to_usdc(&mut self) {
         let usdc_target = 2.0 * Self::TEST_AMOUNT_USD;
         if self.current_usdc_value() >= usdc_target {
-            log_warn!("testperpv1: [1/16] USDC balance already covers both deposit tests");
-            self.test_advance(TestPhase::BootstrapSolend);
+            log_warn!("testlatencylitev1: [1/16] USDC balance already covers both deposit tests");
+            let next = self
+                .state
+                .o_target_protocol
+                .map(TestProtocol::bootstrap_phase)
+                .unwrap_or(TestPhase::BootstrapSolend);
+            self.test_advance(next);
             return;
         }
         if self.test_cooldown_active() {
@@ -3931,9 +4854,9 @@ impl<'a> StateHelper<'a> {
             .map(|(_, a)| *a)
             .sum();
         if wsol_balance_raw > 0 {
-            log_warn!("testperpv1: [1/16] swapping {wsol_balance_raw} lamports of already-wrapped SOL to USDC");
+            log_warn!("testlatencylitev1: [1/16] swapping {wsol_balance_raw} lamports of already-wrapped SOL to USDC");
             if let Err(e) = self.execute_spot_leg(mint_sol, mint_usdc, wsol_balance_raw) {
-                log_error!("testperpv1: [1/16] swap to USDC failed: {e}");
+                log_error!("testlatencylitev1: [1/16] swap to USDC failed: {e}");
             }
             self.test_mark_action();
             return;
@@ -3945,7 +4868,7 @@ impl<'a> StateHelper<'a> {
         let needed = Self::TEST_WRAP_SOL_LAMPORTS + Self::TEST_SOL_FEE_RESERVE_LAMPORTS;
         if sol_balance < needed {
             log_warn!(
-                "testperpv1: [1/16] insufficient native SOL to wrap ({sol_balance} lamports, need {needed}) -- \
+                "testlatencylitev1: [1/16] insufficient native SOL to wrap ({sol_balance} lamports, need {needed}) -- \
                  waiting for boot transfer"
             );
             // Without this, `test_cooldown_active()` never engages (it
@@ -3960,7 +4883,7 @@ impl<'a> StateHelper<'a> {
             return;
         }
         log_warn!(
-            "testperpv1: [1/16] wrapping {} lamports SOL and swapping to USDC",
+            "testlatencylitev1: [1/16] wrapping {} lamports SOL and swapping to USDC",
             Self::TEST_WRAP_SOL_LAMPORTS
         );
         self.test_wrap_and_swap_sol(owner, Self::TEST_WRAP_SOL_LAMPORTS);
@@ -4000,7 +4923,7 @@ impl<'a> StateHelper<'a> {
             5_000,
         );
         if let Err(e) = self.execute_spot_leg(mint_sol, mint_usdc, lamports) {
-            log_error!("testperpv1: [1/16] swap to USDC failed: {e}");
+            log_error!("testlatencylitev1: [1/16] swap to USDC failed: {e}");
         }
     }
 
@@ -4029,18 +4952,40 @@ impl<'a> StateHelper<'a> {
             .as_ref()
             .is_some_and(|s| s.registered())
         {
-            log_warn!("testperpv1: [2/16] solend obligation confirmed registered on-chain");
+            log_warn!("testlatencylitev1: [2/16] solend obligation confirmed registered on-chain");
             self.test_advance(TestPhase::DepositSolend);
             return;
         }
         if self.test_cooldown_active() {
             return;
         }
-        log_warn!("testperpv1: [2/16] bootstrapping solend obligation");
+        log_warn!("testlatencylitev1: [2/16] bootstrapping solend obligation");
         self.bootstrap_solend_obligation();
         self.test_mark_action();
     }
 
+    /// Current deposited-collateral amount (raw units, 0 if no deposit or
+    /// the reserve isn't tracked yet) for `usdc_reserve_id` -- shared by
+    /// the deposit/withdraw cycle logic on both sides (baseline capture
+    /// at write time, read-confirmed check on every subsequent call).
+    fn solend_deposited_amount(&self, usdc_reserve_id: AccountId) -> u64 {
+        self.state
+            .o_solend_position
+            .as_ref()
+            .and_then(|s| s.obligation())
+            .and_then(|ob| ob.deposit_for(usdc_reserve_id))
+            .map(|d| d.deposited_amount)
+            .unwrap_or(0)
+    }
+
+    /// Runs [`Self::CYCLE_TARGET`] real deposit<->withdraw cycles against
+    /// Solend, each one a write (deposit)->read->write (withdraw)->read
+    /// round trip -- see this module's doc comment and `State::cycle_count`
+    /// for why a single pass isn't enough for a meaningful p50/p99.
+    /// "Read confirmed" means the deposited amount moved past the
+    /// baseline captured when this cycle's write was sent (not a plain
+    /// zero/nonzero check -- see `State::cycle_write_baseline_amount`'s
+    /// doc for why).
     fn test_deposit_solend(&mut self) {
         let Some(usdc_reserve_id) = self.solend_usdc_reserve_id() else {
             // Cooldown check *before* logging, not just `test_mark_action`
@@ -4054,67 +4999,98 @@ impl<'a> StateHelper<'a> {
             if self.test_cooldown_active() {
                 return;
             }
-            log_warn!("testperpv1: [3/16] solend USDC reserve not observed yet");
+            log_warn!("testlatencylitev1: [3/16] solend USDC reserve not observed yet");
             self.test_mark_action(); // see test_swap_to_usdc's doc comment for why this matters
             return;
         };
-        let has_deposit = self
-            .state
-            .o_solend_position
-            .as_ref()
-            .and_then(|s| s.obligation())
-            .and_then(|ob| ob.deposit_for(usdc_reserve_id))
-            .is_some_and(|d| d.deposited_amount != 0);
-        if has_deposit {
-            log_warn!("testperpv1: [3/16] solend USDC deposit confirmed on-chain");
+        let deposited_amount = self.solend_deposited_amount(usdc_reserve_id);
+        if self.state.cycle_write_sent_at.is_some()
+            && deposited_amount > self.state.cycle_write_baseline_amount
+        {
+            self.record_cycle_read(TestPhase::DepositSolend);
+            log_warn!(
+                "testlatencylitev1: [3/16] solend USDC deposit confirmed on-chain (cycle {}/{})",
+                self.state.cycle_count + 1,
+                Self::CYCLE_TARGET,
+            );
             self.test_advance(TestPhase::WithdrawSolend);
             return;
         }
         if self.test_cooldown_active() {
             return;
         }
-        if let Some(owner) = self.state.wallet() {
-            let sol_lamports = self.wallet.balance_sol(&owner).unwrap_or(0);
-            let usdc_raw: u64 = self
-                .wallet
-                .token_mut()
-                .balance(&owner, &self.configuration.mint_usdc, true)
-                .iter()
-                .map(|(_, a)| *a)
-                .sum();
-            log_warn!(
-                "testperpv1: [3/16] wallet balances before deposit attempt: {sol_lamports} SOL lamports, {usdc_raw} USDC (raw units)"
-            );
-        }
         log_warn!(
-            "testperpv1: [3/16] depositing ${:.2} USDC into solend",
-            Self::TEST_AMOUNT_USD
+            "testlatencylitev1: [3/16] depositing ${:.2} USDC into solend (cycle {}/{})",
+            Self::TEST_AMOUNT_USD,
+            self.state.cycle_count + 1,
+            Self::CYCLE_TARGET,
         );
+        self.state.cycle_write_baseline_amount = deposited_amount;
         self.deploy_idle_usdc_solend(Self::TEST_AMOUNT_USD);
+        self.state.cycle_write_sent_at = Some(Instant::now());
         self.test_mark_action();
     }
 
-    /// See [`TestPhase`]'s doc comment for why this advances
-    /// unconditionally after a cooldown rather than polling for
-    /// confirmed absence.
+    /// Withdraw half of the Solend deposit<->withdraw cycle -- see
+    /// [`Self::test_deposit_solend`]'s doc comment. Withdraws down to a
+    /// [`Self::CYCLE_DUST_RAW`] remainder rather than the full balance
+    /// (see that constant's doc for why), and is read-confirmed the same
+    /// baseline-comparison way as the deposit half, just in the opposite
+    /// direction. Once [`Self::CYCLE_TARGET`] cycles complete, logs the
+    /// aggregated report and moves on to Kamino; otherwise loops back to
+    /// `DepositSolend` for another cycle.
     fn test_withdraw_solend(&mut self) {
-        if self.state.test_last_action_slot.is_some() {
-            if self.test_cooldown_active() {
-                return;
-            }
+        let Some(usdc_reserve_id) = self.solend_usdc_reserve_id() else {
+            return;
+        };
+        let deposited_amount = self.solend_deposited_amount(usdc_reserve_id);
+        if self.state.cycle_write_sent_at.is_some()
+            && deposited_amount < self.state.cycle_write_baseline_amount
+        {
+            self.record_cycle_read(TestPhase::WithdrawSolend);
+            self.state.cycle_count += 1;
             log_warn!(
-                "testperpv1: [4/16] solend withdraw cooldown elapsed -- proceeding (verify via real \
-                 on-chain state, not this state machine)"
+                "testlatencylitev1: [4/16] solend USDC withdraw confirmed on-chain (cycle {}/{})",
+                self.state.cycle_count,
+                Self::CYCLE_TARGET,
             );
-            self.test_advance(TestPhase::BootstrapKamino);
+            if self.state.cycle_count >= Self::CYCLE_TARGET {
+                self.report_cycle_stats(
+                    "solend",
+                    TestPhase::DepositSolend,
+                    TestPhase::WithdrawSolend,
+                );
+                self.state.cycle_count = 0;
+                // A single-protocol run (`o_target_protocol` set) stops
+                // here rather than cascading into Kamino -- see
+                // `TestProtocol`'s doc comment.
+                let next = if self.state.o_target_protocol.is_some() {
+                    TestPhase::Done
+                } else {
+                    TestPhase::BootstrapKamino
+                };
+                self.test_advance(next);
+            } else {
+                self.test_advance(TestPhase::DepositSolend);
+            }
             return;
         }
-        log_warn!("testperpv1: [4/16] withdrawing USDC from solend");
-        self.test_withdraw_usdc_solend();
+        if self.test_cooldown_active() {
+            return;
+        }
+        log_warn!(
+            "testlatencylitev1: [4/16] withdrawing USDC from solend (cycle {}/{})",
+            self.state.cycle_count + 1,
+            Self::CYCLE_TARGET,
+        );
+        self.state.cycle_write_baseline_amount = deposited_amount;
+        let withdraw_amount = deposited_amount.saturating_sub(Self::CYCLE_DUST_RAW);
+        self.test_withdraw_usdc_solend(withdraw_amount);
+        self.state.cycle_write_sent_at = Some(Instant::now());
         self.test_mark_action();
     }
 
-    fn test_withdraw_usdc_solend(&mut self) {
+    fn test_withdraw_usdc_solend(&mut self, collateral_amount: u64) {
         let Some(owner) = self.state.wallet() else {
             return;
         };
@@ -4143,26 +5119,26 @@ impl<'a> StateHelper<'a> {
         };
 
         if let Err(e) = usdc_reserve.refresh_reserve(usdc_reserve_id, self.wallet) {
-            log_error!("testperpv1: solend withdraw refresh_reserve failed: {e}");
+            log_error!("testlatencylitev1: solend withdraw refresh_reserve failed: {e}");
             return;
         }
         let refresh_reserves = self.solend_refresh_reserves();
         if let Err(e) = solend::refresh_obligation(obligation_id, &refresh_reserves, self.wallet) {
-            log_error!("testperpv1: solend withdraw refresh_obligation failed: {e}");
+            log_error!("testlatencylitev1: solend withdraw refresh_obligation failed: {e}");
             return;
         }
         let deposit_reserves = self.solend_obligation_deposit_reserves();
         if let Err(e) = usdc_reserve.withdraw(
             usdc_reserve_id,
             obligation_id,
-            solend::SOLEND_AMOUNT_MAX,
+            collateral_amount,
             owner,
             usdc_ata,
             usdc_collateral_ata,
             &deposit_reserves,
             self.wallet,
         ) {
-            log_error!("testperpv1: solend withdraw failed: {e}");
+            log_error!("testlatencylitev1: solend withdraw failed: {e}");
         }
     }
 
@@ -4173,18 +5149,32 @@ impl<'a> StateHelper<'a> {
             .as_ref()
             .is_some_and(|s| s.registered())
         {
-            log_warn!("testperpv1: [5/16] kamino obligation confirmed registered on-chain");
+            log_warn!("testlatencylitev1: [5/16] kamino obligation confirmed registered on-chain");
             self.test_advance(TestPhase::DepositKamino);
             return;
         }
         if self.test_cooldown_active() {
             return;
         }
-        log_warn!("testperpv1: [5/16] bootstrapping kamino obligation");
+        log_warn!("testlatencylitev1: [5/16] bootstrapping kamino obligation");
         self.bootstrap_kamino_obligation();
         self.test_mark_action();
     }
 
+    /// See [`Self::solend_deposited_amount`]'s doc comment -- identical
+    /// role, Kamino side.
+    fn kamino_deposited_amount(&self, usdc_reserve_id: AccountId) -> u64 {
+        self.state
+            .o_kamino_position
+            .as_ref()
+            .and_then(|s| s.obligation())
+            .and_then(|ob| ob.deposit_for(usdc_reserve_id))
+            .map(|d| d.deposited_amount)
+            .unwrap_or(0)
+    }
+
+    /// See [`Self::test_deposit_solend`]'s doc comment -- identical shape,
+    /// Kamino side.
     fn test_deposit_kamino(&mut self) {
         let Some(usdc_reserve_id) = self.kamino_usdc_reserve_id() else {
             // See test_deposit_solend's identical branch for why this
@@ -4193,19 +5183,20 @@ impl<'a> StateHelper<'a> {
             if self.test_cooldown_active() {
                 return;
             }
-            log_warn!("testperpv1: [6/16] kamino USDC reserve not observed yet");
+            log_warn!("testlatencylitev1: [6/16] kamino USDC reserve not observed yet");
             self.test_mark_action(); // see test_swap_to_usdc's doc comment for why this matters
             return;
         };
-        let has_deposit = self
-            .state
-            .o_kamino_position
-            .as_ref()
-            .and_then(|s| s.obligation())
-            .and_then(|ob| ob.deposit_for(usdc_reserve_id))
-            .is_some_and(|d| d.deposited_amount != 0);
-        if has_deposit {
-            log_warn!("testperpv1: [6/16] kamino USDC deposit confirmed on-chain");
+        let deposited_amount = self.kamino_deposited_amount(usdc_reserve_id);
+        if self.state.cycle_write_sent_at.is_some()
+            && deposited_amount > self.state.cycle_write_baseline_amount
+        {
+            self.record_cycle_read(TestPhase::DepositKamino);
+            log_warn!(
+                "testlatencylitev1: [6/16] kamino USDC deposit confirmed on-chain (cycle {}/{})",
+                self.state.cycle_count + 1,
+                Self::CYCLE_TARGET,
+            );
             self.test_advance(TestPhase::WithdrawKamino);
             return;
         }
@@ -4213,34 +5204,70 @@ impl<'a> StateHelper<'a> {
             return;
         }
         log_warn!(
-            "testperpv1: [6/16] depositing ${:.2} USDC into kamino",
-            Self::TEST_AMOUNT_USD
+            "testlatencylitev1: [6/16] depositing ${:.2} USDC into kamino (cycle {}/{})",
+            Self::TEST_AMOUNT_USD,
+            self.state.cycle_count + 1,
+            Self::CYCLE_TARGET,
         );
+        self.state.cycle_write_baseline_amount = deposited_amount;
         self.deploy_idle_usdc_kamino(Self::TEST_AMOUNT_USD);
+        self.state.cycle_write_sent_at = Some(Instant::now());
         self.test_mark_action();
     }
 
-    /// See [`TestPhase`]'s doc comment for why this advances
-    /// unconditionally after a cooldown rather than polling for
-    /// confirmed absence.
+    /// See [`Self::test_withdraw_solend`]'s doc comment -- identical
+    /// shape, Kamino side.
     fn test_withdraw_kamino(&mut self) {
-        if self.state.test_last_action_slot.is_some() {
-            if self.test_cooldown_active() {
-                return;
-            }
+        let Some(usdc_reserve_id) = self.kamino_usdc_reserve_id() else {
+            return;
+        };
+        let deposited_amount = self.kamino_deposited_amount(usdc_reserve_id);
+        if self.state.cycle_write_sent_at.is_some()
+            && deposited_amount < self.state.cycle_write_baseline_amount
+        {
+            self.record_cycle_read(TestPhase::WithdrawKamino);
+            self.state.cycle_count += 1;
             log_warn!(
-                "testperpv1: [7/16] kamino withdraw cooldown elapsed -- proceeding (verify via real \
-                 on-chain state, not this state machine)"
+                "testlatencylitev1: [7/16] kamino USDC withdraw confirmed on-chain (cycle {}/{})",
+                self.state.cycle_count,
+                Self::CYCLE_TARGET,
             );
-            self.test_advance(TestPhase::BootstrapMarginfi);
+            if self.state.cycle_count >= Self::CYCLE_TARGET {
+                self.report_cycle_stats(
+                    "kamino",
+                    TestPhase::DepositKamino,
+                    TestPhase::WithdrawKamino,
+                );
+                self.state.cycle_count = 0;
+                // See test_withdraw_solend's identical single-protocol-run
+                // check.
+                let next = if self.state.o_target_protocol.is_some() {
+                    TestPhase::Done
+                } else {
+                    TestPhase::BootstrapMarginfi
+                };
+                self.test_advance(next);
+            } else {
+                self.test_advance(TestPhase::DepositKamino);
+            }
             return;
         }
-        log_warn!("testperpv1: [7/16] withdrawing USDC from kamino");
-        self.test_withdraw_usdc_kamino();
+        if self.test_cooldown_active() {
+            return;
+        }
+        log_warn!(
+            "testlatencylitev1: [7/16] withdrawing USDC from kamino (cycle {}/{})",
+            self.state.cycle_count + 1,
+            Self::CYCLE_TARGET,
+        );
+        self.state.cycle_write_baseline_amount = deposited_amount;
+        let withdraw_amount = deposited_amount.saturating_sub(Self::CYCLE_DUST_RAW);
+        self.test_withdraw_usdc_kamino(withdraw_amount);
+        self.state.cycle_write_sent_at = Some(Instant::now());
         self.test_mark_action();
     }
 
-    fn test_withdraw_usdc_kamino(&mut self) {
+    fn test_withdraw_usdc_kamino(&mut self, collateral_amount: u64) {
         let Some(owner) = self.state.wallet() else {
             return;
         };
@@ -4271,7 +5298,7 @@ impl<'a> StateHelper<'a> {
             usdc_reserve.scope_prices,
             self.wallet,
         ) {
-            log_error!("testperpv1: kamino withdraw refresh_reserve failed: {e}");
+            log_error!("testlatencylitev1: kamino withdraw refresh_reserve failed: {e}");
             return;
         }
         let (deposit_reserves, borrow_reserves) = self.kamino_refresh_reserves();
@@ -4282,7 +5309,7 @@ impl<'a> StateHelper<'a> {
             &borrow_reserves,
             self.wallet,
         ) {
-            log_error!("testperpv1: kamino withdraw refresh_obligation failed: {e}");
+            log_error!("testlatencylitev1: kamino withdraw refresh_obligation failed: {e}");
             return;
         }
         if !self.ensure_kamino_farm_ready(
@@ -4302,21 +5329,22 @@ impl<'a> StateHelper<'a> {
         if let Err(e) = usdc_reserve.withdraw(
             usdc_reserve_id,
             obligation_id,
-            kamino::KAMINO_AMOUNT_MAX,
+            collateral_amount,
             owner,
             usdc_ata,
             self.wallet,
         ) {
-            log_error!("testperpv1: kamino withdraw failed: {e}");
-            return;
+            log_error!("testlatencylitev1: kamino withdraw failed: {e}");
         }
-        // Withdrawing the entire (only) deposit with no borrows
-        // outstanding closes the real Kamino obligation account -- see
-        // `KaminoPosition::mark_obligation_closing`'s doc comment for why
-        // this can't be detected reactively via `on_account` instead.
-        if let Some(pos) = self.state.o_kamino_position.as_mut() {
-            pos.mark_obligation_closing();
-        }
+        // Unlike the old full/`KAMINO_AMOUNT_MAX` withdrawal this replaced,
+        // this leaves `CYCLE_DUST_RAW` behind on purpose (see that
+        // constant's doc comment) specifically so the obligation does NOT
+        // close -- so, unlike that old code, this must NOT call
+        // `mark_obligation_closing()`. Doing so would zero out the tracked
+        // `o_obligation` immediately, making `kamino_deposited_amount`
+        // read 0 regardless of real on-chain state and falsely "confirm"
+        // the withdraw before it actually lands -- corrupting the very
+        // latency number this cycle exists to measure.
     }
 
     fn test_bootstrap_marginfi(&mut self) {
@@ -4326,18 +5354,25 @@ impl<'a> StateHelper<'a> {
             .as_ref()
             .is_some_and(|s| s.registered())
         {
-            log_warn!("testperpv1: [8/16] marginfi account confirmed registered on-chain");
+            log_warn!("testlatencylitev1: [8/16] marginfi account confirmed registered on-chain");
             self.test_advance(TestPhase::DepositMarginfi);
             return;
         }
         if self.test_cooldown_active() {
             return;
         }
-        log_warn!("testperpv1: [8/16] bootstrapping marginfi account");
+        log_warn!("testlatencylitev1: [8/16] bootstrapping marginfi account");
         self.bootstrap_marginfi_account();
         self.test_mark_action();
     }
 
+    /// See [`Self::test_deposit_solend`]'s doc comment for the general
+    /// cycle shape. Marginfi is simpler than Solend/Kamino here: its
+    /// `MarginfiAccount` is documented as NOT closed by a full withdrawal
+    /// (no explicit `close` instruction is ever called against it), so
+    /// there's no dust/baseline dance needed -- a plain "is there a
+    /// deposit at all" check is already unambiguous across repeated
+    /// cycles, same as the original single-pass version used.
     fn test_deposit_marginfi(&mut self) {
         let Some(usdc_bank_id) = self.marginfi_usdc_bank_id() else {
             // See test_deposit_solend's identical branch for why this
@@ -4346,7 +5381,7 @@ impl<'a> StateHelper<'a> {
             if self.test_cooldown_active() {
                 return;
             }
-            log_warn!("testperpv1: [9/16] marginfi USDC bank not observed yet");
+            log_warn!("testlatencylitev1: [9/16] marginfi USDC bank not observed yet");
             self.test_mark_action(); // see test_swap_to_usdc's doc comment for why this matters
             return;
         };
@@ -4357,8 +5392,13 @@ impl<'a> StateHelper<'a> {
             .and_then(|s| s.lending_account())
             .and_then(|la| la.deposit_for(usdc_bank_id))
             .is_some();
-        if has_deposit {
-            log_warn!("testperpv1: [9/16] marginfi USDC deposit confirmed on-chain");
+        if self.state.cycle_write_sent_at.is_some() && has_deposit {
+            self.record_cycle_read(TestPhase::DepositMarginfi);
+            log_warn!(
+                "testlatencylitev1: [9/16] marginfi USDC deposit confirmed on-chain (cycle {}/{})",
+                self.state.cycle_count + 1,
+                Self::CYCLE_TARGET,
+            );
             self.test_advance(TestPhase::WithdrawMarginfi);
             return;
         }
@@ -4366,32 +5406,73 @@ impl<'a> StateHelper<'a> {
             return;
         }
         log_warn!(
-            "testperpv1: [9/16] depositing ${:.2} USDC into marginfi",
-            Self::TEST_AMOUNT_USD
+            "testlatencylitev1: [9/16] depositing ${:.2} USDC into marginfi (cycle {}/{})",
+            Self::TEST_AMOUNT_USD,
+            self.state.cycle_count + 1,
+            Self::CYCLE_TARGET,
         );
         self.deploy_idle_usdc_marginfi(Self::TEST_AMOUNT_USD);
+        self.state.cycle_write_sent_at = Some(Instant::now());
         self.test_mark_action();
     }
 
-    /// See [`TestPhase`]'s doc comment for why this advances
-    /// unconditionally after a cooldown rather than polling for confirmed
-    /// absence -- kept consistent with Solend/Kamino's withdraw phases,
-    /// even though marginfi's own `MarginfiAccount` isn't actually closed
-    /// by a full withdrawal (see the same doc comment's note on this).
+    /// See [`Self::test_withdraw_solend`]'s doc comment for the general
+    /// cycle shape -- no dust remainder needed here (see
+    /// [`Self::test_deposit_marginfi`]'s doc comment), so this withdraws
+    /// the full deposit every cycle, same as the original single-pass
+    /// version.
     fn test_withdraw_marginfi(&mut self) {
-        if self.state.test_last_action_slot.is_some() {
-            if self.test_cooldown_active() {
-                return;
-            }
+        let Some(usdc_bank_id) = self.marginfi_usdc_bank_id() else {
+            return;
+        };
+        let has_deposit = self
+            .state
+            .o_marginfi_position
+            .as_ref()
+            .and_then(|s| s.lending_account())
+            .and_then(|la| la.deposit_for(usdc_bank_id))
+            .is_some();
+        if self.state.cycle_write_sent_at.is_some() && !has_deposit {
+            self.record_cycle_read(TestPhase::WithdrawMarginfi);
+            self.state.cycle_count += 1;
             log_warn!(
-                "testperpv1: [10/16] marginfi withdraw cooldown elapsed -- proceeding (verify via real \
-                 on-chain state, not this state machine)"
+                "testlatencylitev1: [10/16] marginfi USDC withdraw confirmed on-chain (cycle {}/{})",
+                self.state.cycle_count,
+                Self::CYCLE_TARGET,
             );
-            self.test_advance(TestPhase::BorrowSolend);
+            if self.state.cycle_count >= Self::CYCLE_TARGET {
+                self.report_cycle_stats(
+                    "marginfi",
+                    TestPhase::DepositMarginfi,
+                    TestPhase::WithdrawMarginfi,
+                );
+                self.state.cycle_count = 0;
+                // See test_withdraw_solend's identical single-protocol-run
+                // check. Marginfi is last in the deposit/withdraw chain,
+                // so the unset/full-sequence case still falls through into
+                // the (out-of-scope-for-cycling, single-pass) borrow/repay
+                // phases exactly as before.
+                let next = if self.state.o_target_protocol.is_some() {
+                    TestPhase::Done
+                } else {
+                    TestPhase::BorrowSolend
+                };
+                self.test_advance(next);
+            } else {
+                self.test_advance(TestPhase::DepositMarginfi);
+            }
             return;
         }
-        log_warn!("testperpv1: [10/16] withdrawing USDC from marginfi");
+        if self.test_cooldown_active() {
+            return;
+        }
+        log_warn!(
+            "testlatencylitev1: [10/16] withdrawing USDC from marginfi (cycle {}/{})",
+            self.state.cycle_count + 1,
+            Self::CYCLE_TARGET,
+        );
         self.test_withdraw_usdc_marginfi();
+        self.state.cycle_write_sent_at = Some(Instant::now());
         self.test_mark_action();
     }
 
@@ -4436,7 +5517,7 @@ impl<'a> StateHelper<'a> {
             &other_active_banks,
             self.wallet,
         ) {
-            log_error!("testperpv1: marginfi withdraw failed: {e}");
+            log_error!("testlatencylitev1: marginfi withdraw failed: {e}");
         }
     }
 
@@ -4476,7 +5557,7 @@ impl<'a> StateHelper<'a> {
             if self.test_cooldown_active() {
                 return;
             }
-            log_warn!("testperpv1: [11/16] solend SOL reserve not observed yet");
+            log_warn!("testlatencylitev1: [11/16] solend SOL reserve not observed yet");
             self.test_mark_action(); // see test_swap_to_usdc's doc comment for why this matters
             return;
         };
@@ -4488,7 +5569,7 @@ impl<'a> StateHelper<'a> {
             .and_then(|ob| ob.borrow_for(reserve_id))
             .is_some_and(|b| b.borrowed_amount != 0);
         if has_borrow {
-            log_warn!("testperpv1: [11/16] solend SOL borrow confirmed on-chain");
+            log_warn!("testlatencylitev1: [11/16] solend SOL borrow confirmed on-chain");
             self.test_advance(TestPhase::RepaySolend);
             return;
         }
@@ -4496,7 +5577,7 @@ impl<'a> StateHelper<'a> {
             return;
         }
         log_warn!(
-            "testperpv1: [11/16] opening ${:.2} SOL borrow-hedge on solend",
+            "testlatencylitev1: [11/16] opening ${:.2} SOL borrow-hedge on solend",
             Self::TEST_AMOUNT_USD
         );
         self.open_solend_borrow_leg("SOL", Self::TEST_AMOUNT_USD);
@@ -4520,14 +5601,14 @@ impl<'a> StateHelper<'a> {
             .and_then(|ob| ob.borrow_for(reserve_id))
             .is_some_and(|b| b.borrowed_amount != 0);
         if !has_borrow {
-            log_warn!("testperpv1: [12/16] solend SOL repay confirmed on-chain");
+            log_warn!("testlatencylitev1: [12/16] solend SOL repay confirmed on-chain");
             self.test_advance(TestPhase::BorrowKamino);
             return;
         }
         if self.test_cooldown_active() {
             return;
         }
-        log_warn!("testperpv1: [12/16] repaying SOL borrow on solend");
+        log_warn!("testlatencylitev1: [12/16] repaying SOL borrow on solend");
         self.close_solend_borrow_leg("SOL");
         self.test_mark_action();
     }
@@ -4543,7 +5624,7 @@ impl<'a> StateHelper<'a> {
             if self.test_cooldown_active() {
                 return;
             }
-            log_warn!("testperpv1: [13/16] kamino SOL reserve not observed yet");
+            log_warn!("testlatencylitev1: [13/16] kamino SOL reserve not observed yet");
             self.test_mark_action(); // see test_swap_to_usdc's doc comment for why this matters
             return;
         };
@@ -4555,7 +5636,7 @@ impl<'a> StateHelper<'a> {
             .and_then(|ob| ob.borrow_for(reserve_id))
             .is_some_and(|b| b.borrowed_amount != 0);
         if has_borrow {
-            log_warn!("testperpv1: [13/16] kamino SOL borrow confirmed on-chain");
+            log_warn!("testlatencylitev1: [13/16] kamino SOL borrow confirmed on-chain");
             self.test_advance(TestPhase::RepayKamino);
             return;
         }
@@ -4563,7 +5644,7 @@ impl<'a> StateHelper<'a> {
             return;
         }
         log_warn!(
-            "testperpv1: [13/16] opening ${:.2} SOL borrow-hedge on kamino",
+            "testlatencylitev1: [13/16] opening ${:.2} SOL borrow-hedge on kamino",
             Self::TEST_AMOUNT_USD
         );
         self.open_kamino_borrow_leg("SOL", Self::TEST_AMOUNT_USD);
@@ -4584,14 +5665,14 @@ impl<'a> StateHelper<'a> {
             .and_then(|ob| ob.borrow_for(reserve_id))
             .is_some_and(|b| b.borrowed_amount != 0);
         if !has_borrow {
-            log_warn!("testperpv1: [14/16] kamino SOL repay confirmed on-chain");
+            log_warn!("testlatencylitev1: [14/16] kamino SOL repay confirmed on-chain");
             self.test_advance(TestPhase::BorrowMarginfi);
             return;
         }
         if self.test_cooldown_active() {
             return;
         }
-        log_warn!("testperpv1: [14/16] repaying SOL borrow on kamino");
+        log_warn!("testlatencylitev1: [14/16] repaying SOL borrow on kamino");
         self.close_kamino_borrow_leg("SOL");
         self.test_mark_action();
     }
@@ -4616,7 +5697,7 @@ impl<'a> StateHelper<'a> {
     /// a valid, complete state) so the rest of the test can still
     /// confirm end-to-end, per explicit direction.
     fn test_borrow_marginfi(&mut self) {
-        log_warn!("testperpv1: [15/16] skipping marginfi SOL borrow-hedge (depends on an external Switchboard crank, see doc comment above)");
+        log_warn!("testlatencylitev1: [15/16] skipping marginfi SOL borrow-hedge (depends on an external Switchboard crank, see doc comment above)");
         self.test_advance(TestPhase::RepayMarginfi);
     }
 
@@ -4636,7 +5717,7 @@ impl<'a> StateHelper<'a> {
             .is_some();
         if !has_borrow {
             log_warn!(
-                "testperpv1: [16/16] marginfi SOL repay confirmed on-chain -- test complete (verify via real \
+                "testlatencylitev1: [16/16] marginfi SOL repay confirmed on-chain -- test complete (verify via real \
                  on-chain state, not this state machine)"
             );
             self.test_advance(TestPhase::Done);
@@ -4645,9 +5726,1033 @@ impl<'a> StateHelper<'a> {
         if self.test_cooldown_active() {
             return;
         }
-        log_warn!("testperpv1: [16/16] repaying SOL borrow on marginfi");
+        log_warn!("testlatencylitev1: [16/16] repaying SOL borrow on marginfi");
         self.close_marginfi_borrow_leg("SOL");
         self.test_mark_action();
+    }
+
+    /// Lamports moved on every native-transfer round trip after the
+    /// first. Deliberately small, same reasoning as `TEST_AMOUNT_USD`
+    /// elsewhere in this file -- this only needs to prove the round trip
+    /// works and produce a measurable balance delta, not move meaningful
+    /// value.
+    const NATIVE_TRANSFER_LAMPORTS: u64 = 1_000_000;
+    /// Extra lamports wallet 2 gets on top of `NATIVE_TRANSFER_LAMPORTS`
+    /// in its one-time initial funding transfer (transfer #1), kept
+    /// permanently (never sent back) as a fee cushion for the ~50
+    /// transfers wallet 2 will send as the *sender* over the full 100-
+    /// transfer run. 50 transfers x a real Solana base fee (5,000
+    /// lamports) is 250,000 lamports; this is a generous multiple of
+    /// that, not a tight budget.
+    const NATIVE_WALLET2_FEE_BUFFER_LAMPORTS: u64 = 2_000_000;
+    /// Real Solana base fee, lamports per required signature on a
+    /// transaction -- same value `NATIVE_WALLET2_FEE_BUFFER_LAMPORTS`'s
+    /// own doc comment already cites. Used to correct
+    /// `NativePending::expected_lamports` when `owner` (this wallet's
+    /// permanent fee payer, see that field's doc comment) is the
+    /// transfer's recipient: `owner` also pays this fee on that same
+    /// transaction, so its real balance gain is short of the raw transfer
+    /// amount by `signature_count * SOLANA_BASE_FEE_LAMPORTS`.
+    const SOLANA_BASE_FEE_LAMPORTS: u64 = 5_000;
+    /// Total transfers to run (see this module's doc comment / the
+    /// gitlab issue this closes) -- the *first* of these is wallet 2's
+    /// own funding transfer, not a separate bootstrap step.
+    ///
+    /// Temporarily lowered 2026-09-04 (was 100) for a quick real-run
+    /// check of the same-slot write/read fix + tip-aware balance check,
+    /// without spending a full 100-transfer's worth of real Astralane
+    /// tips on it. Restore to 100 for the real full run.
+    const NATIVE_TRANSFER_TARGET: u32 = 20;
+
+    /// Lazily derives and registers the second native-transfer wallet the
+    /// first time it's needed. Deterministic (HKDF-SHA256 over the
+    /// primary child wallet's own secret seed, domain-separated by a
+    /// fixed info string), not random -- so it needs no host-side
+    /// coordination or persistence: recomputing it from the same child
+    /// key always yields the same keypair, same reasoning
+    /// `contrib/derive-child-key` relies on for the parent->child
+    /// derivation on the Go side (see that tool's doc comment). Returns
+    /// the registered `AccountId`, or `None` if the primary wallet keypair
+    /// hasn't arrived from the Go host yet (`Configuration::set`'s
+    /// `Wallet` message arm).
+    fn ensure_native_second_wallet(&mut self) -> Option<AccountId> {
+        if let Some(id) = self.state.o_second_wallet {
+            return Some(id);
+        }
+        let primary = self.state.o_rc_keypair.as_ref()?;
+        let seed = {
+            let kp = rc_unlock(&primary.rc_keypair);
+            let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, kp.secret_bytes());
+            let mut seed = [0u8; 32];
+            hk.expand(b"testlatencylitev1-native-wallet2", &mut seed)
+                .expect("32-byte HKDF expand output is always valid");
+            seed
+        };
+        let keypair = Rc::new(UnsafeCell::new(Keypair::new_from_array(seed)));
+        let id = self.wallet.append_key(keypair, self.graph).ok()?;
+        self.state.o_second_wallet = Some(id);
+        log_warn!(
+            "testlatencylitev1: native transfer test -- derived second wallet {} for real SOL round trips",
+            id
+        );
+        Some(id)
+    }
+
+    /// Queues one final transaction draining both native-transfer test
+    /// wallets' remaining SOL back to the real mothership/parent wallet
+    /// (the account this whole run was funded from) -- called exactly
+    /// once, from `test_native_transfer_loop`'s `native_transfer_count >=
+    /// NATIVE_TRANSFER_TARGET` branch (see `State::native_swept`'s doc
+    /// comment for why this run previously just left both wallets funded
+    /// forever instead).
+    ///
+    /// Two transfers in one transaction, in order: `wallet2 -> owner`
+    /// (drains wallet2's leftover -- normally just
+    /// `NATIVE_WALLET2_FEE_BUFFER_LAMPORTS`, the funding buffer from
+    /// transfer 1 that an even `NATIVE_TRANSFER_TARGET` never sends back),
+    /// then `owner -> mothership` for everything owner now has, less this
+    /// transaction's own real fee. Both amounts are computed off-chain
+    /// from this guest's own cached balances (`Wallet::balance_sol`), not
+    /// derived on-chain -- correct as long as those caches are fresh,
+    /// which they are here (nothing else touches either wallet between
+    /// the 20th confirmed transfer and this call). Best-effort: no
+    /// confirmation tracking, no retry -- if it fails to land, the same
+    /// manual recovery this was added to avoid (deterministic re-
+    /// derivation of `owner`'s key from the real parent key, see this
+    /// field's own doc comment) is still available as a fallback.
+    fn sweep_native_wallets(&mut self) {
+        let Ok(mothership_str) = std::env::var(crate::message::ENV_MOTHERSHIP_PUBKEY) else {
+            log_warn!(
+                "testlatencylitev1: native transfer sweep skipped -- {} env var not set",
+                crate::message::ENV_MOTHERSHIP_PUBKEY,
+            );
+            return;
+        };
+        let Ok(mothership_pk) = Pubkey::try_from(mothership_str.as_str()) else {
+            log_warn!(
+                "testlatencylitev1: native transfer sweep skipped -- couldn't parse {} ({mothership_str})",
+                crate::message::ENV_MOTHERSHIP_PUBKEY,
+            );
+            return;
+        };
+        let Some(owner) = self.state.wallet() else {
+            return;
+        };
+        let Some(owner_pk) = pubkey_from_account_id(&owner) else {
+            return;
+        };
+        let owner_balance = self.wallet.balance_sol(&owner).unwrap_or(0);
+        let wallet2 = self.state.o_second_wallet;
+        let (wallet2_balance, wallet2_pk) = match wallet2 {
+            Some(id) => (
+                self.wallet.balance_sol(&id).unwrap_or(0),
+                pubkey_from_account_id(&id),
+            ),
+            None => (0, None),
+        };
+        // 2 signatures (owner as fee payer + wallet2 as the first
+        // instruction's own required signer) whenever wallet2 has
+        // anything to sweep, else just 1 (owner alone). 10,000 CU total
+        // (5,000 per transfer instruction) when both legs run, else
+        // 5,000 for owner's alone -- same `priority_fee_lamports` formula
+        // `owner_overhead` above uses, no Astralane tip (this sweep
+        // doesn't need bundled speed).
+        let sweep_wallet2 = wallet2_balance > 0 && wallet2_pk.is_some();
+        let signature_count = if sweep_wallet2 { 2 } else { 1 };
+        let transfer_compute = if sweep_wallet2 { 10_000 } else { 5_000 };
+        let reserve = signature_count * Self::SOLANA_BASE_FEE_LAMPORTS
+            + self.wallet.priority_fee_lamports(transfer_compute);
+        let combined = owner_balance + wallet2_balance;
+        if combined <= reserve {
+            log_warn!(
+                "testlatencylitev1: native transfer sweep skipped -- {} owner + {} wallet2 lamports isn't enough to cover this transaction's own {} lamport fee/priority-fee reserve",
+                owner_balance,
+                wallet2_balance,
+                reserve,
+            );
+            return;
+        }
+        let sweep_amount = combined - reserve;
+        if sweep_wallet2 {
+            let wallet2_pk = wallet2_pk.expect("checked by sweep_wallet2 above");
+            self.wallet.require_signer(
+                wallet2.expect("sweep_wallet2 implies wallet2 is Some"),
+            );
+            self.wallet
+                .append_ix(system_transfer(&wallet2_pk, &owner_pk, wallet2_balance), 5_000);
+        }
+        self.wallet.require_signer(owner);
+        self.wallet.append_ix(
+            system_transfer(&owner_pk, &mothership_pk, sweep_amount),
+            5_000,
+        );
+        log_warn!(
+            "testlatencylitev1: native transfer sweep queued -- {} lamports ({} owner + {} wallet2, less {} reserved for this tx's own fee) -> mothership {}",
+            sweep_amount,
+            owner_balance,
+            wallet2_balance,
+            reserve,
+            mothership_pk,
+        );
+    }
+
+    /// Records one native-transfer write->read sample under `lane` and
+    /// hands back the elapsed time -- shared by all three detection
+    /// points (`low_latency`, the `CommitHook::on_account` rooted path,
+    /// and `mid_on_tx`'s `Event::Transaction` path), each passing the
+    /// real on-chain slot their own update carries as `inclusion_slot`
+    /// (an account's `header.slot`, or the confirmed transaction's own
+    /// `Ok(slot)` result). Takes `state.o_native_pending` (see that
+    /// field's doc comment for why `take()` is the right primitive here:
+    /// only the first caller to observe the balance change gets a `Some`
+    /// back, so a transfer can never be double-counted across lanes or
+    /// advance the loop twice).
+    ///
+    /// Beyond the total send->observed latency (unchanged from before),
+    /// this now also splits that total into write delay (send ->
+    /// `inclusion_slot`, looked up against this guest's own real slot
+    /// clock -- see `State::slot_clock`) and read delay (`inclusion_slot`
+    /// -> observed) -- see [`NativeTransferSample`] for what each field
+    /// means and why this split exists.
+    fn record_native_read(
+        &mut self,
+        lane: UpdateLane,
+        inclusion_slot: Slot,
+    ) -> Option<std::time::Duration> {
+        let pending = self.state.o_native_pending.take()?;
+        let elapsed = pending.sent_at.elapsed();
+        self.state
+            .native_read_latency
+            .entry(lane)
+            .or_default()
+            .record(elapsed);
+        self.state.native_transfer_count += 1;
+
+        let slots_until_inclusion = inclusion_slot.saturating_sub(pending.send_slot);
+        // Anchored on `FirstShredReceived` -- the earliest evidence this
+        // guest (a downstream observer, not the leader) ever gets that
+        // `inclusion_slot`'s block exists at all. `write_delay` answers
+        // "how long from send until the leader saw/included this
+        // transfer" as best this guest can measure it -- a genuine
+        // *lower* bound, since the leader must have already included it
+        // by the time any shred reaches us. Only a real, *positive*
+        // measured duration counts as resolved -- `Instant::duration_since`
+        // silently saturates a same-or-earlier instant to `Duration::ZERO`
+        // instead of signaling "unresolvable", which previously produced
+        // a fake `write_delay = Some(0)` here (see
+        // `NativeTransferSample::write_delay`'s doc comment for the real
+        // user-caught bug this was). `None` here is a real "we can't
+        // resolve this", not "it took zero time".
+        let write_delay = self
+            .instant_for_slot(inclusion_slot)
+            .and_then(|t| (t > pending.sent_at).then(|| t.duration_since(pending.sent_at)));
+        // Only computed (and only meaningful) when `write_delay` didn't
+        // resolve at all -- see `NativeTransferSample::write_delay_upper_bound`'s
+        // doc comment for what this actually bounds and why.
+        let write_delay_upper_bound = if write_delay.is_none() {
+            self.instant_after_slot(inclusion_slot)
+                .map(|t| t.saturating_duration_since(pending.sent_at))
+        } else {
+            None
+        };
+        // Real, measured, purely-informational breakdown of what happens
+        // between `FirstShredReceived` and this guest's own observation
+        // -- none of these three are subtracted from `read_delay` (see
+        // that field's doc comment); they're sub-stages of it, reported
+        // here for transparency into what it's made of.
+        let shred_to_completed = match (
+            self.instant_for_slot(inclusion_slot),
+            self.completed_instant_for_slot(inclusion_slot),
+        ) {
+            (Some(a), Some(b)) if b > a => Some(b.duration_since(a)),
+            _ => None,
+        };
+        let completed_to_processed = match (
+            self.completed_instant_for_slot(inclusion_slot),
+            self.processed_instant_for_slot(inclusion_slot),
+        ) {
+            (Some(a), Some(b)) if b > a => Some(b.duration_since(a)),
+            _ => None,
+        };
+        let processed_to_confirmed = match (
+            self.processed_instant_for_slot(inclusion_slot),
+            self.confirmed_instant_for_slot(inclusion_slot),
+        ) {
+            (Some(a), Some(b)) if b > a => Some(b.duration_since(a)),
+            _ => None,
+        };
+        // Never derived as `total - 0` for an unresolved write delay --
+        // `None` propagates straight through, so an unresolved write
+        // delay always yields an unresolved read delay too. `checked_sub`
+        // (not `saturating_sub`) -- a real sanity check: if a write delay
+        // somehow exceeded `elapsed`, that's a genuine inconsistency
+        // worth surfacing as `None`, not silently clamping to zero.
+        let read_delay = write_delay.and_then(|w| elapsed.checked_sub(w));
+        // Register this sample for `tx_index` backfill (see
+        // `State::m_native_tx_index`'s doc comment for why this can't just
+        // reuse `o_native_pending`/`is_current_pending`) -- before the push
+        // below, so the recorded index (`native_samples.len()`) is exactly
+        // where the new sample is about to land.
+        if let Some(sig) = pending.sig {
+            self.state
+                .m_native_tx_index
+                .insert(sig, self.state.native_samples.len());
+        }
+        self.state.native_samples.push(NativeTransferSample {
+            send_slot: pending.send_slot,
+            inclusion_slot,
+            slots_until_inclusion,
+            write_delay,
+            write_delay_upper_bound,
+            read_delay,
+            total_latency: elapsed,
+            lane,
+            shred_to_completed,
+            completed_to_processed,
+            processed_to_confirmed,
+            tx_index: None,
+        });
+
+        log_warn!(
+            "testlatencylitev1: native transfer {}/{} confirmed via {:?} -- sig={} send_slot={} inclusion_slot={} slots={} write={} read={} total={}µs shred->completed={} completed->processed={} processed->confirmed={}",
+            self.state.native_transfer_count,
+            Self::NATIVE_TRANSFER_TARGET,
+            lane,
+            pending
+                .sig
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            pending.send_slot,
+            inclusion_slot,
+            slots_until_inclusion,
+            match (write_delay, write_delay_upper_bound) {
+                (Some(d), _) => format!("{}µs", d.as_micros()),
+                (None, Some(b)) => format!("unknown (<={}µs)", b.as_micros()),
+                (None, None) => "unknown".to_string(),
+            },
+            read_delay
+                .map(|d| format!("{}µs", d.as_micros()))
+                .unwrap_or_else(|| "unknown".to_string()),
+            elapsed.as_micros(),
+            shred_to_completed
+                .map(|d| format!("{}µs", d.as_micros()))
+                .unwrap_or_else(|| "unknown".to_string()),
+            completed_to_processed
+                .map(|d| format!("{}µs", d.as_micros()))
+                .unwrap_or_else(|| "unknown".to_string()),
+            processed_to_confirmed
+                .map(|d| format!("{}µs", d.as_micros()))
+                .unwrap_or_else(|| "unknown".to_string()),
+        );
+        Some(elapsed)
+    }
+
+    /// Checks whether `account_id`'s new balance satisfies a pending
+    /// native transfer's recipient, and if so, claims it under `lane`.
+    /// Called from all three real update paths with that path's own
+    /// `UpdateLane` tag and the slot the update itself carries (`slot` --
+    /// see [`NativeTransferSample::inclusion_slot`]'s doc comment for why
+    /// this is the real on-chain inclusion slot, not just a timestamp). A
+    /// no-op (cheap `Option`/equality checks only) whenever there's no
+    /// pending native transfer or `account_id` isn't its recipient, so
+    /// this is safe to call unconditionally from the hot
+    /// `low_latency`/`on_account` paths without gating on `test_phase`
+    /// first.
+    ///
+    /// Also requires `slot >= pending.send_slot` -- necessary, not just
+    /// defensive: real, live-verified 2026-09-02 that every single one of
+    /// 20 `Commit`-lane "wins" in one run had an `inclusion_slot` *before*
+    /// `send_slot`, and (cross-checked against the transaction's own
+    /// independently-logged real landing time in `mid_on_tx`) every one
+    /// of them claimed the transfer before it had actually landed
+    /// on-chain. Cause: `Commit`'s rooted-tier snapshot is *always* a few
+    /// dozen slots stale by construction (Solana needs ~32 confirmations
+    /// to root a block) -- an old, already-superseded balance reading
+    /// that happens to already clear `expected_lamports` (via oscillation
+    /// or drift from unrelated transfers) gets credited as if it were a
+    /// fresh confirmation of the transfer just sent. Requiring the
+    /// update's own slot to be no earlier than the send is what actually
+    /// rules that out; the amount check alone (below) can't.
+    fn check_native_transfer_arrival(
+        &mut self,
+        account_id: AccountId,
+        slot: Slot,
+        lane: UpdateLane,
+    ) {
+        let Some(pending) = self.state.o_native_pending else {
+            return;
+        };
+        let Some(watch) = pending.watches.iter().find(|w| w.account == account_id) else {
+            return;
+        };
+        if slot < pending.send_slot {
+            return;
+        }
+        let Some(now_lamports) = self.wallet.balance_sol(&account_id) else {
+            return;
+        };
+        // Direction-aware exact match -- see `NativeWatch::delta_lamports`'s
+        // doc comment for why this must be the *exact* threshold, not just
+        // "moved in the right direction".
+        let matched = if watch.delta_lamports >= 0 {
+            now_lamports >= watch.baseline_lamports.saturating_add(watch.delta_lamports as u64)
+        } else {
+            now_lamports
+                <= watch
+                    .baseline_lamports
+                    .saturating_sub(watch.delta_lamports.unsigned_abs())
+        };
+        if !matched {
+            return;
+        }
+        self.record_native_read(lane, slot);
+    }
+
+    /// The real state machine for `TestProtocol::Native`: send, wait for
+    /// a read via whichever real update channel wins the race, send the
+    /// other way, repeat -- for `NATIVE_TRANSFER_TARGET` (100) real
+    /// System Program transfers total, alternating direction between two
+    /// wallets. Deliberately protocol-agnostic: no lending-protocol
+    /// accounts, no USDC, no bootstrap step -- just `Wallet`'s own SOL-
+    /// balance tracking (`Wallet::on_account`, already fed by both
+    /// `low_latency` and the `CommitHook::on_account` rooted path in this
+    /// module) and a plain `solana_system_interface::instruction::transfer`.
+    ///
+    /// Why the winning lane can't be predicted in advance: `evaluate()`
+    /// (which is what would notice "the recipient's balance went up")
+    /// runs after *every* event type, and both `Event::LowLatency` and
+    /// `Event::Commit` feed the exact same `Wallet::on_account` update --
+    /// whichever event happens to deliver the change first is the one
+    /// `check_native_transfer_arrival` sees it through. `Event::Transaction`
+    /// is a third, independent path (this module's existing
+    /// `m_sig`/`tx_latency` signature-correlation, extended below to also
+    /// claim `o_native_pending` when it wins). See `UpdateLane`'s own doc
+    /// comment.
+    fn test_native_transfer_loop(&mut self) {
+        // A transfer is still in flight. Normally one of `low_latency`,
+        // the commit hook, or `mid_on_tx` will claim `o_native_pending`
+        // and this phase picks back up on the next `evaluate()` call
+        // after that happens -- but if it never gets confirmed (dropped,
+        // expired blockhash, or landed with an on-chain error, which
+        // `mid_on_tx` currently skips silently rather than clearing
+        // `o_native_pending`), nothing else will ever un-stick this
+        // phase. So: same cooldown-gated resend the Solend/Kamino/
+        // Marginfi deposit/withdraw phases already use for exactly this
+        // reason -- wait `TEST_ACTION_COOLDOWN_SLOTS`, then fall through
+        // and resend (recomputing the identical from/to/amount below,
+        // since `native_transfer_count` only advances on confirmation).
+        if self.state.o_native_pending.is_some() {
+            if self.test_cooldown_active() {
+                return;
+            }
+            log_warn!(
+                "testlatencylitev1: native transfer {}/{} unconfirmed after {} slots -- retrying",
+                self.state.native_transfer_count + 1,
+                Self::NATIVE_TRANSFER_TARGET,
+                Self::TEST_ACTION_COOLDOWN_SLOTS,
+            );
+        }
+        if self.state.native_transfer_count >= Self::NATIVE_TRANSFER_TARGET {
+            if !self.state.native_swept {
+                self.sweep_native_wallets();
+                self.state.native_swept = true;
+            }
+            self.report_native_stats();
+            self.test_advance(TestPhase::Done);
+            return;
+        }
+        // Wait for the Astralane bundler tip broadcaster's first real
+        // status (up or down) before ever sending transfer 1 -- real,
+        // live-verified 2026-09-04: this guest's very first tip update
+        // attempt always fails Go-side ("bot not connected yet", an
+        // inherent chicken/egg at boot -- see `Wallet::has_bundler_status`'s
+        // doc comment), so if this phase sends transfer 1 fast enough, it
+        // wins a race it has no reason to run: the transfer falls back to
+        // a slower, non-bundled send purely because it looked before the
+        // broadcaster's next scheduled push had a chance to land, not
+        // because Astralane was actually unavailable. Only gates the
+        // very first transfer -- once real status exists (or this wait
+        // times out, for a deployment with no bundler configured at
+        // all), every later send already sees whatever's current.
+        //
+        // A real wall-clock `Instant` budget (`BUNDLER_STATUS_WAIT_SECS`),
+        // not the slot-based `test_cooldown_active`/`test_last_action_slot`
+        // this used at first -- real, live bug 2026-09-04: `last_slot`
+        // (rooted/Commit tier) is still `0` this early in a run, and the
+        // moment the first real Commit event arrives and jumps it to a
+        // real slot number in the hundreds of millions, a slot-based
+        // cooldown gets blown through instantly, so that version never
+        // actually waited at all. See `o_bundler_wait_started`'s own doc
+        // comment.
+        if self.state.native_transfer_count == 0
+            && self.state.o_native_pending.is_none()
+            && !self
+                .wallet
+                .has_bundler_status(Wallet::ASTRALANE_BUNDLER_CODE)
+        {
+            match self.state.o_bundler_wait_started {
+                None => {
+                    log_warn!(
+                        "testlatencylitev1: native transfer test -- waiting up to {}s for the bundler tip broadcaster's first status before sending transfer 1/{}",
+                        Self::BUNDLER_STATUS_WAIT_SECS,
+                        Self::NATIVE_TRANSFER_TARGET,
+                    );
+                    self.state.o_bundler_wait_started = Some(std::time::Instant::now());
+                    return;
+                }
+                Some(started)
+                    if started.elapsed()
+                        < std::time::Duration::from_secs(Self::BUNDLER_STATUS_WAIT_SECS) =>
+                {
+                    return;
+                }
+                Some(_) => {
+                    log_warn!(
+                        "testlatencylitev1: native transfer test -- gave up waiting on bundler tip status after {}s, sending transfer 1/{} without it",
+                        Self::BUNDLER_STATUS_WAIT_SECS,
+                        Self::NATIVE_TRANSFER_TARGET,
+                    );
+                }
+            }
+        }
+        let Some(owner) = self.state.wallet() else {
+            return;
+        };
+        let Some(wallet2) = self.ensure_native_second_wallet() else {
+            return;
+        };
+        // Even count so far (0, 2, 4, ...) -> next send is wallet1->wallet2;
+        // odd -> wallet2->wallet1. Transfer #1 (count still 0) is wallet
+        // 2's own funding transfer, not a separate bootstrap step -- see
+        // this module's doc comment.
+        let (from, to) = if self.state.native_transfer_count % 2 == 0 {
+            (owner, wallet2)
+        } else {
+            (wallet2, owner)
+        };
+        let amount = if self.state.native_transfer_count == 0 {
+            Self::NATIVE_TRANSFER_LAMPORTS + Self::NATIVE_WALLET2_FEE_BUFFER_LAMPORTS
+        } else {
+            Self::NATIVE_TRANSFER_LAMPORTS
+        };
+        let (Some(from_pk), Some(to_pk)) =
+            (pubkey_from_account_id(&from), pubkey_from_account_id(&to))
+        else {
+            return;
+        };
+        // `owner` is always this wallet's fee payer (`Wallet::assemble`'s
+        // `self.payer`) and, once real Astralane tip data exists, also
+        // pays a real tip on every transaction it sends -- both
+        // regardless of whether it's `from` for *this* transfer.
+        // Computed once, up front, so the funding-wait check below and
+        // `expected_lamports` further down agree on the exact same real
+        // overhead (and both actually reflect whether this send will use
+        // Astralane, checked exactly once rather than risking two calls
+        // to `select_tip_account` disagreeing within the same tick).
+        // Signature count is 1 (just `owner`, as payer) when `owner` is
+        // also the sender, else 2 (`owner` as payer + `from` as the
+        // System Program instruction's own required signer).
+        let use_astralane = self
+            .wallet
+            .select_tip_account(Wallet::ASTRALANE_BUNDLER_CODE)
+            .is_some();
+        let signature_count = if from == owner { 1 } else { 2 };
+        // Real compute-unit total for the transaction this send actually
+        // assembles -- one 5,000 CU transfer instruction plain, or that
+        // plus a second 5,000 CU tip transfer when Astralane-bundled (see
+        // `send_native_transfer_via_astralane`/`Wallet::append_bundler_tip`,
+        // both of which use the same `Wallet::TRANSFER_CU` value). Needed
+        // to compute the *real* priority fee below, not just the base fee.
+        let transfer_compute = if use_astralane { 10_000 } else { 5_000 };
+        // Real, live-verified 2026-09-03: this used to be just the flat
+        // per-signature base fee, silently missing the priority fee
+        // (`evaluate_inner` unconditionally sets `PriorityLevel::Medium`
+        // before every phase runs) -- see `Wallet::priority_fee_lamports`'s
+        // doc comment for the exact 50-lamport gap that left uncounted,
+        // and why it made owner-recipient transfers structurally
+        // unconfirmable via the Account/Commit lanes.
+        let owner_overhead = signature_count * Self::SOLANA_BASE_FEE_LAMPORTS
+            + self.wallet.priority_fee_lamports(transfer_compute)
+            + if use_astralane {
+                self.wallet
+                    .tip_lamports(Wallet::ASTRALANE_BUNDLER_CODE)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        // Wait for `from` (and, when `from != owner`, `owner` too -- see
+        // `owner_overhead` above) to actually have the funds before ever
+        // broadcasting -- real, live-verified need (not just defensive):
+        // this phase can start running before the Go host's own boot
+        // transfer (parent -> wallet 1) has landed, since that depends on
+        // a separate subscription this guest has no visibility into. A
+        // fixed startup delay can't be sized correctly (that subscription
+        // has no fixed upper bound), so this waits on the actual
+        // precondition instead: exactly as long as it takes, and no
+        // wasted broadcasts that can't even pay their own way. Real,
+        // live-confirmed 2026-09-03: before `owner_overhead` accounted
+        // for the Astralane tip too (originally just the network fee),
+        // `owner` repeatedly sent a transfer it couldn't actually afford
+        // once the tip was added -- landing on-chain and failing with a
+        // real `custom program error: 0x1` (System Program "insufficient
+        // lamports") four times in a row, each attempt burning a real
+        // network fee, before this same underlying balance-vs-required
+        // gap started throttling it (by coincidence, not by design).
+        let from_balance = self.wallet.balance_sol(&from).unwrap_or(0);
+        let from_required = amount + if from == owner { owner_overhead } else { 0 };
+        if from_balance < from_required {
+            if self.test_cooldown_active() {
+                return;
+            }
+            log_warn!(
+                "testlatencylitev1: native transfer {}/{} -- waiting for {} to be funded ({} of {} lamports needed)",
+                self.state.native_transfer_count + 1,
+                Self::NATIVE_TRANSFER_TARGET,
+                from,
+                from_balance,
+                from_required,
+            );
+            self.test_mark_action();
+            return;
+        }
+        if from != owner {
+            let owner_balance = self.wallet.balance_sol(&owner).unwrap_or(0);
+            if owner_balance < owner_overhead {
+                if self.test_cooldown_active() {
+                    return;
+                }
+                log_warn!(
+                    "testlatencylitev1: native transfer {}/{} -- waiting for {} (fee payer) to cover its own fee/tip overhead ({} of {} lamports needed)",
+                    self.state.native_transfer_count + 1,
+                    Self::NATIVE_TRANSFER_TARGET,
+                    owner,
+                    owner_balance,
+                    owner_overhead,
+                );
+                self.test_mark_action();
+                return;
+            }
+        }
+        let baseline_lamports = self.wallet.balance_sol(&to).unwrap_or(0);
+        log_warn!(
+            "testlatencylitev1: native transfer {}/{} -- sending {} lamports {} -> {}",
+            self.state.native_transfer_count + 1,
+            Self::NATIVE_TRANSFER_TARGET,
+            amount,
+            from,
+            to,
+        );
+        self.wallet.require_signer(from);
+        // Real Astralane bundled send, only ever attempted once live tip
+        // data actually existed at the `use_astralane` check above --
+        // see `send_native_transfer_via_astralane`'s own doc comment for
+        // why that's a read-only check rather than just trying
+        // `append_bundler_tip` and rolling back on failure. Falls back
+        // to the plain unbundled send below on any real send failure
+        // (not just missing tip data) -- a native transfer always goes
+        // out exactly once per tick either way, so this can't turn into
+        // an unthrottled retry loop the way silently skipping the send
+        // entirely would.
+        let astralane_sig = if use_astralane {
+            match self.send_native_transfer_via_astralane(owner, &from_pk, &to_pk, amount) {
+                Ok(signature) => Some(signature),
+                Err(e) => {
+                    log_error!(
+                        "testlatencylitev1: native transfer {}/{} -- astralane bundled send failed, falling back to plain send: {e}",
+                        self.state.native_transfer_count + 1,
+                        Self::NATIVE_TRANSFER_TARGET,
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if astralane_sig.is_none() {
+            self.wallet
+                .append_ix(system_transfer(&from_pk, &to_pk, amount), 5_000);
+        }
+        // `owner` is always this wallet's fee payer (`Wallet::assemble`'s
+        // `self.payer`), on *both* legs of this transfer regardless of
+        // which one it is -- so it's the only side that ever needs
+        // `owner_overhead` netted out. `wallet2` (whichever leg isn't
+        // `owner`) never pays a fee either way, so its delta is always
+        // the raw `amount`, exactly. See [`NativeWatch`]'s doc comment for
+        // why both legs are watched, not just `to`.
+        let from_delta = -(amount as i64) - if from == owner { owner_overhead as i64 } else { 0 };
+        let to_delta = amount as i64 - if to == owner { owner_overhead as i64 } else { 0 };
+        // Fresh `sent_at` on every (re)send, including retries -- this
+        // measures the latency of whichever attempt actually gets
+        // confirmed, not the doomed one(s) before it. Same convention
+        // `test_deposit_solend`/friends use for `cycle_write_sent_at` on
+        // their own cooldown-gated resend.
+        //
+        // Diagnostic for `current_slot()`'s own staleness fix
+        // (`State::freshest_account_slot`'s doc comment): logs both raw
+        // signals separately, right before they're combined into the
+        // `send_slot` actually used below, so a real run can show exactly
+        // how far the old `SlotStatus`-only view (`from_slot_status`) had
+        // fallen behind the newer, higher-frequency account-update signal
+        // (`from_account`) at this exact send -- not just infer it from
+        // whether `slots_until_inclusion` looks more plausible afterward.
+        let from_slot_status = self.state.slot_clock.back().map_or(0, |&(s, _)| s);
+        let from_account = self.state.freshest_account_slot;
+        log_warn!(
+            "testlatencylitev1: native transfer test -- send_slot sources: slot_status={} freshest_account={} gap={}",
+            from_slot_status,
+            from_account,
+            from_account.saturating_sub(from_slot_status),
+        );
+        self.state.o_native_pending = Some(NativePending {
+            sent_at: Instant::now(),
+            watches: [
+                NativeWatch {
+                    account: from,
+                    baseline_lamports: from_balance,
+                    delta_lamports: from_delta,
+                },
+                NativeWatch {
+                    account: to,
+                    baseline_lamports,
+                    delta_lamports: to_delta,
+                },
+            ],
+            // `Some` already when `send_native_transfer_via_astralane`
+            // just sent it directly above; `None` for the plain path --
+            // filled in moments later this same tick, once
+            // `evaluate_inner`'s own tail send loop actually
+            // assembles/signs the instruction queued above -- see that
+            // call site.
+            sig: astralane_sig,
+            send_slot: self.current_slot(),
+        });
+        self.test_mark_action();
+    }
+
+    /// Sends this transfer's own `system_transfer` as a real, individually
+    /// tipped Astralane bundle (`Wallet::append_bundler_tip` +
+    /// `Wallet::send_transaction_batch`) instead of letting
+    /// `evaluate_inner`'s own tail drain loop send it plain via
+    /// `transactionprocessor::send`. Mirrors
+    /// `multimodelv1::state::send_single_hop_as_astralane_tx`'s real,
+    /// live-confirmed pattern: tip + transfer built as one atomic group,
+    /// assembled and sent right here rather than left for the generic
+    /// queue drain, since Astralane requires a tip on every transaction
+    /// it routes -- an ordinary queue drain elsewhere in this same tick
+    /// could otherwise split the tip from the transfer across separate
+    /// transactions.
+    ///
+    /// Callers must already have confirmed real tip data exists (see
+    /// `Wallet::select_tip_account`) -- this only exists once the Go
+    /// host has pushed at least one `CommonBundlerTipUpdate` (see
+    /// `on_message`'s own arm for that), which needs no explicit
+    /// subscription on this module's part beyond handling the message.
+    /// A tip-append failure here despite that prior check is treated as
+    /// a real error (a live race -- the tip data went down between the
+    /// check and now), not silently retried.
+    ///
+    /// Still records into `self.state.m_sig` itself (`evaluate_inner`'s
+    /// tail loop does this for the plain path) so `mid_on_tx`'s existing
+    /// per-phase `tx_latency` stats keep covering this transaction the
+    /// same as any other.
+    fn send_native_transfer_via_astralane(
+        &mut self,
+        owner: AccountId,
+        from_pk: &Pubkey,
+        to_pk: &Pubkey,
+        amount: u64,
+    ) -> Result<Signature, String> {
+        let checkpoint = self.wallet.queue_checkpoint();
+        self.wallet.begin_atomic_group();
+        if !self
+            .wallet
+            .append_bundler_tip(owner, Wallet::ASTRALANE_BUNDLER_CODE)
+        {
+            self.wallet.rollback_to(checkpoint);
+            self.wallet.end_atomic_group();
+            return Err(
+                "append_bundler_tip declined despite select_tip_account succeeding moments earlier"
+                    .to_string(),
+            );
+        }
+        self.wallet
+            .append_ix(system_transfer(from_pk, to_pk, amount), 5_000);
+        self.wallet.end_atomic_group();
+        if !self.wallet.atomic_group_fits(checkpoint) {
+            self.wallet.rollback_to(checkpoint);
+            return Err("tip + transfer atomic group too large for one transaction".to_string());
+        }
+        let Some((signature, tx_bytes)) = self.wallet.assemble() else {
+            return Err("failed to assemble tip + transfer transaction".to_string());
+        };
+        let tx_bytes = tx_bytes.to_vec();
+        self.wallet
+            .send_transaction_batch(&[tx_bytes], Wallet::ASTRALANE_BUNDLER_CODE)
+            .map_err(|e| format!("{e:?}"))?;
+        log_warn!("testlatencylitev1: sent transaction {signature} via Astralane bundle");
+        self.state
+            .m_sig
+            .insert(signature, (self.state.test_phase, Instant::now()));
+        Ok(signature)
+    }
+
+    /// Real per-transaction position-within-block estimate, refining
+    /// `write_delay` beyond its `FirstShredReceived`-anchored lower bound
+    /// using the real Agave `tx.index` (this transfer's own ordinal
+    /// position in its landing block) and `SlotTimestamps::max_tx_index`
+    /// (the largest ordinal position observed for that same slot -- a
+    /// real, honest lower bound on the block's true transaction count,
+    /// see that field's doc comment). `fraction = tx_index / slot_max`
+    /// estimates how far into the block's ordering this transfer landed;
+    /// multiplying that against the real measured `shred_to_completed +
+    /// completed_to_processed` window (`FirstShredReceived` ->
+    /// `Processed`, i.e. this validator's own block-delivery-plus-replay
+    /// span) places the transfer's estimated real execution instant
+    /// somewhere inside that window, instead of only knowing it happened
+    /// somewhere between the two endpoints.
+    ///
+    /// An estimate, not a measurement: Sealevel can execute
+    /// non-conflicting transactions within a block in parallel, not
+    /// strictly in `tx.index` order, so "later index -> later execution"
+    /// is a reasonable approximation, not a guarantee. Always report this
+    /// clearly labeled as an estimate, never merged into `write_delay`
+    /// itself (same discipline as `write_delay_upper_bound` already
+    /// follows).
+    ///
+    /// Called per-sample from `report_native_stats` -- both to build the
+    /// aggregate percentiles *and* to log each sample's own individual
+    /// result (real, live-user-caught gap 2026-09-08: the first version of
+    /// this only ever logged an aggregate percentile line, with no way to
+    /// tell which specific samples resolved or why one didn't -- exactly
+    /// the kind of per-transaction detail the decomposition report's table
+    /// is supposed to carry). `Err` names *which* required input was
+    /// missing, instead of a bare `None`, so the per-sample log line can
+    /// say why.
+    fn tx_index_estimate(&self, sample: &NativeTransferSample) -> Result<TxIndexEstimate, &'static str> {
+        let write_delay = sample
+            .write_delay
+            .ok_or("same-slot sample, no resolvable write/read split at all")?;
+        let tx_index = sample.tx_index.ok_or(
+            "tx.index never backfilled -- this signature's own Transaction-lane data never arrived",
+        )?;
+        let slot_max = self
+            .slot_max_tx_index(sample.inclusion_slot)
+            .filter(|&m| m > 0)
+            .ok_or("no resolvable per-slot max tx.index for this slot")?;
+        let shred_to_completed = sample
+            .shred_to_completed
+            .ok_or("missing shred->completed timestamp for this slot")?;
+        let completed_to_processed = sample
+            .completed_to_processed
+            .ok_or("missing completed->processed timestamp for this slot")?;
+        let fraction = (tx_index as f64 / slot_max as f64).clamp(0.0, 1.0);
+        let window = shred_to_completed + completed_to_processed;
+        Ok(TxIndexEstimate {
+            tx_index,
+            slot_max_tx_index: slot_max,
+            write_delay_estimate: write_delay + window.mul_f64(fraction),
+        })
+    }
+
+    /// Logs the final report once all `NATIVE_TRANSFER_TARGET` transfers
+    /// complete: per-lane total latency (same n/p50/p99 shape as
+    /// `report_cycle_stats`, keyed by [`UpdateLane`] instead of
+    /// protocol/phase, since the whole point of this test is comparing
+    /// latency *across* update channels, not across phases), plus the
+    /// write/slots/read breakdown across all `State::native_samples` --
+    /// see [`NativeTransferSample`] for what write delay and read delay
+    /// mean and why they're reported separately from the total. This is
+    /// the number that actually answers "is a slow write→read cycle the
+    /// transaction being slow to land, or the read path being slow to
+    /// notice it once it has."
+    fn report_native_stats(&self) {
+        for lane in [
+            UpdateLane::LowLatency,
+            UpdateLane::Commit,
+            UpdateLane::Transaction,
+        ] {
+            let (n, p50, p99) = self
+                .state
+                .native_read_latency
+                .get(&lane)
+                .map(|s| s.stats())
+                .unwrap_or((0, 0, 0));
+            log_warn!(
+                "testlatencylitev1: native transfer report -- {:?}: n={n} p50={p50}µs p99={p99}µs",
+                lane,
+            );
+        }
+        let write_us: Vec<u64> = self
+            .state
+            .native_samples
+            .iter()
+            .filter_map(|s| s.write_delay)
+            .map(|d| d.as_micros() as u64)
+            .collect();
+        let read_us: Vec<u64> = self
+            .state
+            .native_samples
+            .iter()
+            .filter_map(|s| s.read_delay)
+            .map(|d| d.as_micros() as u64)
+            .collect();
+        let slots: Vec<u64> = self
+            .state
+            .native_samples
+            .iter()
+            .map(|s| s.slots_until_inclusion)
+            .collect();
+        let unresolved: Vec<&NativeTransferSample> = self
+            .state
+            .native_samples
+            .iter()
+            .filter(|s| s.write_delay.is_none())
+            .collect();
+        // Real, honest upper bounds -- see
+        // `NativeTransferSample::write_delay_upper_bound`'s doc comment.
+        // Deliberately reported on their own, never merged into `write_us`
+        // above: a bound is not a point estimate, and blending the two
+        // would silently reintroduce the same kind of misattribution this
+        // whole split exists to avoid.
+        let write_bound_us: Vec<u64> = unresolved
+            .iter()
+            .filter_map(|s| s.write_delay_upper_bound)
+            .map(|d| d.as_micros() as u64)
+            .collect();
+        let (wn, wp50, wp99) = percentiles(&write_us);
+        let (sn, sp50, sp99) = percentiles(&slots);
+        let (rn, rp50, rp99) = percentiles(&read_us);
+        log_warn!(
+            "testlatencylitev1: native transfer report -- write delay (send->FirstShredReceived): n={wn} p50={wp50}µs p99={wp99}µs",
+        );
+        log_warn!(
+            "testlatencylitev1: native transfer report -- slots until inclusion: n={sn} p50={sp50} p99={sp99}",
+        );
+        log_warn!(
+            "testlatencylitev1: native transfer report -- read delay (FirstShredReceived->observed): n={rn} p50={rp50}µs p99={rp99}µs",
+        );
+        // Real, measured breakdown of what makes up read delay above --
+        // purely informational, never subtracted from it. See
+        // `NativeTransferSample`'s doc comment.
+        let shred_completed_us: Vec<u64> = self
+            .state
+            .native_samples
+            .iter()
+            .filter_map(|s| s.shred_to_completed)
+            .map(|d| d.as_micros() as u64)
+            .collect();
+        let completed_processed_us: Vec<u64> = self
+            .state
+            .native_samples
+            .iter()
+            .filter_map(|s| s.completed_to_processed)
+            .map(|d| d.as_micros() as u64)
+            .collect();
+        let processed_confirmed_us: Vec<u64> = self
+            .state
+            .native_samples
+            .iter()
+            .filter_map(|s| s.processed_to_confirmed)
+            .map(|d| d.as_micros() as u64)
+            .collect();
+        let (scn, scp50, scp99) = percentiles(&shred_completed_us);
+        let (cpn, cpp50, cpp99) = percentiles(&completed_processed_us);
+        let (pcn, pcp50, pcp99) = percentiles(&processed_confirmed_us);
+        log_warn!(
+            "testlatencylitev1: native transfer report -- shred->completed (block delivery spread on this validator): n={scn} p50={scp50}µs p99={scp99}µs",
+        );
+        log_warn!(
+            "testlatencylitev1: native transfer report -- completed->processed (this validator's own local replay): n={cpn} p50={cpp50}µs p99={cpp99}µs",
+        );
+        log_warn!(
+            "testlatencylitev1: native transfer report -- processed->confirmed (cluster confirmation lag): n={pcn} p50={pcp50}µs p99={pcp99}µs",
+        );
+        // Phase 3 of TX_INDEX_ESTIMATE_PLAN.md: a real per-transaction
+        // position-within-block estimate, using the actual Agave `tx.index`
+        // plus each slot's observed max index -- refines `write_delay`
+        // beyond its `FirstShredReceived`-anchored lower bound. See
+        // `tx_index_estimate`'s doc comment for the full derivation and why
+        // it's an estimate, not a measurement. Deliberately its own report
+        // block, never merged into the real `write_delay`/`read_delay`
+        // percentiles above -- same discipline as `write_delay_upper_bound`.
+        //
+        // Logged per-sample (below) as well as in aggregate here -- a real,
+        // live-user-caught gap 2026-09-08: an aggregate-only percentile line
+        // gives no way to tell which specific samples resolved an estimate,
+        // or why one didn't. Both loops call the same `tx_index_estimate`,
+        // so the aggregate and the per-sample lines are always consistent
+        // with each other.
+        let write_estimate_us: Vec<u64> = self
+            .state
+            .native_samples
+            .iter()
+            .filter_map(|s| self.tx_index_estimate(s).ok())
+            .map(|e| e.write_delay_estimate.as_micros() as u64)
+            .collect();
+        let read_estimate_us: Vec<u64> = self
+            .state
+            .native_samples
+            .iter()
+            .filter_map(|s| {
+                let est = self.tx_index_estimate(s).ok()?;
+                s.total_latency.checked_sub(est.write_delay_estimate)
+            })
+            .map(|d| d.as_micros() as u64)
+            .collect();
+        let (wen, wep50, wep99) = percentiles(&write_estimate_us);
+        let (ren, rep50, rep99) = percentiles(&read_estimate_us);
+        log_warn!(
+            "testlatencylitev1: native transfer report -- write delay ESTIMATE (send->estimated real execution instant, via tx.index position-within-block -- NOT an exact measurement): n={wen} p50={wep50}µs p99={wep99}µs",
+        );
+        log_warn!(
+            "testlatencylitev1: native transfer report -- read delay ESTIMATE (estimated real execution instant->observed -- NOT an exact measurement): n={ren} p50={rep50}µs p99={rep99}µs",
+        );
+        // Per-sample breakdown -- the actual point of this session's fix.
+        // `i + 1` matches the `N/NATIVE_TRANSFER_TARGET` ordinal each
+        // sample was already given in its own `record_native_read` log
+        // line (samples are pushed in confirm order and never removed, so
+        // this numbering is stable).
+        for (i, s) in self.state.native_samples.iter().enumerate() {
+            match self.tx_index_estimate(s) {
+                Ok(est) => {
+                    let read_estimate = s.total_latency.checked_sub(est.write_delay_estimate);
+                    log_warn!(
+                        "testlatencylitev1: native transfer {}/{} tx.index estimate -- tx_index={} slot_max_tx_index={} write_estimate={}µs read_estimate={} (NOT an exact measurement)",
+                        i + 1,
+                        Self::NATIVE_TRANSFER_TARGET,
+                        est.tx_index,
+                        est.slot_max_tx_index,
+                        est.write_delay_estimate.as_micros(),
+                        read_estimate
+                            .map(|d| format!("{}µs", d.as_micros()))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    );
+                }
+                Err(reason) => {
+                    log_warn!(
+                        "testlatencylitev1: native transfer {}/{} tx.index estimate -- unresolved ({reason})",
+                        i + 1,
+                        Self::NATIVE_TRANSFER_TARGET,
+                    );
+                }
+            }
+        }
+        if !unresolved.is_empty() {
+            log_warn!(
+                "testlatencylitev1: native transfer report -- {} sample(s) had no write/read split (the transaction landed in a slot already known to this guest before it was even sent, most commonly slots_until_inclusion=0 -- see NativeTransferSample::write_delay's doc comment) -- excluded from the write/read percentiles above; total_latency for these is still exact and included wherever total latency is reported elsewhere",
+                unresolved.len(),
+            );
+            if write_bound_us.is_empty() {
+                log_warn!(
+                    "testlatencylitev1: native transfer report -- none of these had a computable write-delay upper bound (no later slot observed yet, e.g. the run ended right after)",
+                );
+            } else {
+                let (bn, bp50, bp99) = percentiles(&write_bound_us);
+                log_warn!(
+                    "testlatencylitev1: native transfer report -- of those, {bn} had a real upper bound on write delay (time until this guest observed the next slot after inclusion): p50<={bp50}µs p99<={bp99}µs -- an upper bound, not a point estimate",
+                );
+            }
+        }
     }
 
     /// Build and send a single spot swap leg (`mint_in` -> `mint_out`,
@@ -4690,7 +6795,7 @@ impl<'a> StateHelper<'a> {
             .route_slippage_aware(mint_in, mint_out, amount_in, MAX_HOPS)
         else {
             log_error!(
-                "testperpv1: route diagnostics for {mint_in} -> {mint_out}:\n{}",
+                "testlatencylitev1: route diagnostics for {mint_in} -> {mint_out}:\n{}",
                 self.state
                     .spot_router
                     .route_diagnostics(mint_in, mint_out, amount_in, MAX_HOPS)
@@ -4718,7 +6823,7 @@ impl<'a> StateHelper<'a> {
                     ));
                 }
                 return Err(format!(
-                    "pool {} isn't ready to quote yet (tick-array data still syncing) -- try again shortly",
+                    "exact quote invalidated pool {} (not ready yet, no cooldown)",
                     failure.pool_id,
                 ));
             }
@@ -4744,26 +6849,15 @@ impl<'a> StateHelper<'a> {
             // intermediate mint and reverted on-chain with
             // `AccountNotInitialized` because only the address was
             // derived, never actually created.
-            // Glue this hop's ATA-creation + swap instructions together --
-            // see `Wallet::begin_atomic_group`'s doc comment for the real,
-            // live-confirmed `AccountNotInitialized` bug this prevents
-            // (assemble()'s size-based splitter previously could, and
-            // did, send a hop's swap in a different, unordered
-            // transaction than its own destination-ATA-creation
-            // instruction).
-            self.wallet.begin_atomic_group();
             let (Some(source_ata), Some(dest_ata)) = (
                 self.wallet.append_create_ata(owner, hop.input_mint),
                 self.wallet.append_create_ata(owner, hop.output_mint),
             ) else {
-                self.wallet.end_atomic_group();
                 return Err(format!(
                     "hop {i}: FAILED to derive token account(s) for owner={owner}"
                 ));
             };
-            let hop_result = dex.execute_hop(hop, owner, source_ata, dest_ata, self.wallet);
-            self.wallet.end_atomic_group();
-            match hop_result {
+            match dex.execute_hop(hop, owner, source_ata, dest_ata, self.wallet) {
                 Ok(()) => {
                     log_warn!(
                         "  hop {i}: OK dex={:?} pool={} {} -> {} amount_in={} amount_out={}",
@@ -5160,7 +7254,11 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
                     let keypair = rc_unlock(&rc_keypair);
                     let pubkey = keypair.pubkey();
                     let account_id = account_id_from_pubkey(&pubkey);
-                    log_warn!("testperpv1: got wallet keypair {} {}", pubkey, account_id);
+                    log_warn!(
+                        "testlatencylitev1: got wallet keypair {} {}",
+                        pubkey,
+                        account_id
+                    );
                     self.wallet
                         .append_key(rc_keypair.clone(), self.graph)
                         .unwrap();
@@ -5235,33 +7333,22 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
                         .into_iter()
                         .filter_map(|mint| self.wallet.ata_subscribe_request(account_id, mint))
                         .collect();
-                    // This wallet's own durable-nonce account (see
-                    // `Wallet::send_bundler_pair`'s doc comment) --
-                    // batched into the same subscribe_now call as
-                    // everything else above, not a separate round-trip.
-                    let nonce_reqs: Vec<_> = self
-                        .wallet
-                        .nonce_subscribe_request(account_id)
-                        .into_iter()
-                        .collect();
 
-                    let (phoenix_len, solend_len, kamino_len, marginfi_len, ata_len, nonce_len) = (
+                    let (phoenix_len, solend_len, kamino_len, marginfi_len, ata_len) = (
                         phoenix_reqs.len(),
                         solend_reqs.len(),
                         kamino_reqs.len(),
                         marginfi_reqs.len(),
                         ata_reqs.len(),
-                        nonce_reqs.len(),
                     );
                     let mut all_requests = Vec::with_capacity(
-                        phoenix_len + solend_len + kamino_len + marginfi_len + ata_len + nonce_len,
+                        phoenix_len + solend_len + kamino_len + marginfi_len + ata_len,
                     );
                     all_requests.extend(phoenix_reqs);
                     all_requests.extend(solend_reqs);
                     all_requests.extend(kamino_reqs);
                     all_requests.extend(marginfi_reqs);
                     all_requests.extend(ata_reqs);
-                    all_requests.extend(nonce_reqs);
 
                     match SubscriptionQueue::subscribe_now(self.graph, all_requests) {
                         Ok(subs) => {
@@ -5285,12 +7372,9 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
                             }
                             let ata_subs: Vec<_> = (&mut it).take(ata_len).collect();
                             self.wallet.keep_ata_subscriptions(ata_subs);
-                            if let Some(sub) = (&mut it).take(nonce_len).next() {
-                                self.wallet.keep_nonce_subscription(sub);
-                            }
                         }
                         Err(e) => {
-                            log_error!("testperpv1: failed to batch-subscribe wallet authority accounts: {e}");
+                            log_error!("testlatencylitev1: failed to batch-subscribe wallet authority accounts: {e}");
                         }
                     }
                 }
@@ -5317,36 +7401,6 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
                     );
                     self.rebalance_portfolio();
                 }
-                CustomMessageInbound::LstApy(symbol, staking_apy) => {
-                    log_warn!(
-                        "testperpv1: LST staking APY update: {}={:.3}%",
-                        symbol,
-                        staking_apy * 100.0,
-                    );
-                    self.state
-                        .lst_staking_apy
-                        .insert(symbol.clone(), staking_apy);
-                    self.log_lst_loop_projection(&symbol, staking_apy);
-                }
-                CustomMessageInbound::TriggerTestAstralane => {
-                    let Some(owner) = self.state.wallet() else {
-                        log_warn!("testperpv1: TriggerTestAstralane ignored -- no wallet yet");
-                        return;
-                    };
-                    match self.wallet.test_send_astralane_tip_batch(owner) {
-                        Some(Ok(())) => {
-                            log_warn!("testperpv1: TriggerTestAstralane -- tip + self-transfer sent via transactionprocessor::batch (bundler=astralane)");
-                        }
-                        Some(Err(e)) => {
-                            log_error!("testperpv1: TriggerTestAstralane -- batch failed: {e:?}");
-                        }
-                        None => {
-                            log_warn!(
-                                "testperpv1: TriggerTestAstralane ignored -- wallet key not loaded yet, or something else is already queued this tick"
-                            );
-                        }
-                    }
-                }
                 CustomMessageInbound::CommonBundlerTipUpdate(update) => {
                     self.wallet.apply_bundler_tip_update(self.graph, update);
                 }
@@ -5360,13 +7414,23 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
 }
 
 /// Target for both slot-timing diagnostics below: `finish()`'s
-/// start-to-finish span, and `start()`'s gap-since-previous-start.
+/// start-to-finish span, and `start()`'s gap-since-previous-start. This
+/// is a pure logging threshold -- it decides which real, already-measured
+/// gaps are noteworthy enough to warn about; it plays no part in
+/// computing the gap itself (that's a plain `Instant::duration_since`).
 /// Originally set to 200ms; corrected to 400ms after live validator-side
 /// data (root-slot `total=` timings gathered this session) showed real
 /// root-slot intervals cluster around 230-250ms median with normal
 /// spikes into the 400s -- 200ms wasn't an achievable target given
 /// Solana's own real block cadence, not a guest-side problem to chase.
-const SLOT_TIMING_TARGET_MS: u128 = 400;
+/// Tightened to 350ms 2026-09-04 after two independent real
+/// measurements: mainnet's own `getRecentPerformanceSamples` over the
+/// last 10 minutes averaged ~317ms/slot, and this guest's own rooted-
+/// slot gaps that same session measured median 267ms / mean 340ms (heavy
+/// right tail from real network jitter and occasional guest-side
+/// backpressure) -- 400ms had drifted loose enough to miss some of that
+/// tail as "normal".
+const SLOT_TIMING_TARGET_MS: u128 = 350;
 
 /// Cap on how many queued subscription requests `subscription_queue`
 /// sends per slot (one bounded `bulk_subscribe` call in `finish()`) --
@@ -5409,7 +7473,7 @@ impl<'a> CommitHook for StateHelper<'a> {
             let gap_ms = now.duration_since(prev).as_millis();
             if gap_ms > SLOT_TIMING_TARGET_MS {
                 log_warn!(
-                    "testperpv1: {}ms since previous slot's start() (target: <{}ms) -- \
+                    "testlatencylitev1: {}ms since previous slot's start() (target: <{}ms) -- \
                      of that, {}ms was spent in low_latency() processing {} account/token \
                      updates, {}ms was spent across {} evaluate() calls, and {}ms was spent \
                      across {} stdio flush() calls, in the window",
@@ -5469,6 +7533,7 @@ impl<'a> CommitHook for StateHelper<'a> {
         // never return anything but its zero-initialized default,
         // regardless of subscription depth or how long a run waited.
         self.wallet.on_account(header, body);
+        self.check_native_transfer_arrival(header.accountid, header.slot, UpdateLane::Commit);
         if let Some(phoenix) = self.state.o_phoenix.as_mut() {
             phoenix.on_account(header, body);
         }
@@ -5515,16 +7580,10 @@ impl<'a> CommitHook for StateHelper<'a> {
         // not be reconstructed after the fact.
         if self.state.last_slot % 20 == 0 {
             log_warn!(
-                "testperpv1: slot {} entering subscription flush (dex pending={:?}/active={:?})",
+                "testlatencylitev1: slot {} entering subscription flush (dex pending={:?}/active={:?})",
                 self.state.last_slot,
-                self.state
-                    .o_dex
-                    .as_ref()
-                    .map(|d| d.subscription_pending_count()),
-                self.state
-                    .o_dex
-                    .as_ref()
-                    .map(|d| d.subscription_active_count()),
+                self.state.o_dex.as_ref().map(|d| d.subscription_pending_count()),
+                self.state.o_dex.as_ref().map(|d| d.subscription_active_count()),
             );
         }
         let t_dex_flush = std::time::Instant::now();
@@ -5537,7 +7596,7 @@ impl<'a> CommitHook for StateHelper<'a> {
             // -- same 128/slot pacing as `subscription_queue` below, just
             // a separate queue instance owned by `DexState` itself.
             if let Err(e) = dex.flush_subscriptions(self.graph, MAX_SUBSCRIBES_PER_SLOT) {
-                log_error!("testperpv1: failed to flush dex subscription queue: {e}");
+                log_error!("testlatencylitev1: failed to flush dex subscription queue: {e}");
             }
             self.state.o_dex.replace(dex);
         }
@@ -5551,7 +7610,7 @@ impl<'a> CommitHook for StateHelper<'a> {
         // nothing ever follows, it's in `subscription_queue.flush`
         // below instead.
         log_warn!(
-            "testperpv1: slot {} dex flush done ({dex_flush_ms}ms), entering wallet subscription_queue flush",
+            "testlatencylitev1: slot {} dex flush done ({dex_flush_ms}ms), entering wallet subscription_queue flush",
             self.state.last_slot,
         );
         // Drain a bounded slice of the queued startup subscription burst
@@ -5567,13 +7626,13 @@ impl<'a> CommitHook for StateHelper<'a> {
             Ok(0) => {}
             Ok(n) => {
                 log_warn!(
-                    "testperpv1: subscription_queue flushed {n} requests ({} still pending, {} active)",
+                    "testlatencylitev1: subscription_queue flushed {n} requests ({} still pending, {} active)",
                     self.state.subscription_queue.pending_count(),
                     self.state.subscription_queue.active_count(),
                 );
             }
             Err(e) => {
-                log_error!("testperpv1: subscription_queue flush failed: {e}");
+                log_error!("testlatencylitev1: subscription_queue flush failed: {e}");
             }
         }
         let queue_flush_ms = t_queue_flush.elapsed().as_millis();
@@ -5582,7 +7641,7 @@ impl<'a> CommitHook for StateHelper<'a> {
         // that happens *after* `finish()` returns entirely (absent) can
         // be told apart -- closes the last gap in `finish()` itself.
         log_warn!(
-            "testperpv1: slot {} finish() returning (queue_flush {queue_flush_ms}ms)",
+            "testlatencylitev1: slot {} finish() returning (queue_flush {queue_flush_ms}ms)",
             self.state.last_slot,
         );
         // Real-time budget check -- this commit's own start()-to-here
@@ -5598,7 +7657,7 @@ impl<'a> CommitHook for StateHelper<'a> {
             let elapsed_ms = start.elapsed().as_millis();
             if elapsed_ms > SLOT_TIMING_TARGET_MS {
                 log_warn!(
-                    "testperpv1: slot {} took {}ms to process (target: <{}ms) -- \
+                    "testlatencylitev1: slot {} took {}ms to process (target: <{}ms) -- \
                      of that, {}ms was in dex pool/subscription flush and {}ms was in \
                      wallet subscription_queue flush",
                     self.state.last_slot,
@@ -5607,16 +7666,6 @@ impl<'a> CommitHook for StateHelper<'a> {
                     dex_flush_ms,
                     queue_flush_ms,
                 );
-            }
-        }
-        // Periodically report this wallet's most-referenced accounts back
-        // to the optimizer -- see Self::ACCOUNT_USAGE_REPORT_INTERVAL_SLOTS.
-        if self.state.last_slot % Self::ACCOUNT_USAGE_REPORT_INTERVAL_SLOTS == 0 {
-            let top = self
-                .wallet
-                .top_account_usage(Self::ACCOUNT_USAGE_REPORT_MAX_ENTRIES);
-            if !top.is_empty() {
-                self.q_msg.push_back(MessageSend::CommonAddressUpdate(top));
             }
         }
     }

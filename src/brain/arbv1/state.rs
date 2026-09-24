@@ -750,8 +750,8 @@ impl<'a> StateHelper<'a> {
         // purely to compute/log what a real send *would* cost, and never
         // queued anything onto `self.wallet` -- arbv1 never actually
         // traded). Builds directly onto `self.wallet` now, inside a
-        // checkpoint + atomic group (mirrors testperpv1::state::StateHelper::
-        // execute_spot_leg's already-battle-tested discipline exactly, for the same reasons:
+        // checkpoint + atomic group (mirrors leveragedloopv1::execute_spot_leg's
+        // already-battle-tested discipline exactly, for the same reasons:
         // one atomic group ties every hop together so `assemble()` can't
         // split them across separate, unordered transactions; the
         // checkpoint lets any failure discard only *this* route's

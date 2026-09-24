@@ -2,8 +2,7 @@
 
 This is a trading bot that is compiled into web assembly and uploaded using [Solpipe](https://solpipe.io) to a validator running the Catscope Geyser Plugin.
 
-* `./src/brain/arbv1` - detects and executes real cross-DEX arbitrage cycles
-* `./src/brain/testperpv1` - real-transaction Solend/Kamino/marginfi/Phoenix basis-trade smoke test
+* `./src/brain/helloworldv1` - print slot numbers to stderr and swap USDC and SOL on Orca
 
 For an example of how to upload and run a web assembly bot, [please see this repository](https://github.com/noncepad/optimizer).
 

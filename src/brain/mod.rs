@@ -1,12 +1,20 @@
 use std::{cell::UnsafeCell, rc::Rc};
 
 use crate::{
-    brain::{arbv1::ArbitrageV1Hook, testperpv1::TestPerpV1Hook},
+    brain::{
+        arbv1::ArbitrageV1Hook, testlatencylitev1::TestLatencyLiteV1Hook,
+        testperpv1::TestPerpV1Hook,
+    },
     event_loop::EventHandler,
     message::Parser,
 };
 
 pub mod arbv1;
+// Experimental copy of `testperplatencyv1` with the DEX/lending
+// subscription setup stripped out -- see that module's own doc comment
+// for why. Delete this module (and its `BotMode` wiring below) once the
+// native-transfer-latency question it exists to answer is settled.
+pub mod testlatencylitev1;
 pub mod testperpv1;
 
 pub struct Merged {
@@ -16,6 +24,7 @@ pub struct Merged {
 enum BotMode {
     Arbitrage(Box<ArbitrageV1Hook>),
     TestPerp(Box<TestPerpV1Hook>),
+    TestLatencyLiteV1(Box<TestLatencyLiteV1Hook>),
 }
 
 impl Default for Merged {
@@ -32,6 +41,9 @@ impl Default for Merged {
             "testperpv1" => BotMode::TestPerp(Box::new(TestPerpV1Hook::new(Rc::new(
                 UnsafeCell::new(Parser::default()),
             )))),
+            "testlatencylitev1" => BotMode::TestLatencyLiteV1(Box::new(
+                TestLatencyLiteV1Hook::new(Rc::new(UnsafeCell::new(Parser::default()))),
+            )),
             _ => panic!("unknown mode {mode}",),
         };
         Self { inner: Some(inner) }
@@ -55,6 +67,10 @@ impl EventHandler for Merged {
                 r = x.on_load(poller, args);
                 inner = BotMode::TestPerp(x);
             }
+            BotMode::TestLatencyLiteV1(mut x) => {
+                r = x.on_load(poller, args);
+                inner = BotMode::TestLatencyLiteV1(x);
+            }
         };
         self.inner.replace(inner);
         r
@@ -71,6 +87,10 @@ impl EventHandler for Merged {
             BotMode::TestPerp(mut x) => {
                 r = x.on_unload();
                 inner = BotMode::TestPerp(x);
+            }
+            BotMode::TestLatencyLiteV1(mut x) => {
+                r = x.on_unload();
+                inner = BotMode::TestLatencyLiteV1(x);
             }
         };
         self.inner.replace(inner);
@@ -92,6 +112,10 @@ impl EventHandler for Merged {
                 r = x.on_event(event);
                 inner = BotMode::TestPerp(x);
             }
+            BotMode::TestLatencyLiteV1(mut x) => {
+                r = x.on_event(event);
+                inner = BotMode::TestLatencyLiteV1(x);
+            }
         };
         self.inner.replace(inner);
         r
@@ -108,6 +132,10 @@ impl EventHandler for Merged {
             BotMode::TestPerp(mut x) => {
                 r = x.flush();
                 inner = BotMode::TestPerp(x);
+            }
+            BotMode::TestLatencyLiteV1(mut x) => {
+                r = x.flush();
+                inner = BotMode::TestLatencyLiteV1(x);
             }
         };
         self.inner.replace(inner);

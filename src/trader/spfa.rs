@@ -1187,7 +1187,8 @@ mod tests {
     }
 
     /// `max_candidates` bounds the search even when more negative
-    /// cycles exist in the graph -- callers rely on this to cap
+    /// cycles exist in the graph -- callers (e.g.
+    /// `perpfundingv1::log_funding_graph_cycles`) rely on this to cap
     /// work to the real asset-universe size.
     #[test]
     fn find_candidate_cycles_respects_max_candidates() {

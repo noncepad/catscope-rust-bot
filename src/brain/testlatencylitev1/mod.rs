@@ -1,31 +1,48 @@
-//! testperpv1 -- **not a real strategy.** A literal copy of
-//! `perpfundingv1` (same `EventHandler`/`StateHelper`/module shape,
-//! same `on_load`/message handling), except `StateHelper::evaluate` is
-//! replaced with a real-transaction smoke test: bootstrap a Solend
-//! obligation, deposit a small amount of USDC, withdraw it, then do the
-//! same for Kamino. Exists to close a real gap found in the session that
-//! wrote it -- hand-built Python/`solders` scripts had verified the
-//! on-chain instruction shapes directly against mainnet, but never
-//! exercised the actual compiled Rust/WASM runtime (`Wallet` batching,
-//! the `on_account` subscription machinery, event-driven `evaluate()`
-//! dispatch) doing the same thing. See `state::TestPhase`'s doc comment
-//! for the real state machine.
+//! testlatencylitev1 -- **not a real strategy, and not a real fork.**
+//! A byte-for-byte copy of `testperplatencyv1` (see that module's own
+//! doc comment for what the real thing is/does), with exactly one
+//! functional change: `on_load()` skips the unconditional
+//! `PhoenixState::new_and_subscribe`/`DexState::new`/`SolendPosition`/
+//! `KaminoPosition`/`MarginfiPosition` setup that module normally does
+//! for *every* protocol -- see this module's `on_load` for the change
+//! itself and the real, live-measured evidence motivating it.
+//!
+//! Exists purely as an experiment: real, live-measured 2026-09-04 that
+//! `testperplatencyv1`'s native-transfer test (`TestProtocol::Native`,
+//! which only ever touches 2-3 accounts) drags along a subscription to
+//! the *entire* build-time-baked DEX/lending pool universe --
+//! Raydium/Orca/Phoenix/Kamino/Marginfi/Solend/PumpFun/PumpSwap/Jet,
+//! ~42,000 accounts -- because `evaluate_inner` requires `o_dex`/
+//! `o_solend_position`/`o_kamino_position`/`o_marginfi_position` to all
+//! be populated before it'll dispatch to *any* `TestPhase`, including
+//! `NativeTransferLoop`, which never reads any of them. Real, observed
+//! symptom: `low_latency()` processing 8,271 account/token updates in a
+//! single tick, and 35 of 171 rooted-slot transitions in one run
+//! exceeding the 400ms-ish real slot-time target -- see
+//! `SLOT_TIMING_TARGET_MS`'s doc comment for what "real" means there.
+//! **This module is Native-protocol-only** -- running Solend/Kamino/
+//! Marginfi phases against it would panic or misbehave immediately,
+//! since none of their required state is ever initialized here. Compare
+//! a native-transfer run's real latency numbers against this module's
+//! own to see whether that ~42,000-account subscription actually moves
+//! the needle -- delete this whole module once that question is
+//! answered, whichever way it lands.
 //!
 //! # Event flow
 //! ```text
 //! validator → Event::LowLatency  → state.low_latency()   (processed accounts, ~400 ms)
 //! validator → Event::Commit      → state.mid_on_account() (rooted accounts, ~12 s)
-//! validator → Event::Transaction → state.mid_on_tx()      (drained, unused)
+//! validator → Event::Transaction → state.mid_on_tx()      (drained, unused for now --
+//!                                   this is where send→confirm latency tracking hooks in)
 //! validator → Event::SlotStatus  → state.on_slot_status()
 //! Go brain  → stdin              → state.on_message()  (wallet key -- signs whatever
 //!                                   execute_spot_leg builds, once something calls it)
-//! state.evaluate() runs after every event -- epoch-boundary detection,
-//! `PerpRouter` feeding, and the assemble()/send loop (currently a
-//! no-op, see execute_spot_leg) happen there, gated on real wall-clock
-//! hours (`SystemTime::now()`), not a slot/commit cadence.
+//! state.evaluate() runs after every event -- the TestPhase state machine and the
+//! assemble()/send loop (see `evaluate_inner`) happen there, gated on a per-phase
+//! slot cooldown, not a slot/commit cadence.
 //! ```
 use crate::{
-    brain::testperpv1::{
+    brain::testlatencylitev1::{
         configuration::Configuration,
         message::{CustomMessageInbound, CustomMessageOutbound},
         state::{State, StateHelper},
@@ -45,7 +62,7 @@ pub(crate) mod configuration;
 pub(crate) mod message;
 pub(crate) mod state;
 
-pub struct TestPerpV1Hook {
+pub struct TestLatencyLiteV1Hook {
     nonce: Rc<UnsafeCell<u32>>,
     rc_parser: Rc<UnsafeCell<Parser<Configuration, CustomMessageInbound, CustomMessageOutbound>>>,
     rc_configuration: Rc<UnsafeCell<Configuration>>,
@@ -56,7 +73,7 @@ pub struct TestPerpV1Hook {
     o_poller: Option<crate::event_loop::EventPoller>,
 }
 
-impl TestPerpV1Hook {
+impl TestLatencyLiteV1Hook {
     pub fn new(
         rc_parser: Rc<
             UnsafeCell<Parser<Configuration, CustomMessageInbound, CustomMessageOutbound>>,
@@ -90,7 +107,7 @@ impl TestPerpV1Hook {
     }
 }
 
-impl EventHandler for TestPerpV1Hook {
+impl EventHandler for TestLatencyLiteV1Hook {
     fn on_load(
         &mut self,
         poller: crate::event_loop::EventPoller,
@@ -109,12 +126,12 @@ impl EventHandler for TestPerpV1Hook {
         }
         outbound.flush();
         parser.outbound.replace(outbound);
-        log_info!("testperpv1: on_load complete");
+        log_info!("testlatencylitev1: on_load complete");
         Ok(())
     }
 
     fn on_unload(&mut self) -> Result<(), CatscopeGuestError> {
-        log_info!("testperpv1: on_unload");
+        log_info!("testlatencylitev1: on_unload");
         Ok(())
     }
 
@@ -124,7 +141,7 @@ impl EventHandler for TestPerpV1Hook {
             parser.inbound.take().unwrap()
         };
         let mut helper = self.helper();
-        log_debug!("testperpv1: event - +++++");
+        log_debug!("testlatencylitev1: event - +++++");
         match event {
             Event::Stdin(data) => {
                 msg_in.on_data(&data, |action| {
@@ -167,11 +184,11 @@ impl EventHandler for TestPerpV1Hook {
         // guest's perspective -- both just silently never return -- so
         // this closes that gap too.
         if n_written > 0 {
-            log_warn!("testperpv1: writing {n_written} outbound message(s), flushing stdout");
+            log_warn!("testlatencylitev1: writing {n_written} outbound message(s), flushing stdout");
         }
         outbound.flush();
         if n_written > 0 {
-            log_warn!("testperpv1: outbound flush returned");
+            log_warn!("testlatencylitev1: outbound flush returned");
         }
         parser.outbound.replace(outbound);
         Ok(())

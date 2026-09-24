@@ -1587,8 +1587,8 @@ impl Wallet {
     /// still land as one atomic unit by building each hop as its own
     /// separate, individually-tipped transaction and sending them all
     /// here together, instead of failing outright -- see
-    /// `testperpv1::state::StateHelper::execute_spot_leg`'s own
-    /// oversized-route fallback. Same real host primitive already proven by
+    /// `multimodelv1::state::execute_spot_leg`'s own oversized-route
+    /// fallback. Same real host primitive already proven by
     /// [`Self::send_bundler_pair`]/[`Self::test_send_two_system_transfers`],
     /// generalized from a fixed pair to an arbitrary N.
     ///
@@ -2069,8 +2069,8 @@ mod tests {
 
     #[test]
     fn rollback_to_a_multi_hop_route_style_partial_failure_discards_the_earlier_successful_hop() {
-        // Mirrors a real bug found in an execute_spot_leg-style multi-hop
-        // route (2026-08-27): hop 0 succeeds and appends real instructions, hop 1 then fails --
+        // Mirrors leveragedloopv1::execute_spot_leg's real bug (2026-08-27):
+        // hop 0 succeeds and appends real instructions, hop 1 then fails --
         // the whole route must roll back to nothing, not just stop hop 2+
         // from being glued on.
         let mut wallet = bare_wallet();

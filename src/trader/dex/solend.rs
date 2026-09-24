@@ -147,10 +147,9 @@ const MIN_RESERVE_LEN: usize = OFF_SUPER_MAX_BORROW_RATE + 8;
 const OBLIGATION_SEED: &str = "solend-obligation";
 
 /// `id=0` produces the exact same seed string as before this was
-/// parameterized -- critical: `testperpv1` (and the now-retired
-/// perpfundingv1 before it) may have real, currently-open mainnet
-/// obligations at that exact address, and this must never change under
-/// them. `create_with_seed`'s real limit is 32 bytes;
+/// parameterized -- critical: `perpfundingv1`/`testperpv1` may have real,
+/// currently-open mainnet obligations at that exact address, and this must
+/// never change under them. `create_with_seed`'s real limit is 32 bytes;
 /// worst case (`id=255`) is `"solend-obligation-255"`, 22 bytes -- safe with
 /// room to spare for any `u8`.
 fn obligation_seed(id: u8) -> String {
@@ -900,7 +899,7 @@ pub struct SolendPosition {
 
 impl SolendPosition {
     /// Pure-derivation half of the old single-shot `set_authority`
-    /// (removed -- only ever called from `testperpv1`'s
+    /// (removed -- only ever called from `perpfundingv1`/`testperpv1`'s
     /// `Wallet` message handler, alongside Phoenix/Kamino/marginfi's own
     /// three-to-four subscription calls). Returns the subscription
     /// request this authority needs (empty if already set), without
@@ -1236,9 +1235,8 @@ mod tests {
     }
 
     /// The one test that actually protects real, possibly-currently-open
-    /// mainnet Solend obligations (`testperpv1`, and the now-retired
-    /// perpfundingv1 before it, both real callers of `id=0`): confirms
-    /// `obligation_address(owner, 0)` is
+    /// mainnet Solend obligations (`perpfundingv1`/`testperpv1`, both real
+    /// callers of `id=0` today): confirms `obligation_address(owner, 0)` is
     /// byte-identical to what the *original*, unparameterized
     /// `Pubkey::create_with_seed(owner, "solend-obligation",
     /// &SOLEND_PROGRAM_ID)` call would have produced -- not just "id 0 and

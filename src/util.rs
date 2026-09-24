@@ -440,7 +440,7 @@ pub fn resolve_symbol_mint(symbol: &str) -> Option<AccountId> {
 /// build.rs-baked from the real `mint_info` table (see
 /// `symbol_mint_config::SYMBOL_MINT_MAP`'s generation in `build.rs`),
 /// needed to convert a USD amount to/from raw token units (e.g.
-/// `testperpv1::state::State::rebalance_portfolio`'s trade
+/// `perpfundingv1::state::StateHelper::rebalance_portfolio`'s trade
 /// sizing).
 pub fn resolve_symbol_decimals(symbol: &str) -> Option<u8> {
     crate::symbol_mint_config::SYMBOL_MINT_MAP

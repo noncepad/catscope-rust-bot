@@ -228,7 +228,7 @@ impl<C: Sized + Default, MIn: MessageDeserializer> MessageInboundParser<C, MIn> 
     {
         let end = self.index + data.len();
         log_warn!(
-            "MessageInbound::on_data - stdin++++++++++++++++++++++++++++++++++++++ data {}; end {}",
+            "HelloWorldV1Hook::event - stdin++++++++++++++++++++++++++++++++++++++ data {}; end {}",
             data.len(),
             end
         );
@@ -260,7 +260,7 @@ impl<C: Sized + Default, MIn: MessageDeserializer> MessageInboundParser<C, MIn> 
                 }
                 // borrow of self.buffer ends here; action is fully owned
             };
-            log_warn!("MessageInbound::on_data - stdin++++++++++++++++++++++++++++++++++++++ action; cursor {cursor}; consumed {consumed}");
+            log_warn!("HelloWorldV1Hook::event - stdin++++++++++++++++++++++++++++++++++++++ action; cursor {cursor}; consumed {consumed}");
 
             cursor += consumed;
             f(action);

@@ -1213,7 +1213,7 @@ pub struct MarginfiPosition {
 
 impl MarginfiPosition {
     /// Pure-derivation half of the old single-shot `set_authority`
-    /// (removed -- only ever called from `testperpv1`'s
+    /// (removed -- only ever called from `perpfundingv1`/`testperpv1`'s
     /// `Wallet` message handler, alongside Phoenix/Solend/Kamino's own
     /// subscription calls). Returns the subscription request this
     /// authority needs -- this bot's own `MarginfiAccount`
