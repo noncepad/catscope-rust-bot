@@ -29,6 +29,7 @@
 pub mod bundler;
 pub mod credit;
 pub mod dex;
+pub mod market_stats;
 pub mod perp_router;
 pub mod planner;
 pub mod pricegraph;

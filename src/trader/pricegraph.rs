@@ -210,6 +210,22 @@ struct RouterEdge {
     dex: DexType,
 }
 
+/// One direct (single-hop) pool's independent price quote for a specific
+/// `from -> to` pair -- see [`TradeRouter::direct_quotes`]'s own doc
+/// comment.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectQuote {
+    pub pool_id: AccountId,
+    /// `reserve_out / reserve_in`, fee-adjusted, raw units (not
+    /// decimal-normalized).
+    pub price: f64,
+    /// This pool's `to`-side reserve, raw units -- see
+    /// `TradeRouter::direct_quotes`'s own doc comment for why this is a
+    /// valid, directly-comparable liquidity weight across every other
+    /// pool quoting the same pair without needing a USD conversion.
+    pub weight: f64,
+}
+
 /// One swap leg along a route.
 #[derive(Debug, Clone)]
 pub struct Hop {
@@ -577,6 +593,82 @@ impl TradeRouter {
     /// producing edges.
     pub fn has_node(&self, token: AccountId) -> bool {
         self.node(token).is_some()
+    }
+
+    /// Every live single-hop (`from` -> `to`) pool, priced independently
+    /// -- the building block for [`liquidity_weighted_median_price`], a
+    /// deliberately *not* route-search-based way to get a representative
+    /// price for a pair. Real, live-confirmed incident this exists for
+    /// (2026-09-25): `route_slippage_aware`'s `widest_path` picked a
+    /// technically-valid SOL/USDC path that settled on a quote ~58%
+    /// above the real, independently-confirmed price ($190.23 vs. the
+    /// real ~$120) after a few ticks' worth of amount-maximizing search
+    /// landed on it, then stayed there deterministically (same static
+    /// graph, same "best" answer every cycle) for 150+ seconds straight
+    /// -- each individual step up was too small (<3x) for
+    /// `market_stats::REJECT_RATIO`/the anchor to catch, since the
+    /// underlying quote itself was wrong at the source, not merely an
+    /// outlier in an otherwise-honest sequence. Querying every direct
+    /// pool independently and combining them by liquidity (see that
+    /// function's own doc comment) means one non-representative path
+    /// picked by a maximizing search can no longer single-handedly
+    /// decide the reported price the way a single best-path search can.
+    ///
+    /// Each returned price is `reserve_out / reserve_in`, fee-adjusted --
+    /// a *raw* per-raw-unit ratio, not decimal-normalized (this router
+    /// has no notion of a token's decimals; callers normalize using
+    /// their own known decimals, same convention `quote_symbol_usd`
+    /// already used before this existed).
+    pub fn direct_quotes(&self, from: AccountId, to: AccountId) -> Vec<DirectQuote> {
+        let Some(src) = self.node(from) else {
+            return Vec::new();
+        };
+        self.edges[src]
+            .iter()
+            .filter(|e| e.output_mint == to && e.reserve_in > 0 && e.reserve_out > 0)
+            .map(|e| {
+                let fee_mult = 1.0 - (e.fee_bps as f64 / 10_000.0);
+                DirectQuote {
+                    pool_id: e.pool_id,
+                    price: (e.reserve_out as f64 / e.reserve_in as f64) * fee_mult,
+                    // The destination-side reserve is already denominated
+                    // in `to`'s own raw units -- directly comparable
+                    // across every other pool quoting this exact same
+                    // pair, no USD conversion (and its circularity)
+                    // needed.
+                    weight: e.reserve_out as f64,
+                }
+            })
+            .collect()
+    }
+
+    /// Liquidity-weighted median across [`direct_quotes`]`(from, to)`,
+    /// falling back to one bridge hop through `bridge` (composing two
+    /// independently-weighted-median legs, `from->bridge` then
+    /// `bridge->to`) only when there is no live direct pool at all --
+    /// see `direct_quotes`'s own doc comment for why this replaces a
+    /// route search for "what's the honest price" queries. `bridge` is
+    /// typically the caller's own SOL mint; pass the same value as `to`
+    /// (or `from`) to skip the fallback entirely (a bridge that *is*
+    /// one of the endpoints can't help).
+    ///
+    /// A liquidity-weighted *median* (not mean) is deliberate: it always
+    /// returns one of the actually-observed pool prices, so a single
+    /// thin/manipulated pool can only move the result if it holds a
+    /// majority of the combined weight across every candidate pool --
+    /// the same robustness property real price oracles rely on a
+    /// same-pair multi-venue median for, instead of trusting whichever
+    /// single venue happens to look best.
+    pub fn liquidity_weighted_median_price(&self, from: AccountId, to: AccountId, bridge: AccountId) -> Option<f64> {
+        if let Some(p) = weighted_median(&self.direct_quotes(from, to)) {
+            return Some(p);
+        }
+        if bridge == from || bridge == to {
+            return None;
+        }
+        let leg1 = weighted_median(&self.direct_quotes(from, bridge))?;
+        let leg2 = weighted_median(&self.direct_quotes(bridge, to))?;
+        Some(leg1 * leg2)
     }
 
     /// Re-quote a single already-known edge (identified the same way a
@@ -1752,6 +1844,33 @@ impl TradeRouter {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Liquidity-weighted median of `quotes`' prices -- see
+/// [`TradeRouter::liquidity_weighted_median_price`]'s own doc comment for
+/// why a weighted median, not a weighted mean. `None` on an empty (or
+/// entirely non-finite/non-positive/zero-weight) input, same "unpriceable,
+/// don't treat as zero" contract every other quote function in this
+/// module uses.
+fn weighted_median(quotes: &[DirectQuote]) -> Option<f64> {
+    let mut sorted: Vec<&DirectQuote> = quotes
+        .iter()
+        .filter(|q| q.weight > 0.0 && q.price.is_finite() && q.price > 0.0)
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
+    let total_weight: f64 = sorted.iter().map(|q| q.weight).sum();
+    let half = total_weight / 2.0;
+    let mut cum = 0.0;
+    for q in &sorted {
+        cum += q.weight;
+        if cum >= half {
+            return Some(q.price);
+        }
+    }
+    sorted.last().map(|q| q.price)
+}
+
 /// Constant-product AMM quote: `dy = y * dx_after_fee / (x + dx_after_fee)`.
 ///
 /// For Orca CLMM pools this is an approximation (valid near the current tick).
@@ -2248,5 +2367,86 @@ mod tests {
         let net = cycle.net_profit_lamports(200_000, 10_000, 1);
         assert_eq!(net, 1_000 - 7_000);
         assert!(net < 0);
+    }
+
+    #[test]
+    fn direct_quotes_returns_one_entry_per_pool_for_a_pair() {
+        let mut r = router_with_nodes(&[MINT_A, MINT_B]);
+        const POOL_2: AccountId = 200;
+        r.add_generic_pair(POOL_1, MINT_A, MINT_B, 2.0, 0.0, 1_000, 2_000, DexType::Sanctum);
+        r.add_generic_pair(POOL_2, MINT_A, MINT_B, 2.1, 0.0, 500, 1_050, DexType::Sanctum);
+        assert_eq!(r.direct_quotes(MINT_A, MINT_B).len(), 2);
+    }
+
+    #[test]
+    fn direct_quotes_is_empty_for_an_unconnected_pair() {
+        let r = router_with_nodes(&[MINT_A, MINT_B]);
+        assert!(r.direct_quotes(MINT_A, MINT_B).is_empty());
+    }
+
+    #[test]
+    fn weighted_median_of_empty_is_none() {
+        assert_eq!(weighted_median(&[]), None);
+    }
+
+    #[test]
+    fn weighted_median_ignores_non_finite_and_zero_weight_candidates() {
+        let quotes = vec![
+            DirectQuote { pool_id: POOL_1, price: f64::NAN, weight: 100.0 },
+            DirectQuote { pool_id: POOL_1, price: 5.0, weight: 0.0 },
+            DirectQuote { pool_id: POOL_1, price: 3.0, weight: 10.0 },
+        ];
+        assert_eq!(weighted_median(&quotes), Some(3.0));
+    }
+
+    #[test]
+    fn liquidity_weighted_median_price_is_dominated_by_the_deeper_pool() {
+        // The real, live-confirmed incident this guards against
+        // (`TradeRouter::direct_quotes`'s own doc comment): a single
+        // route search can be swayed by one technically-valid but
+        // non-representative path. A thin, mispriced pool here must not
+        // move the result once a far deeper, honestly-priced pool is
+        // also a candidate.
+        let mut r = router_with_nodes(&[MINT_A, MINT_B]);
+        const POOL_2: AccountId = 200;
+        r.add_generic_pair(POOL_1, MINT_A, MINT_B, 10.0, 0.0, 10, 100, DexType::Sanctum);
+        r.add_generic_pair(POOL_2, MINT_A, MINT_B, 2.0, 0.0, 1_000_000, 2_000_000, DexType::Sanctum);
+        let price = r.liquidity_weighted_median_price(MINT_A, MINT_B, MINT_A).unwrap();
+        assert!((price - 2.0).abs() < 1e-9, "expected the deep pool's honest price, got {price}");
+    }
+
+    #[test]
+    fn liquidity_weighted_median_price_falls_back_to_bridge_when_no_direct_pool() {
+        let mut r = router_with_nodes(&[MINT_A, MINT_B, MINT_C]);
+        const POOL_2: AccountId = 200;
+        // A -> B at 2 (B per A), B -> C at 3 (C per B); no direct A->C pool.
+        r.add_generic_pair(POOL_1, MINT_A, MINT_B, 2.0, 0.0, 1_000, 2_000, DexType::Sanctum);
+        r.add_generic_pair(POOL_2, MINT_B, MINT_C, 3.0, 0.0, 1_000, 3_000, DexType::Sanctum);
+        let price = r.liquidity_weighted_median_price(MINT_A, MINT_C, MINT_B).unwrap();
+        assert!((price - 6.0).abs() < 1e-9, "expected composed bridge price 2*3=6, got {price}");
+    }
+
+    #[test]
+    fn liquidity_weighted_median_price_prefers_a_direct_pool_over_the_bridge() {
+        let mut r = router_with_nodes(&[MINT_A, MINT_B, MINT_C]);
+        const POOL_2: AccountId = 200;
+        const POOL_3: AccountId = 300;
+        r.add_generic_pair(POOL_1, MINT_A, MINT_C, 9.0, 0.0, 1_000, 9_000, DexType::Sanctum);
+        r.add_generic_pair(POOL_2, MINT_A, MINT_B, 2.0, 0.0, 1_000, 2_000, DexType::Sanctum);
+        r.add_generic_pair(POOL_3, MINT_B, MINT_C, 3.0, 0.0, 1_000, 3_000, DexType::Sanctum);
+        let price = r.liquidity_weighted_median_price(MINT_A, MINT_C, MINT_B).unwrap();
+        assert!((price - 9.0).abs() < 1e-9, "expected the direct pool's price 9.0, not the bridge's 6.0, got {price}");
+    }
+
+    #[test]
+    fn liquidity_weighted_median_price_none_when_bridge_is_an_endpoint_and_no_direct_pool() {
+        let r = router_with_nodes(&[MINT_A, MINT_C]);
+        assert_eq!(r.liquidity_weighted_median_price(MINT_A, MINT_C, MINT_A), None);
+    }
+
+    #[test]
+    fn liquidity_weighted_median_price_none_when_no_direct_pool_and_no_bridge_route() {
+        let r = router_with_nodes(&[MINT_A, MINT_B, MINT_C]);
+        assert_eq!(r.liquidity_weighted_median_price(MINT_A, MINT_C, MINT_B), None);
     }
 }
