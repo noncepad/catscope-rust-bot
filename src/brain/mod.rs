@@ -2,14 +2,15 @@ use std::{cell::UnsafeCell, rc::Rc};
 
 use crate::{
     brain::{
-        arbv1::ArbitrageV1Hook, testlatencylitev1::TestLatencyLiteV1Hook,
-        testperpv1::TestPerpV1Hook,
+        arbv1::ArbitrageV1Hook, marketwatchv1::MarketWatchV1Hook,
+        testlatencylitev1::TestLatencyLiteV1Hook, testperpv1::TestPerpV1Hook,
     },
     event_loop::EventHandler,
     message::Parser,
 };
 
 pub mod arbv1;
+pub mod marketwatchv1;
 // Experimental copy of `testperplatencyv1` with the DEX/lending
 // subscription setup stripped out -- see that module's own doc comment
 // for why. Delete this module (and its `BotMode` wiring below) once the
@@ -25,6 +26,7 @@ enum BotMode {
     Arbitrage(Box<ArbitrageV1Hook>),
     TestPerp(Box<TestPerpV1Hook>),
     TestLatencyLiteV1(Box<TestLatencyLiteV1Hook>),
+    MarketWatchV1(Box<MarketWatchV1Hook>),
 }
 
 impl Default for Merged {
@@ -39,6 +41,9 @@ impl Default for Merged {
                 UnsafeCell::new(Parser::default()),
             )))),
             "testperpv1" => BotMode::TestPerp(Box::new(TestPerpV1Hook::new(Rc::new(
+                UnsafeCell::new(Parser::default()),
+            )))),
+            "marketwatchv1" => BotMode::MarketWatchV1(Box::new(MarketWatchV1Hook::new(Rc::new(
                 UnsafeCell::new(Parser::default()),
             )))),
             "testlatencylitev1" => BotMode::TestLatencyLiteV1(Box::new(
@@ -71,6 +76,10 @@ impl EventHandler for Merged {
                 r = x.on_load(poller, args);
                 inner = BotMode::TestLatencyLiteV1(x);
             }
+            BotMode::MarketWatchV1(mut x) => {
+                r = x.on_load(poller, args);
+                inner = BotMode::MarketWatchV1(x);
+            }
         };
         self.inner.replace(inner);
         r
@@ -91,6 +100,10 @@ impl EventHandler for Merged {
             BotMode::TestLatencyLiteV1(mut x) => {
                 r = x.on_unload();
                 inner = BotMode::TestLatencyLiteV1(x);
+            }
+            BotMode::MarketWatchV1(mut x) => {
+                r = x.on_unload();
+                inner = BotMode::MarketWatchV1(x);
             }
         };
         self.inner.replace(inner);
@@ -116,6 +129,10 @@ impl EventHandler for Merged {
                 r = x.on_event(event);
                 inner = BotMode::TestLatencyLiteV1(x);
             }
+            BotMode::MarketWatchV1(mut x) => {
+                r = x.on_event(event);
+                inner = BotMode::MarketWatchV1(x);
+            }
         };
         self.inner.replace(inner);
         r
@@ -136,6 +153,10 @@ impl EventHandler for Merged {
             BotMode::TestLatencyLiteV1(mut x) => {
                 r = x.flush();
                 inner = BotMode::TestLatencyLiteV1(x);
+            }
+            BotMode::MarketWatchV1(mut x) => {
+                r = x.flush();
+                inner = BotMode::MarketWatchV1(x);
             }
         };
         self.inner.replace(inner);
