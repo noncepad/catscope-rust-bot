@@ -78,6 +78,15 @@ use twox_hash::XxHash64;
 pub const KAMINO_LENDING_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
 
+/// Kamino's Scope oracle program -- owns every `OraclePrices` account
+/// (see the "Scope oracle" section below and `kamino_xstocks_watcher.rs`'s
+/// `XSTOCKS_SCOPE_PRICES_ACCOUNT`). Live-confirmed: this is the real
+/// `owner` field read back off `XSTOCKS_SCOPE_PRICES_ACCOUNT` itself, not
+/// assumed. Distinct from [`KAMINO_LENDING_PROGRAM_ID`] -- a Scope
+/// account's `on_account` real-data check must compare against this, not
+/// that.
+pub const SCOPE_PROGRAM_ID: Pubkey = Pubkey::from_str_const("HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuPa9MF2fWJ");
+
 /// Kamino's real main market -- confirmed via `api.kamino.finance/kamino-market`
 /// -- the same lending market every currently-tracked reserve (SOL/BTC/ETH)
 /// belongs to. Lets [`KaminoPosition`] derive this bot's obligation address
@@ -144,6 +153,11 @@ const OFF_BORROW_FACTOR_PCT: usize = 5008;
 /// -- that PDA does not match the address actually stored in real reserves,
 /// so these were created as plain accounts at `init_reserve` time, not PDAs.
 const OFF_COLLATERAL_MINT: usize = 2560;
+/// `collateral.mint_total_supply` -- see [`KaminoReserve::
+/// collateral_mint_total_supply`]'s doc comment: derived from the gap
+/// between `OFF_COLLATERAL_MINT` and `OFF_COLLATERAL_SUPPLY_VAULT`, not
+/// independently live-verified the way those two are.
+const OFF_COLLATERAL_MINT_TOTAL_SUPPLY: usize = OFF_COLLATERAL_MINT + 32;
 /// `collateral.supply_vault` -- see `OFF_COLLATERAL_MINT` for verification
 /// method; same "not actually a PDA in practice" caveat applies.
 const OFF_COLLATERAL_SUPPLY_VAULT: usize = 2600;
@@ -174,6 +188,17 @@ const BORROW_RATE_CURVE_POINTS: usize = 11;
 /// only -- the other three oracle fields read as the null pubkey/`None`
 /// for them today).
 const OFF_SCOPE_PRICES: usize = 5112;
+/// `config.token_info.scope_configuration.price_chain: [u16; 4]`, the
+/// field immediately following `price_feed` within `ScopeConfiguration`
+/// (`klend-interface`'s own generated docs: `price_feed: Pubkey` then
+/// `price_chain: [u16; 4]`, `#[repr(C)]` so no padding between them --
+/// hence `OFF_SCOPE_PRICES + 32`). Live-verified against all 13 real
+/// xStocks-market reserves this session: every one uses only
+/// `price_chain[0]` (a single-hop price, no chaining through an
+/// intermediate asset) -- the other 3 slots all read the `u16::MAX`
+/// "unused" sentinel on every reserve checked, so only the first index is
+/// parsed; see [`KaminoReserve::scope_price_chain_index`].
+const OFF_SCOPE_PRICE_CHAIN: usize = OFF_SCOPE_PRICES + 32;
 const OFF_SWITCHBOARD_PRICE_ORACLE: usize = 5160;
 const OFF_SWITCHBOARD_TWAP_ORACLE: usize = 5192;
 const OFF_PYTH_ORACLE: usize = 5224;
@@ -218,6 +243,12 @@ const DISC_REPAY_V2: [u8; 8] = [116, 174, 213, 76, 180, 53, 210, 144];
 const DISC_WITHDRAW_V2: [u8; 8] = [235, 52, 119, 152, 149, 197, 20, 7];
 /// sha256("global:init_obligation_farms_for_reserve")[..8]
 const DISC_INIT_OBLIGATION_FARMS_FOR_RESERVE: [u8; 8] = [136, 63, 15, 186, 211, 152, 168, 164];
+/// From `klend-sdk`'s own generated TS client
+/// (`liquidateObligationAndRedeemReserveCollateralV2.ts`'s `DISCRIMINATOR`),
+/// not computed by hand -- same discriminator already cited in this
+/// codebase's earlier research (see `kamino_xstocks_watcher.rs` history).
+const DISC_LIQUIDATE_OBLIGATION_AND_REDEEM_RESERVE_COLLATERAL_V2: [u8; 8] =
+    [162, 161, 35, 143, 30, 187, 185, 103];
 
 /// Conservative, unmeasured compute-unit budgets -- tune later against real
 /// `simulateTransaction` results. `KAMINO_REFRESH_OBLIGATION_PER_RESERVE_CU`
@@ -233,6 +264,12 @@ pub const KAMINO_BORROW_CU: u32 = 180_000;
 pub const KAMINO_REPAY_CU: u32 = 120_000;
 pub const KAMINO_WITHDRAW_CU: u32 = 180_000;
 pub const KAMINO_INIT_OBLIGATION_FARMS_FOR_RESERVE_CU: u32 = 50_000;
+/// Unmeasured -- no real `simulateTransaction` run against this ix yet
+/// (unlike the other budgets above, none of which are measured either, but
+/// this one touches two reserves plus a collateral redeem in one
+/// instruction, so it's sized well above [`KAMINO_WITHDRAW_CU`] as a
+/// starting margin, not a confirmed number).
+pub const KAMINO_LIQUIDATE_CU: u32 = 400_000;
 
 /// `u64::MAX` signals "repay the obligation's full outstanding debt" /
 /// "withdraw the reserve's entire deposited amount" -- confirmed against
@@ -313,6 +350,17 @@ pub struct KaminoReserve {
     /// market. `0.0` means this reserve can't be used as collateral at all
     /// (e.g. an isolated/borrow-only market).
     pub loan_to_value_pct: f64,
+    /// `config.liquidation_threshold_pct` -- the collateral ratio below
+    /// which an obligation becomes liquidatable, distinct from (and
+    /// always `>= loan_to_value_pct`, giving borrowers a buffer between
+    /// "can't borrow more" and "gets liquidated") the max-borrow LTV
+    /// above. The byte immediately after `loan_to_value_pct` in the real
+    /// account -- previously only read as a cross-check that
+    /// [`OFF_LOAN_TO_VALUE_PCT`] was the right offset (see that constant's
+    /// own doc comment: consistently 5-10 points higher across 8 real
+    /// mainnet reserves, matching every real lending protocol's
+    /// LTV-vs-threshold relationship), now promoted to a real field.
+    pub liquidation_threshold_pct: f64,
     /// `config.borrow_factor_pct` -- risk-adjustment multiplier applied to
     /// this reserve's asset when it's *borrowed* (not deposited): a $1.00
     /// borrow counts as `borrow_factor_pct / 100.0` dollars against the
@@ -337,6 +385,19 @@ pub struct KaminoReserve {
     /// This reserve's cToken mint (`collateral.mint_pubkey`) -- needed by
     /// deposit/withdraw, which move cTokens as obligation collateral.
     pub collateral_mint: AccountId,
+    /// `collateral.mint_total_supply` -- total cTokens outstanding for
+    /// this reserve, i.e. the denominator of the cToken<->underlying
+    /// exchange rate (see [`Self::ctokens_to_underlying`]). Offset derived
+    /// (not independently live-verified the way most fields in this
+    /// struct are) from the 40-byte gap between [`OFF_COLLATERAL_MINT`]
+    /// and [`OFF_COLLATERAL_SUPPLY_VAULT`] -- both of those *are*
+    /// independently live-verified, and `mint_pubkey(32) +
+    /// mint_total_supply(8) = 40` is the only field shape that fills that
+    /// gap in klend's real `ReserveCollateral` (cross-checked against
+    /// `klend-sdk`'s own `Reserve::state.collateral.mintTotalSupply`
+    /// usage). Worth an explicit live cross-check before trusting this for
+    /// anything beyond an approximate health factor.
+    pub collateral_mint_total_supply: u64,
     /// This reserve's cToken supply vault (`collateral.supply_vault`).
     pub collateral_supply_vault: AccountId,
     /// Real oracle accounts `refresh_reserve` needs -- `None` when the
@@ -348,6 +409,18 @@ pub struct KaminoReserve {
     pub switchboard_price_oracle: Option<AccountId>,
     pub switchboard_twap_oracle: Option<AccountId>,
     pub scope_prices: Option<AccountId>,
+    /// Index into [`scope_prices`]'s `OraclePrices.prices` array for this
+    /// reserve's own live price -- `None` for the `u16::MAX` "unused"
+    /// sentinel (only relevant when `scope_prices` is also `None`, since
+    /// every reserve checked this session uses Scope). See
+    /// [`OFF_SCOPE_PRICE_CHAIN`]'s doc comment and
+    /// [`parse_scope_price`]/[`KaminoReserve::live_price_usd`] for what
+    /// this drives: a fresher price than this reserve's own cached
+    /// `price_usd`, which is only as fresh as the last time *anyone* sent
+    /// a Kamino instruction touching this specific reserve -- live-
+    /// observed this session to lag Scope's own ~30-40s refresh cadence
+    /// by several minutes on a quiet reserve.
+    pub scope_price_chain_index: Option<u16>,
     /// Protocol's cut (0-100) of borrower interest -- see
     /// [`Self::current_supply_apy`].
     pub protocol_take_rate_pct: u8,
@@ -406,6 +479,57 @@ impl KaminoReserve {
     /// cheaper.
     pub fn flash_loan_fee_raw(&self, amount: u64) -> u64 {
         (amount as f64 * self.flash_loan_fee_fraction) as u64
+    }
+
+    /// Converts a cToken amount (as stored in an Obligation's
+    /// `deposit_reserve` entries -- see `ObligationCollateral`'s own doc
+    /// comment) to this reserve's underlying token, using `total_supply /
+    /// mint_total_supply` as the exchange rate (mirrors `klend-sdk`'s
+    /// `Reserve.cTokensToLiquidity`/`getCollateralExchangeRate`).
+    /// Approximate, not exact: real `total_supply` also subtracts
+    /// accumulated protocol/referrer fees, which aren't parsed here yet --
+    /// always a small correction relative to a reserve's real size, but a
+    /// correction this doesn't make. `1:1` (no conversion) if either side
+    /// is zero, matching `klend-sdk`'s own `INITIAL_COLLATERAL_RATE`
+    /// fallback for a fresh reserve with no deposits yet.
+    pub fn ctokens_to_underlying(&self, ctoken_amount: u64) -> f64 {
+        let total_supply = self.available_amount as f64 + self.borrowed_amount;
+        if total_supply <= 0.0 || self.collateral_mint_total_supply == 0 {
+            return ctoken_amount as f64;
+        }
+        ctoken_amount as f64 * total_supply / self.collateral_mint_total_supply as f64
+    }
+
+    /// This reserve's asset value in USD for a raw underlying `amount`,
+    /// scaled by `mint_decimals`.
+    pub fn underlying_to_usd(&self, amount: f64) -> f64 {
+        amount / 10f64.powi(self.mint_decimals as i32) * self.price_usd
+    }
+
+    /// The freshest price available for this reserve: Scope's own live
+    /// price (decoded from `scope_body`, the raw account data of whatever
+    /// this reserve's `scope_prices` points at) when `scope_body` is
+    /// `Some` and decodes successfully, falling back to this reserve's
+    /// own cached `price_usd` otherwise. See [`parse_scope_price`]'s own
+    /// doc comment for why this matters: `price_usd` is only as fresh as
+    /// the last Kamino instruction that happened to touch *this specific
+    /// reserve*, which can lag Scope's ~30-40s refresh cadence by
+    /// minutes on a quiet reserve -- live-observed this session (SPYx:
+    /// 364s stale cached vs. 37s stale via this path, at the same
+    /// moment).
+    pub fn live_price_usd(&self, scope_body: Option<&[u8]>) -> f64 {
+        if let (Some(body), Some(idx)) = (scope_body, self.scope_price_chain_index) {
+            if let Some(p) = parse_scope_price(body, idx) {
+                return p.price_usd;
+            }
+        }
+        self.price_usd
+    }
+
+    /// Same as [`Self::underlying_to_usd`], but priced via
+    /// [`Self::live_price_usd`] instead of the cached `price_usd`.
+    pub fn underlying_to_usd_live(&self, amount: f64, scope_body: Option<&[u8]>) -> f64 {
+        amount / 10f64.powi(self.mint_decimals as i32) * self.live_price_usd(scope_body)
     }
 
     /// Current utilization (0.0-1.0): borrowed / (available + borrowed).
@@ -611,6 +735,12 @@ impl KaminoReserve {
     /// Requires this reserve and `obligation` to have been refreshed in the
     /// same slot (see [`Self::refresh_reserve`]/[`refresh_obligation`]) --
     /// deposit only needs slot-freshness, not full oracle-price freshness.
+    /// Classic-SPL-Token liquidity mints only -- delegates to
+    /// [`Self::deposit_with_token_program`] with `SPL_TOKEN_PROGRAM_ID`.
+    /// See that function's doc comment for Token-2022 reserves (e.g. any
+    /// real xStocks-market reserve -- their liquidity mint is Token-2022,
+    /// confirmed on-chain, even though Kamino's own cToken collateral
+    /// mint stays classic SPL Token regardless).
     pub fn deposit(
         &self,
         reserve_id: AccountId,
@@ -618,6 +748,38 @@ impl KaminoReserve {
         liquidity_amount: u64,
         owner: AccountId,
         user_source_liquidity: AccountId,
+        wallet: &mut Wallet,
+    ) -> Result<(), TraderError> {
+        self.deposit_with_token_program(
+            reserve_id,
+            obligation,
+            liquidity_amount,
+            owner,
+            user_source_liquidity,
+            &SPL_TOKEN_PROGRAM_ID,
+            wallet,
+        )
+    }
+
+    /// Real fix (2026-09-17) for a documented gap: this instruction's
+    /// account list needs the *real* token program owning the reserve's
+    /// liquidity mint at the `liquidity_token_program` slot, not always
+    /// classic SPL Token -- confirmed on-chain for the real xStocks
+    /// market's TSLAx reserve (`5iTiczqgUegqA3PpoNpotizMbY9n1sRWr3oL6igKvWuf`):
+    /// its `token_mint` (TSLAx) is owned by `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`
+    /// (Token-2022), while its `collateral_mint` (Kamino's own cToken) is
+    /// separately confirmed owned by classic SPL Token -- so only this one
+    /// slot needs to vary per reserve; `collateral_token_program` stays
+    /// hardcoded to classic SPL Token (real, verified, not an assumption).
+    #[allow(clippy::too_many_arguments)]
+    pub fn deposit_with_token_program(
+        &self,
+        reserve_id: AccountId,
+        obligation: AccountId,
+        liquidity_amount: u64,
+        owner: AccountId,
+        user_source_liquidity: AccountId,
+        liquidity_token_program: &Pubkey,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
         let owner_pk = resolve(owner)?;
@@ -653,8 +815,8 @@ impl KaminoReserve {
                     AccountMeta::new(collateral_supply_pk, false),
                     AccountMeta::new(user_source_liquidity_pk, false),
                     AccountMeta::new_readonly(KAMINO_LENDING_PROGRAM_ID, false), // placeholder_user_destination_collateral: None
-                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // collateral_token_program
-                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // liquidity_token_program (Token-2022 mints unsupported)
+                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // collateral_token_program -- always classic, real on-chain, see this fn's doc comment
+                    AccountMeta::new_readonly(*liquidity_token_program, false), // liquidity_token_program
                     AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),
                     obligation_farm_user_state, // see `farm_accounts_metas`'s doc comment
                     reserve_farm_state,
@@ -806,6 +968,9 @@ impl KaminoReserve {
     /// active borrows, only slot-freshness is required (like deposit/repay);
     /// if it has active borrows, full oracle-price freshness is required for
     /// every deposit/borrow reserve, same as [`Self::borrow`].
+    /// Classic-SPL-Token liquidity mints only -- delegates to
+    /// [`Self::withdraw_with_token_program`] with `SPL_TOKEN_PROGRAM_ID`.
+    /// See that function's doc comment for Token-2022 reserves.
     pub fn withdraw(
         &self,
         reserve_id: AccountId,
@@ -813,6 +978,32 @@ impl KaminoReserve {
         collateral_amount: u64,
         owner: AccountId,
         user_destination_liquidity: AccountId,
+        wallet: &mut Wallet,
+    ) -> Result<(), TraderError> {
+        self.withdraw_with_token_program(
+            reserve_id,
+            obligation,
+            collateral_amount,
+            owner,
+            user_destination_liquidity,
+            &SPL_TOKEN_PROGRAM_ID,
+            wallet,
+        )
+    }
+
+    /// Real fix (2026-09-17) -- see [`Self::deposit_with_token_program`]'s
+    /// doc comment for the full real, on-chain-verified reasoning
+    /// (identical here: only `liquidity_token_program` varies per
+    /// reserve, `collateral_token_program` stays classic SPL Token).
+    #[allow(clippy::too_many_arguments)]
+    pub fn withdraw_with_token_program(
+        &self,
+        reserve_id: AccountId,
+        obligation: AccountId,
+        collateral_amount: u64,
+        owner: AccountId,
+        user_destination_liquidity: AccountId,
+        liquidity_token_program: &Pubkey,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
         let owner_pk = resolve(owner)?;
@@ -848,8 +1039,8 @@ impl KaminoReserve {
                     AccountMeta::new(supply_vault_pk, false),
                     AccountMeta::new(dest_liq_pk, false),
                     AccountMeta::new_readonly(KAMINO_LENDING_PROGRAM_ID, false), // placeholder_user_destination_collateral: None
-                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // collateral_token_program
-                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // liquidity_token_program (Token-2022 mints unsupported)
+                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // collateral_token_program -- always classic, real on-chain, see deposit_with_token_program's doc comment
+                    AccountMeta::new_readonly(*liquidity_token_program, false), // liquidity_token_program
                     AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),
                     obligation_farm_user_state, // see `farm_accounts_metas`'s doc comment
                     reserve_farm_state,
@@ -1186,6 +1377,46 @@ pub fn init_obligation_farms_for_reserve(
 /// these lists (see the credit-graph module's non-goals: no automatic
 /// position discovery). Assumes the obligation has no referrer (this bot
 /// never sets one up via [`init_user_metadata`]).
+///
+/// That non-goal isn't an oversight -- every obligation/position tracker
+/// in this bot (this file, `solend.rs`, `marginfi.rs`) exists to manage
+/// *the bot's own* credit position (see
+/// `brain/leveraged_yield_farming_plan.md`'s Phase 3/4: health-factor
+/// monitoring and deleveraging, of the bot's own loop, under a standing
+/// discipline the plan calls out as "more load-bearing here than anywhere
+/// else in this bot given the liquidation risk involved"). Nothing here
+/// has ever looked at *other* users' positions. Watching -- and the
+/// hackathon plan's stretch goal, liquidating -- other borrowers' real
+/// obligations is a different category of action than that discipline was
+/// written for, not a bigger version of the same feature. Whether to take
+/// that on is a scope decision for whoever owns that plan, not something
+/// to build past on the strength of "it's technically possible."
+///
+/// The technical path, if that scope is approved: `getProgramAccounts`
+/// once (memcmp on Obligation's discriminator + `lending_market` at
+/// offset 32) to get every real obligation address in a market, then a
+/// direct `graph::Graph::subscribe(SubscriptionRequest { root:
+/// obligation_id, filter_weight: 0, depth: 0 })` per address --
+/// `depth: 0` means "just this account," so it works without any edge
+/// existing for it in edge-generator's Catscope account graph, only on
+/// the account already being tracked (true here: Obligation accounts are
+/// owned by Kamino's lending program, already in every reserve/market
+/// parser's `program_id_list()`). Prototyped and verified correct against
+/// 6,968 real obligations in edge-generator this session (2026-09-17) --
+/// 6,656 matched a real xStocks-market reserve address, 1,755 of those
+/// specifically TSLAx -- then reverted uncommitted pending the scope
+/// question above. The offsets used
+/// (`owner`/`lending_market`/`deposits`/`borrows`) match this file's own
+/// [`OFF_OB_DEPOSITS`]/[`OFF_OB_BORROWS`] etc., so re-deriving them isn't
+/// the blocker if this gets a go-ahead.
+///
+/// A `getProgramAccounts`-then-subscribe approach also only finds
+/// obligations that exist at scan time; a reserve -> obligation edge in
+/// edge-generator (mirroring `lending_market -> reserve`, already there)
+/// would let new ones surface automatically via a `depth: 1` subscription
+/// on the reserve -- a real design tradeoff of its own (geyser-plugin
+/// change + a live-validator test to confirm it works end to end) worth
+/// weighing only once the scope question above is settled.
 pub fn refresh_obligation(
     lending_market: AccountId,
     obligation: AccountId,
@@ -1214,6 +1445,129 @@ pub fn refresh_obligation(
             data: DISC_REFRESH_OBLIGATION.to_vec(),
         },
         cu,
+    );
+    Ok(())
+}
+
+/// Append a `liquidate_obligation_and_redeem_reserve_collateral_v2`
+/// instruction to `wallet`. Repays up to `liquidity_amount` of
+/// `obligation`'s debt on `repay_reserve`, in exchange for a discounted
+/// amount of `withdraw_reserve`'s collateral -- already redeemed to the
+/// underlying token (not raw cTokens), since this is the
+/// "AndRedeemReserveCollateral" V2 variant, in one instruction.
+///
+/// `liquidator` need not be a stranger: klend's own handler explicitly
+/// allows `liquidator == obligation.owner` (self-liquidation) -- verified
+/// directly against `handler_liquidate_obligation_and_redeem_reserve_
+/// collateral.rs`'s `process_impl`, no block found. The one owner-gated
+/// behavior in this instruction (`max_allowed_ltv_override_percent`) only
+/// takes effect when the program is built with `cfg!(feature =
+/// "staging")`, which the real deployed mainnet program isn't -- so it's
+/// hardcoded to 0 here regardless of who owns the obligation; passing
+/// anything else would have no effect on mainnet anyway.
+///
+/// Unlike V1, V2's handler (`process_v2`) does not require
+/// `refresh_reserve`/[`refresh_obligation`] to be the immediately-
+/// preceding instructions in the same transaction (V1's `check_refresh_
+/// ixs!` call is simply absent from `process_v2`) -- but both reserves and
+/// the obligation still need to be fresh enough to pass their own on-chain
+/// staleness check, so callers should still refresh them first in the same
+/// transaction, same as every other real op in this file.
+///
+/// Account order and signer/writable roles verified against `klend-sdk`'s
+/// own generated TypeScript client
+/// (`src/@codegen/klend/instructions/liquidateObligationAndRedeemReserveCollateralV2.ts`),
+/// not reconstructed by hand -- including the `AccountRole` bitflag mapping
+/// (`@solana/kit`'s `packages/instructions/src/roles.ts`: 0=readonly,
+/// 1=writable, 2=readonly+signer, 3=writable+signer) used to decide each
+/// `AccountMeta::new`/`new_readonly` call below.
+#[allow(clippy::too_many_arguments)]
+pub fn liquidate_obligation_and_redeem_reserve_collateral_v2(
+    liquidator: AccountId,
+    obligation: AccountId,
+    lending_market: AccountId,
+    repay_reserve_id: AccountId,
+    repay_reserve: &KaminoReserve,
+    withdraw_reserve_id: AccountId,
+    withdraw_reserve: &KaminoReserve,
+    liquidity_amount: u64,
+    min_acceptable_received_liquidity_amount: u64,
+    user_source_liquidity: AccountId,
+    user_destination_collateral: AccountId,
+    user_destination_liquidity: AccountId,
+    repay_liquidity_token_program: &Pubkey,
+    withdraw_liquidity_token_program: &Pubkey,
+    wallet: &mut Wallet,
+) -> Result<(), TraderError> {
+    let liquidator_pk = resolve(liquidator)?;
+    let obligation_pk = resolve(obligation)?;
+    let lm_pk = resolve(lending_market)?;
+    let lma_pk = lending_market_authority(&lm_pk);
+
+    let repay_reserve_pk = resolve(repay_reserve_id)?;
+    let repay_reserve_mint_pk = resolve(repay_reserve.token_mint)?;
+    let repay_reserve_supply_pk = resolve(repay_reserve.supply_vault)?;
+
+    let withdraw_reserve_pk = resolve(withdraw_reserve_id)?;
+    let withdraw_reserve_mint_pk = resolve(withdraw_reserve.token_mint)?;
+    let withdraw_reserve_collateral_mint_pk = resolve(withdraw_reserve.collateral_mint)?;
+    let withdraw_reserve_collateral_supply_pk = resolve(withdraw_reserve.collateral_supply_vault)?;
+    let withdraw_reserve_supply_pk = resolve(withdraw_reserve.supply_vault)?;
+    let withdraw_reserve_fee_receiver_pk = resolve(withdraw_reserve.fee_vault)?;
+
+    let user_source_liquidity_pk = resolve(user_source_liquidity)?;
+    let user_destination_collateral_pk = resolve(user_destination_collateral)?;
+    let user_destination_liquidity_pk = resolve(user_destination_liquidity)?;
+
+    // collateralFarmsAccounts uses withdraw_reserve's farm (collateral-side);
+    // debtFarmsAccounts uses repay_reserve's farm (debt-side) -- matches
+    // process_v2's own `refresh_farms!` pairing exactly (withdraw_reserve
+    // with Collateral, repay_reserve with Debt).
+    let (collateral_obligation_farm_user_state, collateral_reserve_farm_state) =
+        farm_accounts_metas(withdraw_reserve.farm_collateral, obligation_pk)?;
+    let (debt_obligation_farm_user_state, debt_reserve_farm_state) =
+        farm_accounts_metas(repay_reserve.farm_debt, obligation_pk)?;
+
+    let mut data = Vec::with_capacity(32);
+    data.extend_from_slice(&DISC_LIQUIDATE_OBLIGATION_AND_REDEEM_RESERVE_COLLATERAL_V2);
+    data.extend_from_slice(&liquidity_amount.to_le_bytes());
+    data.extend_from_slice(&min_acceptable_received_liquidity_amount.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes()); // max_allowed_ltv_override_percent -- see doc comment
+
+    wallet.require_signer(liquidator);
+    wallet.append_ix(
+        Instruction {
+            program_id: KAMINO_LENDING_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new_readonly(liquidator_pk, true), // liquidator (signer, not writable -- role 2)
+                AccountMeta::new(obligation_pk, false),
+                AccountMeta::new_readonly(lm_pk, false),
+                AccountMeta::new_readonly(lma_pk, false),
+                AccountMeta::new(repay_reserve_pk, false),
+                AccountMeta::new_readonly(repay_reserve_mint_pk, false),
+                AccountMeta::new(repay_reserve_supply_pk, false),
+                AccountMeta::new(withdraw_reserve_pk, false),
+                AccountMeta::new_readonly(withdraw_reserve_mint_pk, false),
+                AccountMeta::new(withdraw_reserve_collateral_mint_pk, false),
+                AccountMeta::new(withdraw_reserve_collateral_supply_pk, false),
+                AccountMeta::new(withdraw_reserve_supply_pk, false),
+                AccountMeta::new(withdraw_reserve_fee_receiver_pk, false),
+                AccountMeta::new(user_source_liquidity_pk, false),
+                AccountMeta::new(user_destination_collateral_pk, false),
+                AccountMeta::new(user_destination_liquidity_pk, false),
+                AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // collateralTokenProgram -- always classic, see withdraw_with_token_program's doc comment
+                AccountMeta::new_readonly(*repay_liquidity_token_program, false),
+                AccountMeta::new_readonly(*withdraw_liquidity_token_program, false),
+                AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),
+                collateral_obligation_farm_user_state,
+                collateral_reserve_farm_state,
+                debt_obligation_farm_user_state,
+                debt_reserve_farm_state,
+                AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false),
+            ],
+            data,
+        },
+        KAMINO_LIQUIDATE_CU,
     );
     Ok(())
 }
@@ -1590,6 +1944,7 @@ pub fn parse(body: &[u8]) -> Option<KaminoReserve> {
             Some(read_pk(off))
         }
     };
+    let read_u16 = |off: usize| u16::from_le_bytes(body[off..off + 2].try_into().unwrap());
     let mut borrow_rate_curve = [(0u32, 0u32); BORROW_RATE_CURVE_POINTS];
     for (i, point) in borrow_rate_curve.iter_mut().enumerate() {
         let base = OFF_BORROW_RATE_CURVE + i * 8;
@@ -1602,6 +1957,7 @@ pub fn parse(body: &[u8]) -> Option<KaminoReserve> {
         supply_vault: read_pk(OFF_SUPPLY_VAULT),
         fee_vault: read_pk(OFF_FEE_VAULT),
         collateral_mint: read_pk(OFF_COLLATERAL_MINT),
+        collateral_mint_total_supply: read_u64(OFF_COLLATERAL_MINT_TOTAL_SUPPLY),
         collateral_supply_vault: read_pk(OFF_COLLATERAL_SUPPLY_VAULT),
         available_amount: read_u64(OFF_AVAILABLE_AMOUNT),
         borrowed_amount: read_u128(OFF_BORROWED_AMOUNT_SF) as f64 / SF_SCALE,
@@ -1609,16 +1965,104 @@ pub fn parse(body: &[u8]) -> Option<KaminoReserve> {
         mint_decimals: read_u64(OFF_MINT_DECIMALS),
         flash_loan_fee_fraction: read_u64(OFF_FLASH_LOAN_FEE_SF) as f64 / SF_SCALE,
         loan_to_value_pct: body[OFF_LOAN_TO_VALUE_PCT] as f64 / 100.0,
+        liquidation_threshold_pct: body[OFF_LOAN_TO_VALUE_PCT + 1] as f64 / 100.0,
         borrow_factor_pct: read_u64(OFF_BORROW_FACTOR_PCT) as f64 / 100.0,
         pyth_oracle: read_optional_pk(OFF_PYTH_ORACLE),
         switchboard_price_oracle: read_optional_pk(OFF_SWITCHBOARD_PRICE_ORACLE),
         switchboard_twap_oracle: read_optional_pk(OFF_SWITCHBOARD_TWAP_ORACLE),
         scope_prices: read_optional_pk(OFF_SCOPE_PRICES),
+        scope_price_chain_index: match read_u16(OFF_SCOPE_PRICE_CHAIN) {
+            SCOPE_PRICE_CHAIN_UNUSED => None,
+            idx => Some(idx),
+        },
         protocol_take_rate_pct: body[OFF_PROTOCOL_TAKE_RATE_PCT],
         borrow_rate_curve,
         status: body[OFF_RESERVE_STATUS],
         farm_collateral: read_optional_pk(OFF_FARM_COLLATERAL),
         farm_debt: read_optional_pk(OFF_FARM_DEBT),
+    })
+}
+
+// ─── Scope oracle (OraclePrices account) ──────────────────────────────────────
+//
+// Every xStocks-market reserve's `scope_prices` field (see
+// `OFF_SCOPE_PRICES`) points at the *same* account,
+// `3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH` -- live-verified against
+// all 13 reserves this session, one `getMultipleAccounts` call. Real
+// layout, from Kamino's own `scope` program source
+// (Kamino-Finance/scope, `states/oracle_prices.rs` + `states/
+// dated_price.rs`), not guessed:
+//
+//   OraclePrices { oracle_mappings: Pubkey, prices: [DatedPrice; 512] }
+//   DatedPrice { price: Price, last_updated_slot: u64, unix_timestamp: u64, generic_data: [u8; 24] }
+//   Price { value: u64, exp: u64 }
+//
+// So on-chain: 8 (Anchor discriminator) + 32 (oracle_mappings) + index *
+// 56 (DatedPrice size: 16 + 8 + 8 + 24) gets one entry. Live-verified
+// end to end against SPYx's real reserve: decoded price
+// ($771.7652392724656) matched its cached `market_price_sf` exactly, and
+// `unix_timestamp` was 37s stale at read time vs. that same reserve's
+// cached price being 364s stale -- real account size also matched
+// exactly (28712 bytes total).
+
+/// Sentinel `price_chain`/index value meaning "this slot isn't used" --
+/// see [`OFF_SCOPE_PRICE_CHAIN`]'s doc comment.
+const SCOPE_PRICE_CHAIN_UNUSED: u16 = u16::MAX;
+/// Bytes before `OraclePrices.prices[0]` starts: 8-byte Anchor
+/// discriminator + 32-byte `oracle_mappings` pubkey.
+const SCOPE_PRICES_HEADER_LEN: usize = 8 + 32;
+/// `size_of::<DatedPrice>()`: `Price` (`value: u64` + `exp: u64` = 16) +
+/// `last_updated_slot: u64` (8) + `unix_timestamp: u64` (8) +
+/// `generic_data: [u8; 24]` (24) = 56.
+const SCOPE_DATED_PRICE_SIZE: usize = 56;
+/// `size_of::<[DatedPrice; 512]>()` fits in the real account's declared
+/// `ORACLE_PRICES_SIZE` (28704 bytes for the struct body, i.e. excluding
+/// the 8-byte Anchor discriminator) minus `oracle_mappings`: `(28704 -
+/// 32) / 56 == 512` exactly.
+const SCOPE_MAX_ENTRIES: usize = 512;
+
+/// One decoded Scope price -- see this section's own doc comment for the
+/// real on-chain layout this reads.
+#[derive(Debug, Clone, Copy)]
+pub struct ScopePrice {
+    pub price_usd: f64,
+    pub last_updated_slot: u64,
+    pub unix_timestamp: u64,
+}
+
+/// Decodes one entry out of a raw Scope `OraclePrices` account (`body` is
+/// the full, untouched account data -- same convention as
+/// [`parse_kamino_reserve`]/[`parse_kamino_obligation`]). `index` is a
+/// reserve's own [`KaminoReserve::scope_price_chain_index`]. `None` if
+/// `body` is too short for that index (a stale/partial account read) or
+/// `index >= SCOPE_MAX_ENTRIES` -- callers should fall back to the
+/// reserve's own cached `price_usd` in either case, see
+/// [`KaminoReserve::live_price_usd`].
+pub fn parse_scope_price(body: &[u8], index: u16) -> Option<ScopePrice> {
+    let index = index as usize;
+    if index >= SCOPE_MAX_ENTRIES {
+        return None;
+    }
+    let base = SCOPE_PRICES_HEADER_LEN + index * SCOPE_DATED_PRICE_SIZE;
+    if body.len() < base + SCOPE_DATED_PRICE_SIZE {
+        return None;
+    }
+    let read_u64 = |off: usize| u64::from_le_bytes(body[off..off + 8].try_into().unwrap());
+    let value = read_u64(base);
+    let exp = read_u64(base + 8);
+    let last_updated_slot = read_u64(base + 16);
+    let unix_timestamp = read_u64(base + 24);
+    // exp is realistically always small (Scope prices this session were
+    // exp=15) but guard the pathological case rather than let a garbage
+    // read produce an `f64` overflow/NaN that then silently poisons a
+    // health-factor comparison.
+    if exp > 30 {
+        return None;
+    }
+    Some(ScopePrice {
+        price_usd: value as f64 / 10f64.powi(exp as i32),
+        last_updated_slot,
+        unix_timestamp,
     })
 }
 

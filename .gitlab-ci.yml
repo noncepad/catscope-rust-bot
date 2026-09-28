@@ -106,7 +106,7 @@ build_docker_builder:
     entrypoint: [""]
   tags: ["kube", "shared"]
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "main1"
   variables:
     FF_KUBERNETES_HONOR_ENTRYPOINT: "false"
     BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
@@ -147,7 +147,7 @@ deploy_builder:
     name: bitnami/kubectl:latest
     entrypoint: [""]
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "main1"
   variables:
     FF_USE_LEGACY_KUBERNETES_EXECUTION_STRATEGY: "true"
     FF_KUBERNETES_HONOR_ENTRYPOINT: "false"

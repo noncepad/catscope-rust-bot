@@ -26,7 +26,8 @@ use solana_sdk::{
 };
 use solana_sdk_ids::system_program::ID as SystemProgramID;
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account_idempotent,
+    get_associated_token_address, get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account_idempotent,
 };
 use std::{
     cell::UnsafeCell,
@@ -609,6 +610,25 @@ impl Wallet {
         Some(account_id_from_pubkey(&ata_address))
     }
 
+    /// Same as [`Self::derive_ata`], but for a mint owned by a token
+    /// program other than classic SPL Token (e.g. Token-2022) -- the ATA
+    /// address is a function of the owning token program too, not just
+    /// owner+mint, so a Token-2022 mint's real ATA is a *different*
+    /// address than `derive_ata` would compute for it (e.g. TSLAx and the
+    /// other xStock mints).
+    pub fn derive_ata_with_program(
+        &self,
+        owner: AccountId,
+        mint: AccountId,
+        token_program: &Pubkey,
+    ) -> Option<AccountId> {
+        let owner_pubkey = pubkey_from_account_id(&owner)?;
+        let mint_pubkey = pubkey_from_account_id(&mint)?;
+        let ata_address =
+            get_associated_token_address_with_program_id(&owner_pubkey, &mint_pubkey, token_program);
+        Some(account_id_from_pubkey(&ata_address))
+    }
+
     /// Derives (not subscribes -- no host call besides `derive_ata`'s
     /// own address resolution, both cache-backed via
     /// `util::PubkeyAccountIdCache`) the `SubscriptionRequest` for
@@ -625,6 +645,24 @@ impl Wallet {
         mint: AccountId,
     ) -> Option<SubscriptionRequest> {
         let ata = self.derive_ata(owner, mint)?;
+        Some(SubscriptionRequest {
+            root: ata,
+            filter_weight: 0,
+            depth: 1,
+        })
+    }
+
+    /// Same as [`Self::ata_subscribe_request`], but for a mint owned by a
+    /// token program other than classic SPL Token -- see
+    /// [`Self::derive_ata_with_program`]'s doc comment for why the
+    /// program matters to the address itself.
+    pub fn ata_subscribe_request_with_program(
+        &self,
+        owner: AccountId,
+        mint: AccountId,
+        token_program: &Pubkey,
+    ) -> Option<SubscriptionRequest> {
+        let ata = self.derive_ata_with_program(owner, mint, token_program)?;
         Some(SubscriptionRequest {
             root: ata,
             filter_weight: 0,
@@ -747,24 +785,43 @@ impl Wallet {
     /// Derive the ATA for `owner`+`mint`, append a `CreateIdempotent` instruction,
     /// and return the ATA pubkey. Returns `None` if no payer is set.
     pub fn append_create_ata(&mut self, owner: AccountId, mint: AccountId) -> Option<AccountId> {
+        self.append_create_ata_with_program(owner, mint, &spl_token::ID)
+    }
+
+    /// Same as [`Self::append_create_ata`], but for a mint owned by a
+    /// token program other than classic SPL Token (e.g. Token-2022) --
+    /// see [`Self::derive_ata_with_program`]'s doc comment for why the
+    /// program matters to the address itself, not just the instruction.
+    pub fn append_create_ata_with_program(
+        &mut self,
+        owner: AccountId,
+        mint: AccountId,
+        token_program: &Pubkey,
+    ) -> Option<AccountId> {
         let owner_pubkey = self.pubkey_from_account_id(&owner)?;
         let mint_pubkey = self.pubkey_from_account_id(&mint)?;
-        let ix = make_ata_instruction(&owner_pubkey, &owner_pubkey, &mint_pubkey);
-        let ata_address: Pubkey = get_associated_token_address(&owner_pubkey, &mint_pubkey);
+        let ix = make_ata_instruction(&owner_pubkey, &owner_pubkey, &mint_pubkey, token_program);
+        let ata_address: Pubkey =
+            get_associated_token_address_with_program_id(&owner_pubkey, &mint_pubkey, token_program);
         self.require_signer(owner);
-        // Was 5_000 -- real, live-confirmed `ComputationalBudgetExceeded`
-        // (leveragedloopv1's first real deposit-collateral attempt,
-        // 2026-08-27): a real `CreateIdempotent` needed slightly more than
-        // the ~4,700 CU actually left after fixed per-transaction overhead
-        // ate into the requested 5,000. Never surfaced before because
-        // every other real transaction bundled this with other
-        // instructions carrying their own generous CU budgets, so the
-        // transaction-level total always covered the shortfall regardless
-        // -- only exposed once `Wallet::assemble()`'s size-based splitter
-        // happened to isolate a bare ATA creation into its own
-        // transaction. Bumped to a comfortable margin, not tuned to the
-        // exact real minimum.
-        self.append_ix(ix, 15_000);
+        // 15_000 (classic SPL Token's own real-confirmed minimum, see
+        // `append_create_ata`'s doc comment) is NOT enough here -- real,
+        // live-confirmed 2026-09-15 (`testperpv1`'s first real
+        // Token-2022 ATA-creation attempt): a Token-2022 mint carrying
+        // real extensions (this codebase's test mint has
+        // `metadataPointer`/`tokenMetadata`) makes `CreateIdempotent` CPI
+        // into `GetAccountDataSize` *and* run `InitializeImmutableOwner`
+        // before the final `InitializeAccount3` -- real on-chain evidence
+        // (`getTransaction` on the failed attempt): all 15,000 CU
+        // consumed, failing with `ProgramFailedToComplete` /
+        // "exceeded CUs meter at BPF instruction" mid-way through
+        // `InitializeAccount3` itself, i.e. genuinely out of budget, not a
+        // different bug. Classic Token never pays for any of that (no
+        // extensions, no extra CPI hops), which is why this only ever
+        // surfaced here, not on `append_create_ata`'s own path. Bumped
+        // generously (not tuned to this one mint's exact minimum, since a
+        // different mint's extension set could cost more or less).
+        self.append_ix(ix, 40_000);
         Some(account_id_from_pubkey(&ata_address))
     }
 
@@ -1923,8 +1980,13 @@ fn build_and_serialize(
     }
 }
 
-fn make_ata_instruction(payer: &Pubkey, wallet_owner: &Pubkey, token_mint: &Pubkey) -> Instruction {
-    create_associated_token_account_idempotent(payer, wallet_owner, token_mint, &spl_token::ID)
+fn make_ata_instruction(
+    payer: &Pubkey,
+    wallet_owner: &Pubkey,
+    token_mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    create_associated_token_account_idempotent(payer, wallet_owner, token_mint, token_program)
 }
 
 /// Decodes a durable-nonce account's raw body into its current

@@ -28,11 +28,24 @@
 
 pub mod bundler;
 pub mod credit;
+pub mod derivative_router;
 pub mod dex;
+pub mod dispersion_basket;
+pub mod factor_basket;
+pub mod factor_borrow_gate;
+pub mod factor_graph;
+pub mod factor_intent;
+pub mod factor_residual;
+pub mod residual_snapshot;
+pub mod factor_sizing;
+pub mod hawkes_factor;
 pub mod market_stats;
+pub mod pair_basket;
 pub mod perp_router;
 pub mod planner;
+pub mod portfolio;
 pub mod pricegraph;
 pub mod router;
 pub mod spfa;
+pub mod timegraph;
 pub mod types;
