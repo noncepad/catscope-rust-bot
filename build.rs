@@ -354,6 +354,15 @@ struct KaminoReserveJson {
     fee_vault: String,
 }
 
+/// Shape of `kamino_xstocks_obligation.json`
+/// (`optimizer/prefetch/kamino.ExportXstocksObligationsJSON`) -- just the
+/// discovered obligation addresses, no parsed fields; the bot decodes each
+/// one live once subscribed (see kamino_xstocks_watcher.rs).
+#[derive(Deserialize)]
+struct KaminoXstocksObligationJson {
+    pubkey: String,
+}
+
 /// Shape of `solend_reserve.json` (`optimizer/prefetch/solend.ExportJSON`).
 #[derive(Deserialize)]
 struct SolendReserveJson {
@@ -2326,6 +2335,36 @@ fn main() {
                 .expect("failed to create kamino_data.rs")
                 .write_all(code.as_bytes())
                 .expect("failed to write kamino_data.rs");
+        }
+        // ── kamino_xstocks_obligation.json → xstocks_obligation_data.rs ──────────
+        // Mirrors kamino_reserve.json → kamino_data.rs immediately above, but
+        // for optimizer/prefetch/kamino.CreateXstocksObligations's own
+        // getProgramAccounts scan (see that Go file's doc comment for why
+        // it's a separate scan, not derived from the Catscope graph like
+        // kamino_reserve.json). Degrades to empty, NOT required unlike
+        // kamino_reserve.json -- an older prefetch.db predating this table,
+        // or a dev build that hasn't re-run `download-arb` since this scan
+        // was added, should still build, just with an empty generated list
+        // (kamino_xstocks_watcher.rs falls back to its small hand-picked
+        // XSTOCKS_OBLIGATIONS sample when this is empty).
+        {
+            let mut code =
+                String::from("pub static XSTOCKS_OBLIGATIONS_GENERATED: &[[u8; 32]] = &[\n");
+            if let Some(json_str) =
+                read_target_json_file(&manifest_dir, "kamino_xstocks_obligation.json")
+            {
+                let obligations: Vec<KaminoXstocksObligationJson> = serde_json::from_str(&json_str)
+                    .expect("failed to parse kamino_xstocks_obligation.json");
+                for o in obligations {
+                    let pk = bs58_32(&o.pubkey, "pubkey");
+                    code.push_str(&format!("    {pk:?},\n"));
+                }
+            }
+            code.push_str("];\n");
+            File::create(out_dir.join("xstocks_obligation_data.rs"))
+                .expect("failed to create xstocks_obligation_data.rs")
+                .write_all(code.as_bytes())
+                .expect("failed to write xstocks_obligation_data.rs");
         }
         // ── prefetch db (marginfi_bank) → marginfi_data.rs ───────────────────────
         {

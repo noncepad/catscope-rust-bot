@@ -94,6 +94,13 @@ pub mod raydium_cpmm_config {
 pub mod kamino_config {
     include!(concat!(env!("OUT_DIR"), "/kamino_data.rs"));
 }
+/// Kamino xStocks-market obligation addresses (`XSTOCKS_OBLIGATIONS_GENERATED`),
+/// generated at build time from optimizer's own getProgramAccounts scan --
+/// see build.rs's own doc comment on this codegen block and
+/// trader::dex::kamino_xstocks_watcher for how it's used.
+pub mod kamino_xstocks_obligation_config {
+    include!(concat!(env!("OUT_DIR"), "/xstocks_obligation_data.rs"));
+}
 /// Sanctum S Controller LST list (`SanctumLstRaw`), generated at build time
 /// from the `sanctum_lst` table in the unified prefetch db (SQL_PATH).
 pub mod sanctum_config {

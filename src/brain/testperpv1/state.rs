@@ -34,7 +34,7 @@ use crate::{
     drift_config,
     err::CatscopeGuestError,
     event::SlotStatus,
-    graph::{AccountId, CommitHook, Graph, LowLatencyAccountUpdate, SubscriptionQueue},
+    graph::{AccountId, CommitHook, Graph, LowLatencyAccountUpdate, SubscriptionQueue, SubscriptionRequest},
     jet_config, kamino_config, log_error, log_info, log_warn, marginfi_config,
     message::{InboundMesasgeHandler, MessageAction, MessageSend},
     orca_config, phoenix_config, pumpfun_config, pumpswap_config, raydium_amm_config,
@@ -43,9 +43,9 @@ use crate::{
     tracked_accounts_config,
     trader::{
         dex::{
-            ember, kamino, marginfi,
+            ember, kamino, kamino_xstocks_watcher, marginfi,
             phoenix::{ix::Side, PhoenixState},
-            solend,
+            solend, tslax,
             update::Updater as _,
             DexState,
         },
@@ -53,6 +53,7 @@ use crate::{
         planner,
         pricegraph::TradeRouter,
         router,
+        types::SwapParams,
     },
     trading_config,
     txview::TransactionList,
@@ -197,6 +198,32 @@ pub(crate) enum TestPhase {
     BootstrapMarginfi,
     DepositMarginfi,
     WithdrawMarginfi,
+    /// TSLAx (Tesla xStock, a real Backed Finance Token-2022 mint) round
+    /// trip against its own live Raydium CLMM pool -- see
+    /// `trader::dex::tslax`'s module doc. A swap-shaped triad (not a
+    /// lending market): "deposit"/"withdraw" here mean "swap USDC into
+    /// TSLAx" / "swap it back", reusing the already real-trade-tested
+    /// `raydium::clmm` module. `WithdrawMarginfi` advances straight here.
+    BootstrapTslax,
+    DepositTslax,
+    /// TSLAx deposit/withdraw against the real Kamino xStocks lending
+    /// market (`kamino_xstocks_watcher::XSTOCKS_LENDING_MARKET`), a
+    /// *different* real market than `BootstrapKamino`/etc.'s main-market
+    /// obligation above -- see `kamino::deposit_with_token_program`'s doc
+    /// comment for the real, on-chain-confirmed reason this needed its
+    /// own Token-2022-aware deposit/withdraw variant (TSLAx's own reserve
+    /// there has a real Token-2022 liquidity mint, even though Kamino's
+    /// own cToken collateral mint stays classic SPL Token regardless).
+    /// Placed *between* `DepositTslax` and `WithdrawTslax` rather than
+    /// after: it needs real TSLAx to deposit, which `DepositTslax` just
+    /// acquired via Raydium, and hands back whatever's left for
+    /// `WithdrawTslax` to sell back to USDC at the end -- one real
+    /// Raydium buy funding both this lending round trip and the swap
+    /// round trip, not two separate acquisitions.
+    BootstrapKaminoTslax,
+    DepositKaminoTslax,
+    WithdrawKaminoTslax,
+    WithdrawTslax,
     /// Borrow/repay phases run *after* every protocol's own
     /// bootstrap/deposit/withdraw sequence completes, not interleaved
     /// with it -- each is self-contained (mirrors `open_solend_borrow_leg`
@@ -307,6 +334,38 @@ pub(crate) struct State {
     /// protocol exercised by this smoke test, otherwise identical
     /// role/lifecycle to `o_solend_position`/`o_kamino_position`.
     o_marginfi_position: Option<marginfi::MarginfiPosition>,
+    /// This wallet's TSLAx (Token-2022) ATA -- `None` until derived at
+    /// wallet-key-arrival time. `Wallet::token()` (the low-latency
+    /// `Tokenaccountv1` push feed) doesn't surface Token-2022 accounts at
+    /// all, so this is tracked via the plain `on_account`/`low_latency`
+    /// account path instead, reading the amount directly from the account
+    /// body (see `parse_token_amount`).
+    o_tslax_ata: Option<AccountId>,
+    /// Raw Token-2022 balance last observed for [`Self::o_tslax_ata`] --
+    /// `None` until a real account update for it has arrived, `Some(0)`
+    /// once seen but empty.
+    tslax_balance: Option<u64>,
+    /// Live TSLAx reserve in the real Kamino xStocks lending market
+    /// (`kamino_xstocks_watcher::XSTOCKS_LENDING_MARKET`) -- a *different*
+    /// real market than `o_dex`'s `KaminoState`, which only tracks the
+    /// main market's build-time reserve list, so this reserve needs its
+    /// own direct subscription (see the `Wallet` message handler). `None`
+    /// until a real account update for it has arrived.
+    o_kamino_tslax_reserve: Option<kamino::KaminoReserve>,
+    /// This wallet's obligation in the xStocks market -- a second,
+    /// independent obligation from `o_kamino_position`'s main-market one
+    /// (different `lending_market`, same `id = 0`; see
+    /// `kamino::obligation_pda`'s doc comment for why that's not a
+    /// collision). Deliberately tracked directly here rather than via a
+    /// second `KaminoPosition` instance: that struct's own
+    /// `authority_subscribe_requests`/`apply_authority` hardcode
+    /// `KAMINO_MAIN_MARKET`, and widening it wasn't needed for a single
+    /// test leg.
+    o_kamino_tslax_obligation_id: Option<AccountId>,
+    /// `None` until a real account update for
+    /// [`Self::o_kamino_tslax_obligation_id`] has arrived -- same
+    /// "registered()"-style signal as `KaminoPosition::registered`.
+    o_kamino_tslax_obligation: Option<kamino::KaminoObligation>,
     router: PerpRouter,
     /// The epoch currently being accumulated -- `None` until the first
     /// `evaluate()` call after `on_load`. Distinct from `PerpRouter`'s
@@ -348,6 +407,32 @@ pub(crate) struct State {
     /// Phase-1-style read-only leverage projection -- nothing in this bot
     /// opens a real leveraged position from this yet.
     lst_staking_apy: HashMap<String, f64>,
+    /// Latest `Slot` `low_latency`'s fast, ~400ms processed-account stream
+    /// has recorded for each account id -- lets
+    /// [`StateHelper::is_newer_than_low_latency`] reject a rooted
+    /// `Self::on_account` (~12s-late, but finalized) update when
+    /// `low_latency` has already delivered the same or newer data for
+    /// that account, mirroring `arbv1::state`'s identically-named
+    /// field/pattern (see its own doc comment for the full reasoning).
+    ///
+    /// Added after a real, on-chain-confirmed bug this session: this
+    /// mode's `on_account` had no such gate, so a late rooted duplicate
+    /// re-delivering this wallet's *pre-withdraw* Solend obligation bytes
+    /// (from the `[3/16]` deposit, moments before the `[4/16]` withdraw
+    /// that superseded them) silently rolled `o_solend_position`'s cached
+    /// obligation back to "still has a USDC deposit" -- and since nothing
+    /// else ever touches that account again, the wrong state stuck
+    /// around permanently, not just "briefly stale" as this file's old
+    /// (now-corrected) doc comment on `Self::on_account` assumed. That
+    /// fed `open_solend_borrow_leg`'s `has_usdc_collateral` check a false
+    /// positive, which built a `refresh_obligation` call against a
+    /// reserve list that no longer matched the real (by-then-empty)
+    /// on-chain obligation, tripping Solend's own strict remaining-
+    /// accounts check (`Custom(0xd) InvalidAccountInput`, "Too many
+    /// obligation deposit or borrow reserves provided") on every retry,
+    /// live-confirmed via `solana confirm -v` and a direct on-chain byte
+    /// decode of the obligation account.
+    m_account_slot: HashMap<AccountId, Slot>,
 }
 
 impl Default for State {
@@ -369,6 +454,11 @@ impl Default for State {
             o_solend_position: None,
             o_kamino_position: None,
             o_marginfi_position: None,
+            o_tslax_ata: None,
+            tslax_balance: None,
+            o_kamino_tslax_reserve: None,
+            o_kamino_tslax_obligation_id: None,
+            o_kamino_tslax_obligation: None,
             router: PerpRouter::default(),
             pending_epoch_ts: None,
             o_dex: None,
@@ -386,6 +476,7 @@ impl Default for State {
                 })
                 .collect(),
             lst_staking_apy: HashMap::new(),
+            m_account_slot: HashMap::default(),
         }
     }
 }
@@ -621,6 +712,104 @@ impl<'a> StateHelper<'a> {
         }
     }
 
+    /// Real, byte-for-byte identical to classic SPL Token's fixed-size
+    /// prefix (mint 32B + owner 32B + amount u64 LE at offset 64..72) --
+    /// Token-2022 keeps this layout even for accounts with extensions
+    /// (extensions are appended after the base 165-byte struct, keyed by a
+    /// discriminator at offset 165). See `State::o_tslax_ata`'s doc
+    /// comment for why this bot reads the amount directly instead of going
+    /// through `Wallet::token()`. Returns `None` if `body` is too short to
+    /// contain the amount field at all (e.g. an account not yet
+    /// initialized).
+    fn parse_token_amount(body: &[u8]) -> Option<u64> {
+        body.get(64..72).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    /// Checks `header`/`body` against [`State::o_tslax_ata`], updating
+    /// [`State::tslax_balance`] on a match. Merely *receiving* an update
+    /// for this accountid is not proof the ATA exists -- a real swap once
+    /// failed on-chain with `AccountNotInitialized` because a
+    /// never-created ATA was treated as `Some(0)`. `lamports == 0` or a
+    /// non-Token-2022 owner is what a nonexistent/closed account reports.
+    fn observe_tslax_account(&mut self, header: &Header, body: &[u8]) {
+        if Some(header.accountid) != self.state.o_tslax_ata {
+            return;
+        }
+        if header.owner == account_id_from_pubkey(&tslax::TOKEN_2022_PROGRAM_ID) && header.lamports > 0 {
+            self.state.tslax_balance = Some(Self::parse_token_amount(body).unwrap_or(0));
+        } else {
+            self.state.tslax_balance = None;
+        }
+    }
+
+    /// Checks `header`/`body` against the real, fixed Kamino xStocks
+    /// TSLAx reserve address (`kamino_xstocks_watcher::TSLAX_RESERVE`),
+    /// updating [`State::o_kamino_tslax_reserve`] on a match. This
+    /// reserve is owned by Kamino's lending program (not Token-2022), so
+    /// unlike [`Self::observe_tslax_account`] there's no equivalent
+    /// existence-gate needed here -- `kamino::parse` returning `Some` is
+    /// itself already gated on `body` being long enough to be a real
+    /// reserve account.
+    fn observe_kamino_tslax_reserve(&mut self, header: &Header, body: &[u8]) {
+        if header.accountid != account_id_from_pubkey(&kamino_xstocks_watcher::TSLAX_RESERVE) {
+            return;
+        }
+        if let Some(parsed) = kamino::parse(body) {
+            self.state.o_kamino_tslax_reserve = Some(parsed);
+        }
+    }
+
+    /// Checks `header`/`body` against [`State::o_kamino_tslax_obligation_id`],
+    /// updating [`State::o_kamino_tslax_obligation`] on a match -- same
+    /// "real update confirms real existence" reasoning as
+    /// `kamino::KaminoPosition::registered`, just tracked directly here
+    /// instead of via a second `KaminoPosition` instance (see that
+    /// field's own doc comment for why).
+    fn observe_kamino_tslax_obligation(&mut self, header: &Header, body: &[u8]) {
+        if Some(header.accountid) != self.state.o_kamino_tslax_obligation_id {
+            return;
+        }
+        if header.owner == account_id_from_pubkey(&kamino::KAMINO_LENDING_PROGRAM_ID) && header.lamports > 0 {
+            self.state.o_kamino_tslax_obligation = kamino::parse_kamino_obligation(body);
+        } else {
+            // Real, live-confirmed incident this mirrors:
+            // `KaminoPosition::mark_obligation_closing`'s doc comment --
+            // a fully-withdrawn obligation closes on-chain but this bot's
+            // subscription never observes a follow-up push reflecting
+            // that. Not proactively called here (this leg's withdraw is
+            // the fire-once-then-advance-unconditionally shape, so
+            // nothing re-checks `registered()` afterward), but kept
+            // symmetric with `observe_tslax_account` regardless.
+            self.state.o_kamino_tslax_obligation = None;
+        }
+    }
+
+    /// Records `slot` as the latest slot `low_latency` has processed for
+    /// `account_id` -- unconditional, never a gate (mirrors
+    /// `arbv1::StateHelper::record_low_latency_slot`'s identical
+    /// reasoning: a single slot can carry multiple updates for the same
+    /// account, each strictly newer than the last even though
+    /// `header.slot` doesn't change between them, so gating writes here
+    /// would silently drop later-but-same-slot updates).
+    fn record_low_latency_slot(&mut self, account_id: AccountId, slot: Slot) {
+        self.state.m_account_slot.insert(account_id, slot);
+    }
+
+    /// Gate for the rooted `Self::on_account` stream's position-tracking
+    /// observers only: true iff `slot` is strictly newer than whatever
+    /// `record_low_latency_slot` has already recorded for `account_id`.
+    /// See [`State::m_account_slot`]'s doc comment for the real,
+    /// on-chain-confirmed bug this fixes (a late rooted duplicate rolling
+    /// `o_solend_position`'s cached obligation back to a stale,
+    /// already-superseded snapshot) -- mirrors
+    /// `arbv1::StateHelper::is_newer_than_low_latency` exactly.
+    fn is_newer_than_low_latency(&self, account_id: AccountId, slot: Slot) -> bool {
+        match self.state.m_account_slot.get(&account_id) {
+            Some(&last) => slot > last,
+            None => true,
+        }
+    }
+
     pub(crate) fn low_latency(&mut self, mut llap: LowLatencyAccountUpdate) {
         let t0 = std::time::Instant::now();
         let mut count: u64 = 0;
@@ -636,12 +825,23 @@ impl<'a> StateHelper<'a> {
         while let Some(account) = llap.account() {
             count += 1;
             let d = account.body.unwrap_or(&zero);
+            self.record_low_latency_slot(account.header.accountid, account.header.slot);
             self.wallet.on_account(account.header, d);
             if let Some(phoenix) = self.state.o_phoenix.as_mut() {
                 phoenix.on_account(account.header, d);
             }
             if let Some(solend_position) = self.state.o_solend_position.as_mut() {
+                let is_obligation = Some(account.header.accountid) == solend_position.obligation_id();
                 solend_position.on_account(account.header, d);
+                if is_obligation {
+                    log_warn!(
+                        "testperpv1: [debug] low_latency solend obligation update slot={} body_len={} deposits={:?} borrows={:?}",
+                        account.header.slot,
+                        d.len(),
+                        solend_position.obligation().map(|ob| ob.deposits.len()),
+                        solend_position.obligation().map(|ob| ob.borrows.len()),
+                    );
+                }
             }
             if let Some(kamino_position) = self.state.o_kamino_position.as_mut() {
                 kamino_position.on_account(account.header, d);
@@ -649,6 +849,9 @@ impl<'a> StateHelper<'a> {
             if let Some(marginfi_position) = self.state.o_marginfi_position.as_mut() {
                 marginfi_position.on_account(account.header, d);
             }
+            self.observe_tslax_account(account.header, d);
+            self.observe_kamino_tslax_reserve(account.header, d);
+            self.observe_kamino_tslax_obligation(account.header, d);
             if let Some(dex) = self.state.o_dex.as_mut() {
                 dex.on_account(account.header, d);
                 dex.refresh_account_router(account.header.accountid, &mut self.state.spot_router);
@@ -1835,6 +2038,12 @@ impl<'a> StateHelper<'a> {
             .and_then(|s| s.obligation())
             .and_then(|ob| ob.deposit_for(usdc_reserve_id))
             .is_some();
+        log_warn!(
+            "testperpv1: [debug] open_solend_borrow_leg decision has_usdc_collateral={} deposits={:?} borrows={:?}",
+            has_usdc_collateral,
+            self.state.o_solend_position.as_ref().and_then(|s| s.obligation()).map(|ob| &ob.deposits),
+            self.state.o_solend_position.as_ref().and_then(|s| s.obligation()).map(|ob| &ob.borrows),
+        );
 
         const USDC_DECIMALS: i32 = 6;
 
@@ -3809,6 +4018,12 @@ impl<'a> StateHelper<'a> {
             TestPhase::BootstrapMarginfi => self.test_bootstrap_marginfi(),
             TestPhase::DepositMarginfi => self.test_deposit_marginfi(),
             TestPhase::WithdrawMarginfi => self.test_withdraw_marginfi(),
+            TestPhase::BootstrapTslax => self.test_bootstrap_tslax(),
+            TestPhase::DepositTslax => self.test_deposit_tslax(),
+            TestPhase::BootstrapKaminoTslax => self.test_bootstrap_kamino_tslax(),
+            TestPhase::DepositKaminoTslax => self.test_deposit_kamino_tslax(),
+            TestPhase::WithdrawKaminoTslax => self.test_withdraw_kamino_tslax(),
+            TestPhase::WithdrawTslax => self.test_withdraw_tslax(),
             TestPhase::BorrowSolend => self.test_borrow_solend(),
             TestPhase::RepaySolend => self.test_repay_solend(),
             TestPhase::BorrowKamino => self.test_borrow_kamino(),
@@ -4387,12 +4602,397 @@ impl<'a> StateHelper<'a> {
                 "testperpv1: [10/16] marginfi withdraw cooldown elapsed -- proceeding (verify via real \
                  on-chain state, not this state machine)"
             );
-            self.test_advance(TestPhase::BorrowSolend);
+            self.test_advance(TestPhase::BootstrapTslax);
             return;
         }
         log_warn!("testperpv1: [10/16] withdrawing USDC from marginfi");
         self.test_withdraw_usdc_marginfi();
         self.test_mark_action();
+    }
+
+    /// Deliberately small -- see `trader::dex::tslax`'s module doc for why
+    /// this is a real swap against a real, live pool, not a scaled-up
+    /// trade. 1 USDC (mint_1, 6 decimals), matching `TEST_AMOUNT_USD`'s
+    /// own $1 convention everywhere else in this file.
+    const TSLAX_TEST_AMOUNT_USDC_RAW: u64 = 1_000_000;
+
+    /// [tslax 1/3] Ensures this wallet's TSLAx (Token-2022) ATA exists.
+    /// No obligation account to create (TSLAx is a swap venue via
+    /// Raydium CLMM, not a lending market) -- "bootstrap" here just
+    /// means the ATA is real on-chain (a real account update for it has
+    /// arrived). The USDC side already has an ATA from the earlier
+    /// `SwapToUsdc`/lending-deposit phases.
+    fn test_bootstrap_tslax(&mut self) {
+        let Some(owner) = self.state.wallet() else {
+            return;
+        };
+        let mint = account_id_from_pubkey(&tslax::TSLAX_MINT);
+        let has_ata = self.state.tslax_balance.is_some();
+        if has_ata {
+            log_warn!("testperpv1: [tslax 1/3] Token-2022 TSLAx ATA confirmed on-chain");
+            self.test_advance(TestPhase::DepositTslax);
+            return;
+        }
+        if self.test_cooldown_active() {
+            return;
+        }
+        log_warn!("testperpv1: [tslax 1/3] creating Token-2022 TSLAx ATA");
+        self.wallet
+            .append_create_ata_with_program(owner, mint, &tslax::TOKEN_2022_PROGRAM_ID);
+        self.test_mark_action();
+    }
+
+    /// [tslax 2/3] Swaps [`Self::TSLAX_TEST_AMOUNT_USDC_RAW`] of USDC
+    /// into TSLAx. Retries until a real nonzero TSLAx balance is
+    /// observed, same shape as the lending deposit phases above.
+    fn test_deposit_tslax(&mut self) {
+        let Some(owner) = self.state.wallet() else {
+            return;
+        };
+        let tslax_balance: u64 = self.state.tslax_balance.unwrap_or(0);
+        if tslax_balance > 0 {
+            log_warn!("testperpv1: [tslax 2/3] TSLAx balance confirmed on-chain ({tslax_balance} raw units)");
+            // Straight into the Kamino-xStocks leg, not WithdrawTslax --
+            // see `TestPhase::BootstrapKaminoTslax`'s doc comment for why.
+            self.test_advance(TestPhase::BootstrapKaminoTslax);
+            return;
+        }
+        if self.test_cooldown_active() {
+            return;
+        }
+        log_warn!(
+            "testperpv1: [tslax 2/3] swapping {} raw USDC into TSLAx",
+            Self::TSLAX_TEST_AMOUNT_USDC_RAW
+        );
+        self.tslax_swap(owner, false, Self::TSLAX_TEST_AMOUNT_USDC_RAW);
+        self.test_mark_action();
+    }
+
+    /// [tslax 3/3] Swaps whatever TSLAx balance the deposit leg above
+    /// landed back into USDC, completing the round trip. Advances
+    /// unconditionally after a cooldown -- same reasoning as every lending
+    /// `WithdrawX` phase's own doc comment.
+    fn test_withdraw_tslax(&mut self) {
+        if self.state.test_last_action_slot.is_some() {
+            if self.test_cooldown_active() {
+                return;
+            }
+            log_warn!(
+                "testperpv1: [tslax 3/3] withdraw cooldown elapsed -- proceeding (verify via real \
+                 on-chain state, not this state machine)"
+            );
+            self.test_advance(TestPhase::BorrowSolend);
+            return;
+        }
+        let Some(owner) = self.state.wallet() else {
+            return;
+        };
+        let tslax_balance: u64 = self.state.tslax_balance.unwrap_or(0);
+        if tslax_balance == 0 {
+            log_warn!("testperpv1: [tslax 3/3] no TSLAx balance to swap back yet");
+            self.test_mark_action();
+            return;
+        }
+        log_warn!("testperpv1: [tslax 3/3] swapping {tslax_balance} raw TSLAx units back to USDC");
+        self.tslax_swap(owner, true, tslax_balance);
+        self.test_mark_action();
+    }
+
+    /// Builds and queues a real `swap_v2` against [`tslax::TSLAX_POOL`]
+    /// via `raydium::clmm::build_swap_ix` -- real, already real-trade-
+    /// tested account layout/instruction code, not reimplemented here.
+    /// `tslax_to_usdc` selects direction: `true` swaps mint_0 (TSLAx) ->
+    /// mint_1 (USDC), `false` the reverse -- matches TSLAx's real pool
+    /// order (see `trader::dex::tslax`'s module doc for the real fetched
+    /// values).
+    fn tslax_swap(&mut self, owner: AccountId, tslax_to_usdc: bool, amount_raw: u64) {
+        let Some(dex) = self.state.o_dex.as_ref() else {
+            return;
+        };
+        let Some(pool) = dex.tslax().pool() else {
+            log_warn!("testperpv1: [tslax] pool state not observed yet");
+            return;
+        };
+        let pool = pool.clone();
+        let pool_id = dex.tslax().pool_id();
+
+        let zero_for_one = tslax_to_usdc; // zero_for_one = mint_0 (TSLAx) in
+        let (input_mint, output_mint) = if zero_for_one {
+            (pool.token_mint_0, pool.token_mint_1)
+        } else {
+            (pool.token_mint_1, pool.token_mint_0)
+        };
+
+        // Real fix for a live NotEnoughTickArrayAccount failure (a pool's
+        // bitmap can point at a tick array that doesn't exist) -- refuse
+        // rather than guess if the real tick-array data this swap would
+        // need hasn't been confirmed to actually exist on-chain yet.
+        // `build_swap_ix` (called below) derives its own tick-array list
+        // internally from the same pool data, so this call is purely the
+        // readiness gate, not an input to the instruction itself.
+        if dex.tslax().ready_tick_arrays(zero_for_one).is_none() {
+            log_warn!("testperpv1: [tslax] tick array data not confirmed yet -- refusing rather than guessing");
+            return;
+        }
+
+        // TSLAx's ATA is Token-2022, USDC's is classic SPL Token.
+        let (Some(input_ata), Some(output_ata)) = (
+            if input_mint == pool.token_mint_0 {
+                self.wallet
+                    .derive_ata_with_program(owner, input_mint, &tslax::TOKEN_2022_PROGRAM_ID)
+            } else {
+                self.wallet.derive_ata(owner, input_mint)
+            },
+            if output_mint == pool.token_mint_0 {
+                self.wallet
+                    .derive_ata_with_program(owner, output_mint, &tslax::TOKEN_2022_PROGRAM_ID)
+            } else {
+                self.wallet.derive_ata(owner, output_mint)
+            },
+        ) else {
+            return;
+        };
+
+        let params = SwapParams {
+            pool: pool_id,
+            input_mint,
+            output_mint,
+            amount_in: amount_raw,
+            min_amount_out: 0, // permissive, this is a smoke test not a real trade
+            user_source_token_account: input_ata,
+            user_destination_token_account: output_ata,
+            user_wallet: owner,
+        };
+        if let Err(e) = dex.tslax().swap(&params, self.wallet) {
+            log_error!("testperpv1: [tslax] swap failed: {e}");
+        }
+    }
+
+    /// [kamino-tslax 1/3] Ensures this wallet's obligation in the real
+    /// Kamino xStocks lending market exists -- a second, independent
+    /// obligation from the main-market one `BootstrapKamino` already
+    /// registered (see `State::o_kamino_tslax_obligation_id`'s doc
+    /// comment). `user_metadata` is per-owner, not per-market, so unlike
+    /// `bootstrap_kamino_obligation` this never needs to check/re-init it
+    /// -- by the time this phase runs, the main Kamino leg has already
+    /// done that earlier in the same sequence.
+    fn test_bootstrap_kamino_tslax(&mut self) {
+        let Some(owner) = self.state.wallet() else {
+            return;
+        };
+        if self.state.o_kamino_tslax_obligation.is_some() {
+            log_warn!("testperpv1: [kamino-tslax 1/3] xStocks obligation confirmed registered on-chain");
+            self.test_advance(TestPhase::DepositKaminoTslax);
+            return;
+        }
+        if self.test_cooldown_active() {
+            return;
+        }
+        log_warn!("testperpv1: [kamino-tslax 1/3] registering xStocks-market Kamino obligation");
+        let lending_market = account_id_from_pubkey(&kamino_xstocks_watcher::XSTOCKS_LENDING_MARKET);
+        if let Err(e) = kamino::init_obligation(owner, lending_market, 0, self.wallet) {
+            log_error!("testperpv1: [kamino-tslax] init_obligation failed: {e}");
+        }
+        self.test_mark_action();
+    }
+
+    /// [kamino-tslax 2/3] Deposits whatever TSLAx balance `DepositTslax`
+    /// just acquired via Raydium as collateral in the xStocks-market
+    /// obligation. Retries until a real nonzero deposit is observed,
+    /// same shape as `test_deposit_tslax`.
+    fn test_deposit_kamino_tslax(&mut self) {
+        let tslax_reserve_id = account_id_from_pubkey(&kamino_xstocks_watcher::TSLAX_RESERVE);
+        let has_deposit = self
+            .state
+            .o_kamino_tslax_obligation
+            .as_ref()
+            .and_then(|ob| ob.deposit_for(tslax_reserve_id))
+            .is_some_and(|d| d.deposited_amount != 0);
+        if has_deposit {
+            log_warn!("testperpv1: [kamino-tslax 2/3] TSLAx deposit confirmed on-chain");
+            self.test_advance(TestPhase::WithdrawKaminoTslax);
+            return;
+        }
+        if self.test_cooldown_active() {
+            return;
+        }
+        let Some(owner) = self.state.wallet() else {
+            return;
+        };
+        let tslax_amount = self.state.tslax_balance.unwrap_or(0);
+        if tslax_amount == 0 {
+            log_warn!("testperpv1: [kamino-tslax 2/3] no TSLAx balance to deposit yet");
+            self.test_mark_action();
+            return;
+        }
+        if self.state.o_kamino_tslax_reserve.is_none() {
+            log_warn!("testperpv1: [kamino-tslax 2/3] xStocks TSLAx reserve not observed yet");
+            self.test_mark_action();
+            return;
+        }
+        log_warn!("testperpv1: [kamino-tslax 2/3] depositing {tslax_amount} raw TSLAx units into Kamino");
+        self.kamino_tslax_deposit(owner, tslax_amount);
+        self.test_mark_action();
+    }
+
+    /// [kamino-tslax 3/3] Withdraws the full TSLAx deposit back out,
+    /// completing the round trip -- fire-once-then-advance-
+    /// unconditionally, same reasoning as every other lending `WithdrawX`
+    /// phase's own doc comment (dust/rounding makes "confirmed empty" a
+    /// fragile check; verify via real on-chain state, not this state
+    /// machine). Advances to `WithdrawTslax`, which sells whatever TSLAx
+    /// comes back out of Kamino here back to USDC via Raydium -- see
+    /// `TestPhase::BootstrapKaminoTslax`'s doc comment for why this leg
+    /// sits between `DepositTslax` and `WithdrawTslax` rather than after.
+    fn test_withdraw_kamino_tslax(&mut self) {
+        if self.state.test_last_action_slot.is_some() {
+            if self.test_cooldown_active() {
+                return;
+            }
+            log_warn!(
+                "testperpv1: [kamino-tslax 3/3] withdraw cooldown elapsed -- proceeding (verify via \
+                 real on-chain state, not this state machine)"
+            );
+            self.test_advance(TestPhase::WithdrawTslax);
+            return;
+        }
+        let Some(owner) = self.state.wallet() else {
+            return;
+        };
+        if self.state.o_kamino_tslax_reserve.is_none() {
+            log_warn!("testperpv1: [kamino-tslax 3/3] xStocks TSLAx reserve not observed yet");
+            self.test_mark_action();
+            return;
+        }
+        log_warn!("testperpv1: [kamino-tslax 3/3] withdrawing TSLAx from Kamino");
+        self.kamino_tslax_withdraw(owner);
+        self.test_mark_action();
+    }
+
+    /// Real `refresh_reserve` -> `refresh_obligation` ->
+    /// `deposit_with_token_program` sequence against the xStocks-market
+    /// TSLAx reserve -- same shape as `deploy_idle_usdc_kamino`'s
+    /// main-market equivalent, minus a separate farm-readiness gate:
+    /// this reserve's `farm_collateral` is confirmed `None` on real
+    /// on-chain data (checked directly this session), and
+    /// `deposit_with_token_program` already handles a `None` farm
+    /// correctly on its own (see `farm_accounts_metas`), so
+    /// `ensure_kamino_farm_ready` -- which reads from the *main*-market
+    /// `o_kamino_position` anyway, not applicable here -- isn't needed.
+    /// Every reserve the xStocks-market Kamino obligation currently has
+    /// a *deposit* against, from the last real `on_account` update --
+    /// mirrors [`Self::kamino_obligation_deposit_reserves`] but reads
+    /// `self.state.o_kamino_tslax_obligation` (the second, xStocks-market
+    /// obligation) instead of the main-market one.
+    ///
+    /// **Deliberately does NOT add "this call's own extra reserve"**, for
+    /// the exact reason documented on
+    /// [`Self::kamino_obligation_deposit_reserves`]: real klend requires
+    /// `refresh_obligation`'s remaining-accounts count to match the
+    /// obligation's *current* on-chain deposit count exactly --
+    /// confirmed live on mainnet this session via a real
+    /// `Custom(6006) InvalidAccountInput` (`expected_remaining_accounts=0,
+    /// actual_remaining_accounts=1`) when the not-yet-deposited TSLAx
+    /// reserve was included before the obligation's first deposit. The
+    /// reserve being newly deposited into is added to the obligation *by*
+    /// the deposit instruction itself, not before it.
+    fn kamino_tslax_obligation_deposit_reserves(&self) -> Vec<AccountId> {
+        self.state
+            .o_kamino_tslax_obligation
+            .as_ref()
+            .map(|ob| ob.deposits.iter().map(|d| d.deposit_reserve).collect())
+            .unwrap_or_default()
+    }
+
+    fn kamino_tslax_deposit(&mut self, owner: AccountId, amount_raw: u64) {
+        let Some(obligation_id) = self.state.o_kamino_tslax_obligation_id else {
+            return;
+        };
+        let Some(reserve) = self.state.o_kamino_tslax_reserve.clone() else {
+            return;
+        };
+        let Some(tslax_ata) = self.state.o_tslax_ata else {
+            return;
+        };
+        let reserve_id = account_id_from_pubkey(&kamino_xstocks_watcher::TSLAX_RESERVE);
+        let deposit_reserves = self.kamino_tslax_obligation_deposit_reserves();
+
+        if let Err(e) = reserve.refresh_reserve(
+            reserve_id,
+            reserve.pyth_oracle,
+            reserve.switchboard_price_oracle,
+            reserve.switchboard_twap_oracle,
+            reserve.scope_prices,
+            self.wallet,
+        ) {
+            log_error!("testperpv1: [kamino-tslax] refresh_reserve failed: {e}");
+            return;
+        }
+        if let Err(e) =
+            kamino::refresh_obligation(reserve.lending_market, obligation_id, &deposit_reserves, &[], self.wallet)
+        {
+            log_error!("testperpv1: [kamino-tslax] refresh_obligation failed: {e}");
+            return;
+        }
+        if let Err(e) = reserve.deposit_with_token_program(
+            reserve_id,
+            obligation_id,
+            amount_raw,
+            owner,
+            tslax_ata,
+            &tslax::TOKEN_2022_PROGRAM_ID,
+            self.wallet,
+        ) {
+            log_error!("testperpv1: [kamino-tslax] deposit failed: {e}");
+        }
+    }
+
+    /// Real `refresh_reserve` -> `refresh_obligation` ->
+    /// `withdraw_with_token_program` sequence, mirroring
+    /// `Self::kamino_tslax_deposit`. Withdraws the full deposited amount
+    /// (`KAMINO_AMOUNT_MAX`), matching `test_withdraw_usdc_kamino`'s own
+    /// full-withdrawal convention.
+    fn kamino_tslax_withdraw(&mut self, owner: AccountId) {
+        let Some(obligation_id) = self.state.o_kamino_tslax_obligation_id else {
+            return;
+        };
+        let Some(reserve) = self.state.o_kamino_tslax_reserve.clone() else {
+            return;
+        };
+        let Some(tslax_ata) = self.state.o_tslax_ata else {
+            return;
+        };
+        let reserve_id = account_id_from_pubkey(&kamino_xstocks_watcher::TSLAX_RESERVE);
+        let deposit_reserves = self.kamino_tslax_obligation_deposit_reserves();
+
+        if let Err(e) = reserve.refresh_reserve(
+            reserve_id,
+            reserve.pyth_oracle,
+            reserve.switchboard_price_oracle,
+            reserve.switchboard_twap_oracle,
+            reserve.scope_prices,
+            self.wallet,
+        ) {
+            log_error!("testperpv1: [kamino-tslax] withdraw refresh_reserve failed: {e}");
+            return;
+        }
+        if let Err(e) =
+            kamino::refresh_obligation(reserve.lending_market, obligation_id, &deposit_reserves, &[], self.wallet)
+        {
+            log_error!("testperpv1: [kamino-tslax] withdraw refresh_obligation failed: {e}");
+            return;
+        }
+        if let Err(e) = reserve.withdraw_with_token_program(
+            reserve_id,
+            obligation_id,
+            kamino::KAMINO_AMOUNT_MAX,
+            owner,
+            tslax_ata,
+            &tslax::TOKEN_2022_PROGRAM_ID,
+            self.wallet,
+        ) {
+            log_error!("testperpv1: [kamino-tslax] withdraw failed: {e}");
+        }
     }
 
     fn test_withdraw_usdc_marginfi(&mut self) {
@@ -5231,10 +5831,56 @@ impl<'a> InboundMesasgeHandler<Configuration, CustomMessageInbound, CustomMessag
                             hs_ata_mints.insert(mint);
                         }
                     }
-                    let ata_reqs: Vec<_> = hs_ata_mints
+                    let mut ata_reqs: Vec<_> = hs_ata_mints
                         .into_iter()
                         .filter_map(|mint| self.wallet.ata_subscribe_request(account_id, mint))
                         .collect();
+                    // TSLAx is Token-2022, not classic SPL Token -- its
+                    // ATA is a different address than `ata_subscribe_request`
+                    // (classic-Token-only) would derive, so it can't just
+                    // join `hs_ata_mints` above.
+                    self.state.o_tslax_ata = self.wallet.derive_ata_with_program(
+                        account_id,
+                        account_id_from_pubkey(&tslax::TSLAX_MINT),
+                        &tslax::TOKEN_2022_PROGRAM_ID,
+                    );
+                    if let Some(req) = self.wallet.ata_subscribe_request_with_program(
+                        account_id,
+                        account_id_from_pubkey(&tslax::TSLAX_MINT),
+                        &tslax::TOKEN_2022_PROGRAM_ID,
+                    ) {
+                        ata_reqs.push(req);
+                    }
+                    // The real Kamino xStocks TSLAx reserve -- owner-
+                    // independent (a fixed, well-known account), but
+                    // batched into this same round-trip since it only
+                    // needs to happen once, right when this message
+                    // first arrives. See `State::o_kamino_tslax_reserve`'s
+                    // doc comment.
+                    ata_reqs.push(SubscriptionRequest {
+                        root: account_id_from_pubkey(&kamino_xstocks_watcher::TSLAX_RESERVE),
+                        filter_weight: 0,
+                        depth: 1,
+                    });
+                    // This wallet's own obligation in that same xStocks
+                    // market -- a second, independent obligation from
+                    // `kamino_reqs`' main-market one above (different
+                    // `lending_market`, same `id = 0`). See
+                    // `State::o_kamino_tslax_obligation_id`'s doc comment
+                    // for why this is tracked directly rather than via a
+                    // second `KaminoPosition`.
+                    let kamino_tslax_obligation_pk = kamino::obligation_pda(
+                        &pubkey,
+                        &kamino_xstocks_watcher::XSTOCKS_LENDING_MARKET,
+                        0,
+                    );
+                    self.state.o_kamino_tslax_obligation_id =
+                        Some(account_id_from_pubkey(&kamino_tslax_obligation_pk));
+                    ata_reqs.push(SubscriptionRequest {
+                        root: account_id_from_pubkey(&kamino_tslax_obligation_pk),
+                        filter_weight: 0,
+                        depth: 1,
+                    });
                     // This wallet's own durable-nonce account (see
                     // `Wallet::send_bundler_pair`'s doc comment) --
                     // batched into the same subscribe_now call as
@@ -5472,21 +6118,57 @@ impl<'a> CommitHook for StateHelper<'a> {
         if let Some(phoenix) = self.state.o_phoenix.as_mut() {
             phoenix.on_account(header, body);
         }
-        if let Some(solend_position) = self.state.o_solend_position.as_mut() {
-            solend_position.on_account(header, body);
+        // Real, on-chain-confirmed bug this gate fixes (see
+        // `State::m_account_slot`'s doc comment for the full incident):
+        // this rooted stream is finalized but arrives ~12s late --
+        // `low_latency` has almost always already delivered the same or
+        // newer data for a given position account by the time this
+        // fires. Every position tracker below reflects an account this
+        // bot's own transactions touch only rarely (a lending
+        // obligation, sitting idle between deposits/withdraws) --
+        // without this gate, a late rooted duplicate re-delivering an
+        // *older* snapshot (e.g. a deposit's bytes, arriving after
+        // `low_latency` already delivered the following withdraw's) can
+        // silently roll the cached position backward, and since nothing
+        // else touches the account again, the wrong state sticks around
+        // permanently rather than "briefly" as previously assumed here.
+        // Mirrors `arbv1::StateHelper::is_newer_than_low_latency` exactly
+        // -- see that function's own doc comment.
+        let is_solend_obligation = self
+            .state
+            .o_solend_position
+            .as_ref()
+            .is_some_and(|s| Some(header.accountid) == s.obligation_id());
+        if is_solend_obligation && !self.is_newer_than_low_latency(header.accountid, header.slot) {
+            log_warn!(
+                "testperpv1: [debug] rooted solend obligation update REJECTED (stale) slot={}",
+                header.slot,
+            );
         }
-        if let Some(kamino_position) = self.state.o_kamino_position.as_mut() {
-            kamino_position.on_account(header, body);
+        if self.is_newer_than_low_latency(header.accountid, header.slot) {
+            self.record_low_latency_slot(header.accountid, header.slot);
+            if let Some(solend_position) = self.state.o_solend_position.as_mut() {
+                solend_position.on_account(header, body);
+                if is_solend_obligation {
+                    log_warn!(
+                        "testperpv1: [debug] rooted solend obligation update slot={} body_len={} deposits={:?} borrows={:?}",
+                        header.slot,
+                        body.len(),
+                        solend_position.obligation().map(|ob| ob.deposits.len()),
+                        solend_position.obligation().map(|ob| ob.borrows.len()),
+                    );
+                }
+            }
+            if let Some(kamino_position) = self.state.o_kamino_position.as_mut() {
+                kamino_position.on_account(header, body);
+            }
+            if let Some(marginfi_position) = self.state.o_marginfi_position.as_mut() {
+                marginfi_position.on_account(header, body);
+            }
+            self.observe_kamino_tslax_reserve(header, body);
+            self.observe_kamino_tslax_obligation(header, body);
         }
-        if let Some(marginfi_position) = self.state.o_marginfi_position.as_mut() {
-            marginfi_position.on_account(header, body);
-        }
-        // No low_latency-freshness gate here (unlike arbv1's
-        // is_newer_than_low_latency) -- this mode doesn't track a
-        // per-account low-latency slot map, and nothing yet depends on
-        // spot_router being perfectly fresh (execute_spot_leg isn't
-        // auto-triggered). A late rooted duplicate can only make it
-        // briefly less stale, never wrong.
+        self.observe_tslax_account(header, body);
         if let Some(dex) = self.state.o_dex.as_mut() {
             dex.on_account(header, body);
             dex.refresh_account_router(header.accountid, &mut self.state.spot_router);

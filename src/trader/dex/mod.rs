@@ -6,6 +6,17 @@ pub mod drift;
 pub mod ember;
 pub mod jet;
 pub mod kamino;
+/// Direct-subscription watcher for a known set of Kamino Obligation
+/// accounts -- see the module's own doc comment for why this exists
+/// separately from `kamino.rs`. Not yet wired into `DexState`/registered
+/// here the way every other module in this list is; today's scope is the
+/// standalone tracking logic itself, not the brain-mode integration.
+pub mod kamino_xstocks_watcher;
+/// Direct-subscription watcher for the most liquid Orca Whirlpool pool
+/// per xStock ticker -- see the module's own doc comment. Same
+/// not-yet-wired-into-`DexState` status as `kamino_xstocks_watcher`
+/// above; `brain::xstockshealthv1` owns its own instance directly.
+pub mod xstock_dex_watcher;
 pub mod marginfi;
 pub mod marinade;
 pub mod orca;
@@ -24,6 +35,7 @@ pub mod raydium;
 pub mod sanctum;
 pub mod solend;
 pub mod spl_stake_pool;
+pub mod tslax;
 pub mod update;
 /// Drift/Velocity Protocol perpetual futures -- pricing-only, deliberately
 /// **not** wired into `DexState`/`Updater` below (unlike every other
@@ -46,7 +58,7 @@ use crate::{
             marinade::MarinadeState, orca::OrcaState, phoenix::PhoenixState,
             pumpfun::PumpfunState, pumpswap::PumpswapState, raydium::RaydiumState,
             sanctum::SanctumState, solend::SolendState, spl_stake_pool::SplStakePoolState,
-            update::Updater,
+            tslax::TslaxState, update::Updater,
         },
         pricegraph::Hop,
         types::{DexType, TraderError},
@@ -64,6 +76,7 @@ pub struct DexState {
     sanctum: SanctumState,
     marginfi: MarginfiState,
     solend: SolendState,
+    tslax: TslaxState,
     drift: DriftState,
     marinade: MarinadeState,
     spl_stake_pool: SplStakePoolState,
@@ -110,6 +123,11 @@ impl DexState {
         let (solend, solend_reqs) = SolendState::new();
         subscription_queue.extend(solend_reqs);
         hs_program_id.insert(*solend.program_id());
+        // No `hs_program_id` insertion needed here -- TslaxState's pool
+        // is Raydium CLMM, whose program id is already registered above
+        // via `RaydiumState::new`.
+        let (tslax, tslax_reqs) = TslaxState::new();
+        subscription_queue.extend(tslax_reqs);
         let (drift, drift_reqs) = DriftState::new();
         subscription_queue.extend(drift_reqs);
         hs_program_id.insert(*drift.program_id());
@@ -145,6 +163,7 @@ impl DexState {
             sanctum,
             marginfi,
             solend,
+            tslax,
             drift,
             marinade,
             spl_stake_pool,
@@ -190,6 +209,14 @@ impl DexState {
     /// data).
     pub fn solend(&self) -> &SolendState {
         &self.solend
+    }
+
+    /// Exposed directly, same reasoning as [`Self::solend`] --
+    /// `testperpv1`'s TSLAx leg needs the live pool state to pick the
+    /// right tick arrays for a real `swap_v2` call via
+    /// `raydium::clmm::build_swap_ix`.
+    pub fn tslax(&self) -> &TslaxState {
+        &self.tslax
     }
 
     /// Exposed directly, same reasoning as [`Self::solend`] --
@@ -459,6 +486,7 @@ impl Updater for DexState {
         self.sanctum.on_account(header, body);
         self.marginfi.on_account(header, body);
         self.solend.on_account(header, body);
+        self.tslax.on_account(header, body);
         self.drift.on_account(header, body);
         self.marinade.on_account(header, body);
         self.spl_stake_pool.on_account(header, body);
@@ -475,6 +503,7 @@ impl Updater for DexState {
             || self.sanctum.on_token(ta)
             || self.marginfi.on_token(ta)
             || self.solend.on_token(ta)
+            || self.tslax.on_token(ta)
             || self.drift.on_token(ta)
             || self.marinade.on_token(ta)
             || self.spl_stake_pool.on_token(ta)
@@ -490,6 +519,7 @@ impl Updater for DexState {
         self.sanctum.batch_router(router);
         self.marginfi.batch_router(router);
         self.solend.batch_router(router);
+        self.tslax.batch_router(router);
         self.drift.batch_router(router);
         self.marinade.batch_router(router);
         self.spl_stake_pool.batch_router(router);
@@ -510,6 +540,7 @@ impl Updater for DexState {
         self.sanctum.refresh_account_router(account_id, router);
         self.marginfi.refresh_account_router(account_id, router);
         self.solend.refresh_account_router(account_id, router);
+        self.tslax.refresh_account_router(account_id, router);
         self.drift.refresh_account_router(account_id, router);
         self.marinade.refresh_account_router(account_id, router);
         self.spl_stake_pool.refresh_account_router(account_id, router);
@@ -525,6 +556,7 @@ impl Updater for DexState {
         self.sanctum.refresh_token_router(ta_id, router);
         self.marginfi.refresh_token_router(ta_id, router);
         self.solend.refresh_token_router(ta_id, router);
+        self.tslax.refresh_token_router(ta_id, router);
         self.drift.refresh_token_router(ta_id, router);
         self.marinade.refresh_token_router(ta_id, router);
         self.spl_stake_pool.refresh_token_router(ta_id, router);
@@ -547,6 +579,7 @@ impl Updater for DexState {
         self.sanctum.on_tx(ix, slot);
         self.marginfi.on_tx(ix, slot);
         self.solend.on_tx(ix, slot);
+        self.tslax.on_tx(ix, slot);
         self.drift.on_tx(ix, slot);
         self.marinade.on_tx(ix, slot);
         self.spl_stake_pool.on_tx(ix, slot);
@@ -564,6 +597,9 @@ impl Updater for DexState {
         // Needed for Raydium CLMM's PDA-derived tick-array subscriptions --
         // see `raydium::clmm`'s module doc.
         self.raydium.flush_pool(g, max_per_flush)?;
+        // Needed for TSLAx's own PDA-derived tick-array subscriptions --
+        // same reasoning as Raydium CLMM above.
+        self.tslax.flush_pool(g, max_per_flush)?;
         Ok(())
     }
 }
