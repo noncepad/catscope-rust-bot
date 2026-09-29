@@ -179,6 +179,25 @@ pub struct PhoenixPositionState {
     pub accumulated_funding_for_active_position: i64,
 }
 
+/// Independent, symbol-keyed summary of this bot's own open Phoenix
+/// positions -- see [`PhoenixState::summarize_positions`].
+#[derive(Debug, Default, Clone)]
+pub struct PhoenixPositionSummary {
+    pub positions: Vec<PhoenixPositionSummaryEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PhoenixPositionSummaryEntry {
+    pub symbol: String,
+    /// Human-readable base-asset units -- positive = long, negative = short.
+    pub size: f64,
+    /// `size * mark price`. `None` if this market has never been priced yet.
+    pub notional_usd: Option<f64>,
+    /// Mark-to-market unrealized PnL in USD. `None` under the same
+    /// condition as `notional_usd`.
+    pub unrealized_pnl_usd: Option<f64>,
+}
+
 #[derive(Debug)]
 pub struct PhoenixState {
     program_id: AccountId,
@@ -337,6 +356,42 @@ impl PhoenixState {
 
     pub fn positions(&self) -> &[PhoenixPositionState] {
         &self.positions
+    }
+
+    /// Symbol-keyed, human-readable view of this bot's own open Phoenix
+    /// positions -- unlike Solend/Kamino/Marginfi (no live USD price
+    /// source in this codebase), Phoenix already tracks a live mark
+    /// price per market ([`PhoenixMarketState::mark_price_usd`]), so this
+    /// includes USD notional/PnL where available. `notional_usd`/
+    /// `unrealized_pnl_usd` are `None` for a market that's never been
+    /// priced yet (a brand-new listing) -- see `mark_price_usd`'s own doc
+    /// comment for why that's distinct from "worth zero." Zero-size slots
+    /// (`base_lot_position == 0`) are skipped.
+    pub fn summarize_positions(&self) -> PhoenixPositionSummary {
+        let positions = self
+            .positions
+            .iter()
+            .filter(|p| p.base_lot_position != 0)
+            .filter_map(|p| {
+                let market = self.market(p.asset_id as u32)?;
+                let size = p.base_lot_position as f64 / 10f64.powi(market.base_lot_decimals as i32);
+                let (notional_usd, unrealized_pnl_usd) = match market.mark_price_usd() {
+                    Some(mark) => {
+                        let pnl_quote_lots = margin::unrealized_pnl_quote_lots(market, p);
+                        let pnl_usd = pnl_quote_lots as f64 / 10f64.powi(QUOTE_LOT_DECIMALS);
+                        (Some(size * mark), Some(pnl_usd))
+                    }
+                    None => (None, None),
+                };
+                Some(PhoenixPositionSummaryEntry {
+                    symbol: market.symbol_str().into_owned(),
+                    size,
+                    notional_usd,
+                    unrealized_pnl_usd,
+                })
+            })
+            .collect();
+        PhoenixPositionSummary { positions }
     }
 
     pub fn collateral_quote_lots(&self) -> i64 {

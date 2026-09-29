@@ -823,6 +823,45 @@ impl SolendObligation {
     pub fn borrow_for(&self, reserve: AccountId) -> Option<&ObligationLiquidity> {
         self.borrows.iter().find(|b| b.borrow_reserve == reserve)
     }
+
+    /// Mint-keyed, human-readable (decimals-adjusted) view of this
+    /// obligation, for strategy code that wants "how much of mint X am I
+    /// long/short on Solend" without reaching into `deposit_reserve`/
+    /// `borrow_reserve`-keyed raw entries itself. A deposit/borrow whose
+    /// reserve hasn't been observed yet (no `mint`/`mint_decimals` to
+    /// convert with) is skipped rather than guessed -- callers that need
+    /// to distinguish "no position" from "position exists but reserve
+    /// data hasn't arrived yet" should check `self.deposits`/`self.borrows`
+    /// directly instead.
+    pub fn summarize(&self, dex: &SolendState) -> SolendPositionSummary {
+        let convert = |reserve_id: AccountId, raw: u64| -> Option<(AccountId, f64)> {
+            let reserve = dex.reserve_by_id(reserve_id)?;
+            Some((reserve.mint, raw as f64 / 10f64.powi(reserve.mint_decimals as i32)))
+        };
+        SolendPositionSummary {
+            deposits: self
+                .deposits
+                .iter()
+                .filter_map(|d| convert(d.deposit_reserve, d.deposited_amount))
+                .collect(),
+            borrows: self
+                .borrows
+                .iter()
+                .filter_map(|b| convert(b.borrow_reserve, b.borrowed_amount))
+                .collect(),
+        }
+    }
+}
+
+/// Independent, mint-keyed summary of this bot's own Solend obligation --
+/// see [`SolendObligation::summarize`]. Amounts are human-readable
+/// (already divided by the mint's decimals), not raw/native.
+#[derive(Debug, Default, Clone)]
+pub struct SolendPositionSummary {
+    /// `(mint, deposited amount)` -- one entry per active deposit.
+    pub deposits: Vec<(AccountId, f64)>,
+    /// `(mint, borrowed amount)` -- one entry per active borrow.
+    pub borrows: Vec<(AccountId, f64)>,
 }
 
 /// Parse a Solend Obligation account from raw body bytes. Live-verified,

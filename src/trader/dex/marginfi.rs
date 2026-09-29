@@ -667,6 +667,16 @@ impl MarginfiState {
             .map(|(id, b)| (*id, b))
     }
 
+    /// Direct bank lookup by its own address -- unlike [`Self::reserve_by_mint`],
+    /// no group/oracle filtering or TVL tie-break, since the caller
+    /// already has a specific bank id (e.g. from a
+    /// `MarginfiBalance::bank_id`) and wants that exact bank, not "the
+    /// bank this bot trades for this mint." Mirrors
+    /// `solend::SolendState::reserve_by_id`/`kamino::KaminoState::reserve_by_id`.
+    pub fn bank_by_id(&self, bank_id: AccountId) -> Option<&MarginfiBank> {
+        self.m_bank.get(&bank_id)
+    }
+
     /// How many bank oracle accounts are currently subscribed to,
     /// regardless of whether either parser has produced a price from them
     /// yet -- TEMPORARY DEBUG, added to confirm the push-oracle wiring is
@@ -1113,6 +1123,44 @@ impl MarginfiLendingAccount {
     pub fn other_active_banks(&self, exclude: AccountId) -> Vec<AccountId> {
         self.balances.iter().filter(|b| b.bank_id != exclude).map(|b| b.bank_id).collect()
     }
+
+    /// Mint-keyed, human-readable (decimals-adjusted) view of this
+    /// lending account -- mirrors `solend::SolendObligation::summarize`'s
+    /// role. `shares * share_value` is the same raw-native conversion
+    /// already used elsewhere in this codebase (e.g.
+    /// `brain::perpfundingv1::state`'s `borrowed_amount_raw` computation)
+    /// -- see [`MarginfiBank`]'s `asset_share_value`/`liability_share_value`
+    /// doc comments. A balance whose bank hasn't been observed yet is
+    /// skipped rather than guessed.
+    pub fn summarize(&self, dex: &MarginfiState) -> MarginfiPositionSummary {
+        let mut deposits = Vec::new();
+        let mut borrows = Vec::new();
+        for balance in &self.balances {
+            let Some(bank) = dex.bank_by_id(balance.bank_id) else {
+                continue;
+            };
+            let decimals = 10f64.powi(bank.mint_decimals as i32);
+            if balance.asset_shares > 0.0 {
+                deposits.push((bank.mint, balance.asset_shares * bank.asset_share_value / decimals));
+            }
+            if balance.liability_shares > 0.0 {
+                borrows.push((bank.mint, balance.liability_shares * bank.liability_share_value / decimals));
+            }
+        }
+        MarginfiPositionSummary { deposits, borrows }
+    }
+}
+
+/// Independent, mint-keyed summary of this bot's own marginfi lending
+/// account -- see [`MarginfiLendingAccount::summarize`]. Amounts are
+/// human-readable (already divided by the mint's decimals), not raw
+/// shares.
+#[derive(Debug, Default, Clone)]
+pub struct MarginfiPositionSummary {
+    /// `(mint, deposited amount)` -- one entry per active deposit.
+    pub deposits: Vec<(AccountId, f64)>,
+    /// `(mint, borrowed amount)` -- one entry per active borrow.
+    pub borrows: Vec<(AccountId, f64)>,
 }
 
 /// Absolute offset of `lending_account.balances[0]` within a real

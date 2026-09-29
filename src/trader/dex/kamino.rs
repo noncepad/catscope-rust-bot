@@ -1641,6 +1641,52 @@ impl KaminoObligation {
     pub fn borrow_for(&self, reserve: AccountId) -> Option<&KaminoLiquidity> {
         self.borrows.iter().find(|b| b.borrow_reserve == reserve)
     }
+
+    /// Mint-keyed, human-readable (decimals-adjusted) view of this
+    /// obligation -- mirrors `solend::SolendObligation::summarize`'s
+    /// role, but deposits go through [`KaminoReserve::ctokens_to_underlying`]
+    /// first, since `KaminoCollateral::deposited_amount` is in cToken
+    /// units, not underlying (unlike Solend's already-native
+    /// `ObligationCollateral::deposited_amount`). A deposit/borrow whose
+    /// reserve hasn't been observed yet is skipped rather than guessed.
+    pub fn summarize(&self, dex: &KaminoState) -> KaminoPositionSummary {
+        KaminoPositionSummary {
+            deposits: self
+                .deposits
+                .iter()
+                .filter_map(|d| {
+                    let reserve = dex.reserve_by_id(d.deposit_reserve)?;
+                    let underlying = reserve.ctokens_to_underlying(d.deposited_amount);
+                    Some((
+                        reserve.token_mint,
+                        underlying / 10f64.powi(reserve.mint_decimals as i32),
+                    ))
+                })
+                .collect(),
+            borrows: self
+                .borrows
+                .iter()
+                .filter_map(|b| {
+                    let reserve = dex.reserve_by_id(b.borrow_reserve)?;
+                    Some((
+                        reserve.token_mint,
+                        b.borrowed_amount as f64 / 10f64.powi(reserve.mint_decimals as i32),
+                    ))
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Independent, mint-keyed summary of this bot's own Kamino obligation --
+/// see [`KaminoObligation::summarize`]. Amounts are human-readable
+/// (already divided by the mint's decimals), not raw/native or cToken.
+#[derive(Debug, Default, Clone)]
+pub struct KaminoPositionSummary {
+    /// `(mint, deposited underlying amount)` -- one entry per active deposit.
+    pub deposits: Vec<(AccountId, f64)>,
+    /// `(mint, borrowed amount)` -- one entry per active borrow.
+    pub borrows: Vec<(AccountId, f64)>,
 }
 
 /// Parse a Kamino Obligation account from raw body bytes. Live-verified,
