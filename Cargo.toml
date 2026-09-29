@@ -1,7 +1,17 @@
 [package]
 name = "catscope-rust-bot"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
+
+[features]
+# See lib.rs's own doc comment on the Component/export!(Component) block
+# this gates. Default ON so this crate's own standalone wasm-component
+# build (and every existing test/CI invocation, none of which pass
+# --no-default-features) is completely unaffected; a downstream crate
+# supplying its own component entry point depends on this crate with
+# `default-features = false` to opt out.
+default = ["component-entrypoint"]
+component-entrypoint = []
 
 [dependencies]
 
@@ -46,7 +56,13 @@ serde = "1"
 serde_json = "1"
 
 [lib]
-crate-type = ["cdylib"]
+# "rlib" (alongside the wasm-guest "cdylib") is what lets another crate
+# depend on this one via a normal `use catscope_rust_bot::...` -- a
+# cdylib alone produces a C-ABI/wasm artifact with no .rlib for a
+# downstream Rust crate to link against. Purely additive: doesn't change
+# the existing wasm32-wasip2 guest build or the native `cargo test` path
+# (whose test harness already ignores crate-type entirely) at all.
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 #opt-level = "z"

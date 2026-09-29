@@ -2,11 +2,19 @@ wit_bindgen::generate!({
     world: "catscopevalidator",
     path: "wit",
     generate_all,
+    // `pub` (not the default `pub(crate)`) so a downstream crate
+    // supplying its own component entry point (see the
+    // `component-entrypoint` feature's own doc comment below) can reach
+    // this crate's generated `export!` macro as `catscope_rust_bot::export!`.
+    pub_export_macro: true,
 });
+#[cfg(feature = "component-entrypoint")]
 use crate::{
     brain::Merged, event_loop::run,
 };
+#[cfg(feature = "component-entrypoint")]
 use exports::wasi::cli::run::Guest;
+#[cfg(feature = "component-entrypoint")]
 use std::{
     cell::{RefCell},
     rc::Rc,
@@ -16,20 +24,41 @@ pub mod brain;
 pub mod bundler_message;
 pub mod crypt;
 pub mod err;
-pub(crate) mod event;
+// event/graph/stdio/util were pub(crate) -- relaxed to pub so a
+// downstream crate writing its own brain module (see e.g. testperpv1's
+// mod.rs, which needs event::Event/graph::Graph directly, and every
+// brain module's pervasive log_info!/log_warn!/log_error! use, which
+// expand to $crate::util::... and so need util itself to be reachable
+// from outside this crate) can actually compile against this crate's
+// module tree. Purely a visibility relaxation -- pub is a strict
+// superset of pub(crate), so no existing internal call site is affected.
+pub mod event;
 pub mod event_loop;
-pub(crate) mod graph;
+pub mod graph;
 pub mod message;
-pub(crate) mod stdio;
+pub mod stdio;
 pub mod token;
 pub mod trader;
 pub mod tx;
 pub mod txview;
-pub(crate) mod util;
+pub mod util;
 pub mod wallet;
 
+// This block -- and the wit_bindgen `exports::wasi::cli::run::Guest`
+// world-export it implements -- is this crate's OWN standalone WASM
+// component entry point (Merged::default() dispatching every real
+// BotMode by MODE env var). It's feature-gated (default ON, so this
+// crate's own build/test/wasm pipeline is completely unaffected) so a
+// downstream crate that wants to depend on the reusable module tree
+// (trader, wallet, event_loop, etc.) and supply its OWN Component/
+// export!(Component) can build with `default-features = false` --
+// wit_bindgen's `export!` can only be called once per WIT world across
+// the whole final link; calling it here *and* in a dependent crate would
+// collide.
+#[cfg(feature = "component-entrypoint")]
 struct Component;
 
+#[cfg(feature = "component-entrypoint")]
 impl Guest for Component {
     /// This is the entry point for the bot.
     fn run() -> Result<(), ()> {
@@ -210,4 +239,5 @@ pub mod target_allocation_config {
     include!(concat!(env!("OUT_DIR"), "/target_allocation_data.rs"));
 }
 
+#[cfg(feature = "component-entrypoint")]
 export!(Component);

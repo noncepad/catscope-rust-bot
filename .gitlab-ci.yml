@@ -30,7 +30,7 @@ build_test:
     # backed optimizer run to pull from.
     - cp contrib/test-json/*.json target/
     - cargo clippy --no-deps -- -D unused_variables -D clippy::needless_borrow -D clippy::large_enum_variant
-    - cargo test --target x86_64-unknown-linux-gnu
+    - cargo test --target x86_64-unknown-linux-gnu --lib
     - cargo build --target wasm32-wasip2 --release
     - perl ./contrib/test.pl
 
@@ -52,7 +52,7 @@ build_bot:
     # build_test's own copy of this same comment.
     - cp contrib/test-json/*.json target/
     - cargo clippy --no-deps -- -D unused_variables -D clippy::needless_borrow -D clippy::large_enum_variant
-    - cargo test --target x86_64-unknown-linux-gnu
+    - cargo test --target x86_64-unknown-linux-gnu --lib
     - cargo build --target wasm32-wasip2 --release
   artifacts:
     expire_in: 1 hour
