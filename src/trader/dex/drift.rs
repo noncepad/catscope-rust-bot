@@ -282,6 +282,55 @@ impl DriftUser {
     pub fn perp_position_for(&self, market_index: u16) -> Option<&DriftPerpPosition> {
         self.perp_positions.iter().find(|p| p.market_index == market_index && p.is_open())
     }
+
+    /// Mint-keyed, human-readable (decimals-adjusted) view of this bot's
+    /// own spot positions -- mirrors `solend::SolendObligation::summarize`'s
+    /// role. **Spot only**: Drift's real order flow moved to an
+    /// off-chain "Swift" relayer this bot's WIT host interface can't
+    /// reach (see this module's own doc comment), so perp trading here
+    /// is retired, and unlike spot markets ([`DriftSpotMarket`]) this bot
+    /// never tracks live `PerpMarket` state -- no mint/decimals/price
+    /// source to resolve `perp_positions` against. A spot position whose
+    /// market hasn't been observed yet is skipped rather than guessed.
+    pub fn summarize(&self, dex: &DriftState) -> DriftPositionSummary {
+        let spot = self
+            .spot_positions
+            .iter()
+            .filter(|p| p.scaled_balance != 0)
+            .filter_map(|p| {
+                let (_, market) = dex.market_by_index(p.market_index)?;
+                let interest = if p.is_borrow {
+                    market.cumulative_borrow_interest
+                } else {
+                    market.cumulative_deposit_interest
+                };
+                let human =
+                    (p.scaled_balance as f64 * interest) / 10f64.powi(market.mint_decimals as i32);
+                Some(DriftSpotPositionSummaryEntry {
+                    mint: market.mint,
+                    amount: human,
+                    is_borrow: p.is_borrow,
+                })
+            })
+            .collect();
+        DriftPositionSummary { spot }
+    }
+}
+
+/// Independent, mint-keyed summary of this bot's own Drift spot
+/// positions -- see [`DriftUser::summarize`]. Amounts are human-readable
+/// (already divided by the mint's decimals), not raw/scaled.
+#[derive(Debug, Default, Clone)]
+pub struct DriftPositionSummary {
+    pub spot: Vec<DriftSpotPositionSummaryEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DriftSpotPositionSummaryEntry {
+    pub mint: AccountId,
+    /// Human-readable amount -- always positive; see `is_borrow` for direction.
+    pub amount: f64,
+    pub is_borrow: bool,
 }
 
 /// Parse a Drift v2 `User` account from raw body bytes (including the
