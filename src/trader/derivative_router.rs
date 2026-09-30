@@ -193,6 +193,7 @@ mod tests {
             mint: 100,
             max_ltv_pct: 0.7,
             borrow_apy,
+            supply_apy: 0.0,
             available_liquidity_usd: 1_000_000.0,
         }
     }

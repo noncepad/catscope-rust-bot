@@ -33,6 +33,11 @@ pub struct CreditReserve {
     /// Ongoing cost (fraction per year) to borrow this asset. `0.0` if
     /// unknown -- callers should treat that as "unpriced", not "free".
     pub borrow_apy: f64,
+    /// Ongoing yield (fraction per year) earned by depositing this asset.
+    /// `0.0` if unknown (Drift/Jet -- see their own `from_*` doc
+    /// comments) -- same "unpriced, not free/zero-yield" caveat as
+    /// `borrow_apy`.
+    pub supply_apy: f64,
     /// USD value of liquidity actually sitting in this reserve, i.e. the
     /// hard cap on how much of it can be borrowed right now.
     pub available_liquidity_usd: f64,
@@ -49,6 +54,7 @@ impl CreditReserve {
             mint: r.token_mint,
             max_ltv_pct: r.loan_to_value_pct,
             borrow_apy: r.current_borrow_apy(),
+            supply_apy: r.current_supply_apy(),
             available_liquidity_usd: r.available_amount as f64 * raw_to_usd,
         }
     }
@@ -77,6 +83,7 @@ impl CreditReserve {
             mint: b.mint,
             max_ltv_pct: b.asset_weight_init,
             borrow_apy: b.current_borrow_apy(),
+            supply_apy: b.current_supply_apy(),
             available_liquidity_usd,
         }
     }
@@ -93,6 +100,7 @@ impl CreditReserve {
             mint: r.mint,
             max_ltv_pct: r.loan_to_value_pct,
             borrow_apy: r.current_borrow_apy(),
+            supply_apy: r.current_supply_apy(),
             available_liquidity_usd: r.available_amount as f64 * raw_to_usd,
         }
     }
@@ -101,6 +109,8 @@ impl CreditReserve {
     /// is the market account's own pubkey (not stored on `DriftSpotMarket`
     /// itself). `price_usd` here is an oracle snapshot, not a live read --
     /// see the module doc comment on `dex::drift` for the caveat.
+    /// `supply_apy` is left at `0.0` (unpriced) -- `DriftSpotMarket` only
+    /// implements `current_borrow_apy`, no supply-side estimator.
     pub fn from_drift(reserve_id: AccountId, m: &super::dex::drift::DriftSpotMarket) -> Self {
         let raw_to_usd = m.price_usd / 10f64.powi(m.mint_decimals as i32);
         Self {
@@ -108,6 +118,7 @@ impl CreditReserve {
             mint: m.mint,
             max_ltv_pct: m.initial_asset_weight,
             borrow_apy: m.current_borrow_apy(),
+            supply_apy: 0.0,
             available_liquidity_usd: m.available_amount() * raw_to_usd,
         }
     }
@@ -117,14 +128,15 @@ impl CreditReserve {
     /// (from the reserve's own address-book entry) since Jet's cached
     /// per-reserve info -- the only part of this protocol reliably parsed
     /// so far, see the module doc comment on `dex::jet` -- doesn't include
-    /// it. `available_liquidity_usd` and `borrow_apy` are left at `0.0`
-    /// (unpriced) for the same reason.
+    /// it. `available_liquidity_usd`/`borrow_apy`/`supply_apy` are left at
+    /// `0.0` (unpriced) for the same reason.
     pub fn from_jet(reserve_id: AccountId, mint: AccountId, info: &super::dex::jet::JetReserveInfo) -> Self {
         Self {
             reserve_id,
             mint,
             max_ltv_pct: info.max_ltv_pct(),
             borrow_apy: 0.0,
+            supply_apy: 0.0,
             available_liquidity_usd: 0.0,
         }
     }
@@ -176,6 +188,7 @@ mod tests {
             mint: 100,
             max_ltv_pct: 0.70,
             borrow_apy: 0.0,
+            supply_apy: 0.0,
             available_liquidity_usd: 50_000.0,
         }
     }
@@ -186,6 +199,7 @@ mod tests {
             mint: 200,
             max_ltv_pct: 0.0,
             borrow_apy: 0.0,
+            supply_apy: 0.0,
             available_liquidity_usd: 1_000_000.0,
         }
     }

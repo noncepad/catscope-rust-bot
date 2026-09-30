@@ -39,6 +39,7 @@ pub mod factor_residual;
 pub mod residual_snapshot;
 pub mod factor_sizing;
 pub mod hawkes_factor;
+pub mod lending_router;
 pub mod market_stats;
 pub mod pair_basket;
 pub mod perp_router;
