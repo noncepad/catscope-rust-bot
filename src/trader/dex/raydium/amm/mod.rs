@@ -26,7 +26,7 @@ use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, SubscriptionRequest},
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{Hop, TradeRouter},
         types::{DexType, PoolPrice, SwapParams, TraderError, RAYDIUM_HOP_MAX_SLIPPAGE},
     },
@@ -34,8 +34,10 @@ use crate::{
     wallet::Wallet,
 };
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 use std::{collections::HashMap, hash::BuildHasherDefault};
 use twox_hash::XxHash64;
@@ -296,10 +298,20 @@ impl RaydiumAmm {
             };
             m_pool.insert(
                 setup.pubkey,
-                RaydiumAmmPoolWrapper { pool, swap_config: setup.swap_config.clone() },
+                RaydiumAmmPoolWrapper {
+                    pool,
+                    swap_config: setup.swap_config.clone(),
+                },
             );
         }
-        (Self { program_id, m_pool, m_vault }, l_req)
+        (
+            Self {
+                program_id,
+                m_pool,
+                m_vault,
+            },
+            l_req,
+        )
     }
 
     pub fn program_id(&self) -> &AccountId {
@@ -328,7 +340,10 @@ impl RaydiumAmm {
         dest_ata: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        let state = self.m_pool.get(&hop.pool_id).ok_or(TraderError::UnknownPool(hop.pool_id))?;
+        let state = self
+            .m_pool
+            .get(&hop.pool_id)
+            .ok_or(TraderError::UnknownPool(hop.pool_id))?;
         let mut params = SwapParams {
             pool: hop.pool_id,
             input_mint: hop.input_mint,
@@ -343,18 +358,24 @@ impl RaydiumAmm {
         // this, real on-chain price movement between quote and landing
         // reliably trips the pool's own minimum-output check.
         params.apply_slippage_tolerance(RAYDIUM_HOP_MAX_SLIPPAGE);
-        build_swap_ix(hop.pool_id, &state.pool, &state.swap_config, &params, wallet)
+        build_swap_ix(
+            hop.pool_id,
+            &state.pool,
+            &state.swap_config,
+            &params,
+            wallet,
+        )
     }
 }
 impl Updater for RaydiumAmm {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if header.owner != self.program_id {
-            return;
+            return None;
         }
         let new_state = match self.m_pool.get(&header.accountid) {
-            None => return,
+            None => return None,
             Some(_) => match parse(body) {
-                None => return,
+                None => return None,
                 Some(s) => s,
             },
         };
@@ -363,7 +384,7 @@ impl Updater for RaydiumAmm {
         let (old_cv, old_pv, new_cv, new_pv) = {
             let s = match self.m_pool.get_mut(&pool_id) {
                 Some(x) => x,
-                None => return,
+                None => return None,
             };
             let rc = s.pool.reserve_coin;
             let rp = s.pool.reserve_pc;
@@ -384,6 +405,13 @@ impl Updater for RaydiumAmm {
         if old_pv == 0 && new_pv != 0 {
             self.m_vault.insert(new_pv, pool_id);
         }
+        // `reserve_coin`/`reserve_pc` (the price-bearing fields) are
+        // deliberately preserved from the old state above, not updated
+        // here -- this account carries pool config, not live balances
+        // (those only ever change via `on_token`'s vault-balance
+        // tracking), so there's no fresh price to report -- `Blank`, not
+        // a half-populated `Spot`.
+        Some(StateChange::Blank)
     }
     fn on_token(&mut self, ta: &Tokenaccountv1) -> bool {
         if let Some(&pool_id) = self.m_vault.get(&ta.id) {
@@ -419,7 +447,7 @@ impl Updater for RaydiumAmm {
     fn on_tx(
         &mut self,
         _ix: &crate::txview::CatscopeInstructionRead<'_>,
-        _slot: &solana_sdk::clock::Slot,
+        _r: &Result<Slot, TransactionError>,
     ) {
         // Deliberately not decoded, unlike CLMM/CPMM/Orca's on_tx: a
         // SwapBaseIn instruction always carries both coin_vault and
@@ -432,7 +460,11 @@ impl Updater for RaydiumAmm {
         // documented gap rather than a guess.
     }
 
-    fn flush_pool(&mut self, _graph: &Graph, _max_per_flush: usize) -> Result<(), CatscopeGuestError> {
+    fn flush_pool(
+        &mut self,
+        _graph: &Graph,
+        _max_per_flush: usize,
+    ) -> Result<(), CatscopeGuestError> {
         // Not currently called by DexState::flush_pool (only Orca is).
         Ok(())
     }

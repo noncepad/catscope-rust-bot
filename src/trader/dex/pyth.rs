@@ -62,9 +62,10 @@
 
 use crate::{
     graph::{AccountId, SubscriptionRequest},
+    trader::dex::update::Updater,
     util::account_id_from_pubkey,
 };
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{pubkey::Pubkey, transaction::TransactionError};
 
 /// Pyth's well-known magic number, present at the start of every legacy
 /// Price/Product/Mapping account.
@@ -119,8 +120,11 @@ pub fn parse_legacy(body: &[u8]) -> Option<PythPrice> {
     let agg_conf = u64::from_le_bytes(body[OFF_AGG_CONF..OFF_AGG_CONF + 8].try_into().unwrap());
     let agg_status =
         u32::from_le_bytes(body[OFF_AGG_STATUS..OFF_AGG_STATUS + 4].try_into().unwrap());
-    let agg_pub_slot =
-        u64::from_le_bytes(body[OFF_AGG_PUB_SLOT..OFF_AGG_PUB_SLOT + 8].try_into().unwrap());
+    let agg_pub_slot = u64::from_le_bytes(
+        body[OFF_AGG_PUB_SLOT..OFF_AGG_PUB_SLOT + 8]
+            .try_into()
+            .unwrap(),
+    );
 
     let scale = 10f64.powi(expo);
     Some(PythPrice {
@@ -223,11 +227,15 @@ pub fn parse_push_oracle(body: &[u8]) -> Option<PythPushPrice> {
     let read_i64 = |off: usize| i64::from_le_bytes(body[off..off + 8].try_into().unwrap());
     let read_u64 = |off: usize| u64::from_le_bytes(body[off..off + 8].try_into().unwrap());
 
-    let feed_id: [u8; 32] = body[price_message_off..price_message_off + 32].try_into().unwrap();
+    let feed_id: [u8; 32] = body[price_message_off..price_message_off + 32]
+        .try_into()
+        .unwrap();
     let price = read_i64(price_message_off + 32);
     let conf = read_u64(price_message_off + 40);
     let exponent = i32::from_le_bytes(
-        body[price_message_off + 48..price_message_off + 52].try_into().unwrap(),
+        body[price_message_off + 48..price_message_off + 52]
+            .try_into()
+            .unwrap(),
     );
     let publish_time = read_i64(price_message_off + 52);
 
@@ -315,7 +323,11 @@ pub fn parse_switchboard_pull(body: &[u8]) -> Option<SwitchboardPullPrice> {
     if body[0..8] != SWITCHBOARD_PULL_DISCRIMINATOR {
         return None;
     }
-    let raw = i128::from_le_bytes(body[OFF_SWITCHBOARD_VALUE..OFF_SWITCHBOARD_VALUE + 16].try_into().unwrap());
+    let raw = i128::from_le_bytes(
+        body[OFF_SWITCHBOARD_VALUE..OFF_SWITCHBOARD_VALUE + 16]
+            .try_into()
+            .unwrap(),
+    );
     let last_update_timestamp = i64::from_le_bytes(
         body[OFF_SWITCHBOARD_LAST_UPDATE_TIMESTAMP..OFF_SWITCHBOARD_LAST_UPDATE_TIMESTAMP + 8]
             .try_into()
@@ -450,8 +462,18 @@ impl PythFeedState {
             &PYTH_PUSH_ORACLE_PROGRAM_ID,
         );
         let sol_usd_account_id = account_id_from_pubkey(&pda);
-        let req = SubscriptionRequest { root: sol_usd_account_id, filter_weight: 0, depth: 1 };
-        (Self { sol_usd_account_id, sol_usd_price: None }, req)
+        let req = SubscriptionRequest {
+            root: sol_usd_account_id,
+            filter_weight: 0,
+            depth: 1,
+        };
+        (
+            Self {
+                sol_usd_account_id,
+                sol_usd_price: None,
+            },
+            req,
+        )
     }
 
     pub fn sol_usd_price(&self) -> Option<PythPushPrice> {
@@ -464,6 +486,51 @@ impl PythFeedState {
                 self.sol_usd_price = Some(price);
             }
         }
+    }
+}
+
+impl Updater for PythFeedState {
+    fn refresh_account_router(
+        &mut self,
+        _account_id: AccountId,
+        _router: &mut crate::trader::pricegraph::TradeRouter,
+    ) {
+    }
+
+    fn refresh_token_router(
+        &mut self,
+        _ta_id: AccountId,
+        _router: &mut crate::trader::pricegraph::TradeRouter,
+    ) {
+    }
+
+    fn on_account(
+        &mut self,
+        _header: &crate::catscope::witbot::shooter::Header,
+        _body: &[u8],
+    ) -> Option<super::update::StateChange> {
+        None
+    }
+
+    fn on_token(&mut self, _ta: &crate::catscope::witbot::shooter::Tokenaccountv1) -> bool {
+        false
+    }
+
+    fn on_tx(
+        &mut self,
+        _ix: &crate::txview::CatscopeInstructionRead<'_>,
+        _r: &Result<solana_sdk::clock::Slot, TransactionError>,
+    ) {
+    }
+
+    fn batch_router(&mut self, _router: &mut crate::trader::pricegraph::TradeRouter) {}
+
+    fn flush_pool(
+        &mut self,
+        _graph: &crate::graph::Graph,
+        _max_per_flush: usize,
+    ) -> Result<(), crate::err::CatscopeGuestError> {
+        Ok(())
     }
 }
 
@@ -489,7 +556,8 @@ mod tests {
         body[OFF_EXPO..OFF_EXPO + 4].copy_from_slice(&(-8i32).to_le_bytes());
         body[OFF_AGG_PRICE..OFF_AGG_PRICE + 8].copy_from_slice(&100_000_000i64.to_le_bytes());
         body[OFF_AGG_CONF..OFF_AGG_CONF + 8].copy_from_slice(&106_896u64.to_le_bytes());
-        body[OFF_AGG_STATUS..OFF_AGG_STATUS + 4].copy_from_slice(&PYTH_STATUS_TRADING.to_le_bytes());
+        body[OFF_AGG_STATUS..OFF_AGG_STATUS + 4]
+            .copy_from_slice(&PYTH_STATUS_TRADING.to_le_bytes());
         body[OFF_AGG_PUB_SLOT..OFF_AGG_PUB_SLOT + 8].copy_from_slice(&200_000_000u64.to_le_bytes());
         body
     }

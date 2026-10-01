@@ -76,7 +76,11 @@
 use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, Subscription, SubscriptionRequest},
-    trader::{dex::update::Updater, pricegraph::TradeRouter, types::TraderError},
+    trader::{
+        dex::update::{StateChange, Updater},
+        pricegraph::TradeRouter,
+        types::TraderError,
+    },
     util::{account_id_from_pubkey, pubkey_from_account_id},
     wallet::Wallet,
 };
@@ -85,6 +89,7 @@ use solana_sdk::{
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
     rent::Rent,
+    transaction::TransactionError,
 };
 use solana_sdk_ids::sysvar::rent as rent_sysvar;
 use solana_system_interface::instruction::create_account_with_seed;
@@ -153,7 +158,11 @@ const OBLIGATION_SEED: &str = "solend-obligation";
 /// worst case (`id=255`) is `"solend-obligation-255"`, 22 bytes -- safe with
 /// room to spare for any `u8`.
 fn obligation_seed(id: u8) -> String {
-    if id == 0 { OBLIGATION_SEED.to_string() } else { format!("{OBLIGATION_SEED}-{id}") }
+    if id == 0 {
+        OBLIGATION_SEED.to_string()
+    } else {
+        format!("{OBLIGATION_SEED}-{id}")
+    }
 }
 
 /// Solend's Obligation account is a fixed 1300 bytes
@@ -285,14 +294,33 @@ impl SolendReserve {
     pub fn current_borrow_apy(&self) -> f64 {
         let util_pct = self.utilization() * 100.0;
         let (lo, hi, seg_start, seg_end) = if util_pct <= self.optimal_utilization_rate {
-            (self.min_borrow_rate, self.optimal_borrow_rate, 0.0, self.optimal_utilization_rate)
+            (
+                self.min_borrow_rate,
+                self.optimal_borrow_rate,
+                0.0,
+                self.optimal_utilization_rate,
+            )
         } else if util_pct <= self.max_utilization_rate {
-            (self.optimal_borrow_rate, self.max_borrow_rate, self.optimal_utilization_rate, self.max_utilization_rate)
+            (
+                self.optimal_borrow_rate,
+                self.max_borrow_rate,
+                self.optimal_utilization_rate,
+                self.max_utilization_rate,
+            )
         } else {
-            (self.max_borrow_rate, self.super_max_borrow_rate, self.max_utilization_rate, 100.0)
+            (
+                self.max_borrow_rate,
+                self.super_max_borrow_rate,
+                self.max_utilization_rate,
+                100.0,
+            )
         };
         let denom = seg_end - seg_start;
-        let frac = if denom <= 0.0 { 1.0 } else { ((util_pct - seg_start) / denom).clamp(0.0, 1.0) };
+        let frac = if denom <= 0.0 {
+            1.0
+        } else {
+            ((util_pct - seg_start) / denom).clamp(0.0, 1.0)
+        };
         (lo + (hi - lo) * frac) / 100.0
     }
 
@@ -322,7 +350,11 @@ impl SolendReserve {
     /// account exists on the real program (only used when a reserve's
     /// `config.extra_oracle_pubkey` is set) but wasn't observed live on any
     /// reserve sampled -- not modeled here.
-    pub fn refresh_reserve(&self, reserve_id: AccountId, wallet: &mut Wallet) -> Result<(), TraderError> {
+    pub fn refresh_reserve(
+        &self,
+        reserve_id: AccountId,
+        wallet: &mut Wallet,
+    ) -> Result<(), TraderError> {
         let reserve_pk = resolve(reserve_id)?;
         wallet.append_ix(
             Instruction {
@@ -641,7 +673,11 @@ fn resolve(id: AccountId) -> Result<Pubkey, TraderError> {
 /// obligation account. Must succeed before [`init_obligation`]. `owner`
 /// acts as both the seed base and the fee payer -- this bot operates with a
 /// single signing wallet.
-pub fn create_obligation_account(owner: AccountId, id: u8, wallet: &mut Wallet) -> Result<AccountId, TraderError> {
+pub fn create_obligation_account(
+    owner: AccountId,
+    id: u8,
+    wallet: &mut Wallet,
+) -> Result<AccountId, TraderError> {
     let owner_pk = resolve(owner)?;
     let obligation_pk = obligation_address(&owner_pk, id);
     let lamports = Rent::default().minimum_balance(OBLIGATION_LEN as usize);
@@ -836,7 +872,10 @@ impl SolendObligation {
     pub fn summarize(&self, dex: &SolendState) -> SolendPositionSummary {
         let convert = |reserve_id: AccountId, raw: u64| -> Option<(AccountId, f64)> {
             let reserve = dex.reserve_by_id(reserve_id)?;
-            Some((reserve.mint, raw as f64 / 10f64.powi(reserve.mint_decimals as i32)))
+            Some((
+                reserve.mint,
+                raw as f64 / 10f64.powi(reserve.mint_decimals as i32),
+            ))
         };
         SolendPositionSummary {
             deposits: self
@@ -948,12 +987,20 @@ impl SolendPosition {
     /// separate ones. Real, live-observed incident: those five
     /// one-at-a-time calls accounted for ~26 seconds of stall in one run
     /// (traced via `CommitHook::start`'s own timing diagnostics).
-    pub fn authority_subscribe_requests(&self, authority: Pubkey, id: u8) -> Vec<SubscriptionRequest> {
+    pub fn authority_subscribe_requests(
+        &self,
+        authority: Pubkey,
+        id: u8,
+    ) -> Vec<SubscriptionRequest> {
         if self.o_authority_pk == Some(authority) {
             return Vec::new();
         }
         let obligation_pk = obligation_address(&authority, id);
-        vec![SubscriptionRequest { root: account_id_from_pubkey(&obligation_pk), filter_weight: 0, depth: 1 }]
+        vec![SubscriptionRequest {
+            root: account_id_from_pubkey(&obligation_pk),
+            filter_weight: 0,
+            depth: 1,
+        }]
     }
 
     /// Apply `authority` plus its already-resolved subscription (from
@@ -962,7 +1009,9 @@ impl SolendPosition {
     /// set, or nothing to apply). `id` must match the same value passed to
     /// `authority_subscribe_requests`.
     pub fn apply_authority(&mut self, authority: Pubkey, id: u8, subs: Vec<Subscription>) {
-        let Some(sub) = subs.into_iter().next() else { return };
+        let Some(sub) = subs.into_iter().next() else {
+            return;
+        };
         let obligation_pk = obligation_address(&authority, id);
         let obligation_id = account_id_from_pubkey(&obligation_pk);
         self.subscriptions.push(sub);
@@ -1046,7 +1095,13 @@ impl SolendState {
             m_reserve.insert(reserve_id, SolendReserve::default());
         }
 
-        (Self { program_id, m_reserve }, l_req)
+        (
+            Self {
+                program_id,
+                m_reserve,
+            },
+            l_req,
+        )
     }
 
     pub fn program_id(&self) -> &AccountId {
@@ -1101,12 +1156,27 @@ impl SolendState {
 }
 
 impl Updater for SolendState {
-    fn on_account(&mut self, header: &crate::catscope::witbot::shooter::Header, body: &[u8]) {
+    fn on_account(
+        &mut self,
+        header: &crate::catscope::witbot::shooter::Header,
+        body: &[u8],
+    ) -> Option<StateChange> {
         if let Some(reserve) = self.m_reserve.get_mut(&header.accountid) {
             if let Some(parsed) = parse(body) {
                 *reserve = parsed;
+                return Some(StateChange::Lending {
+                    account_id: header.accountid,
+                    borrow_apy: Some(reserve.current_borrow_apy()),
+                    supply_apy: Some(reserve.current_supply_apy()),
+                    price_usd: Some(reserve.price_usd),
+                });
             }
+            // Recognized (it's a tracked reserve) but unparseable --
+            // `Blank`, not `None` (which would mean "not recognized at
+            // all").
+            return Some(StateChange::Blank);
         }
+        None
     }
 
     fn on_token(&mut self, _ta: &crate::catscope::witbot::shooter::Tokenaccountv1) -> bool {
@@ -1123,7 +1193,12 @@ impl Updater for SolendState {
         // unimplemented.
     }
 
-    fn on_tx(&mut self, _ix: &crate::txview::CatscopeInstructionRead<'_>, _slot: &Slot) {}
+    fn on_tx(
+        &mut self,
+        _ix: &crate::txview::CatscopeInstructionRead<'_>,
+        _result: &Result<Slot, TransactionError>,
+    ) {
+    }
 
     fn flush_pool(&mut self, _g: &Graph, _max_per_flush: usize) -> Result<(), CatscopeGuestError> {
         Ok(())
@@ -1254,7 +1329,8 @@ mod tests {
         // getting this wrong the other way (adding a prefix) would produce
         // a different, wrong PDA.
         let lending_market = Pubkey::new_unique();
-        let expected = Pubkey::find_program_address(&[lending_market.as_ref()], &SOLEND_PROGRAM_ID).0;
+        let expected =
+            Pubkey::find_program_address(&[lending_market.as_ref()], &SOLEND_PROGRAM_ID).0;
         assert_eq!(lending_market_authority(&lending_market), expected);
     }
 
@@ -1262,8 +1338,14 @@ mod tests {
     fn obligation_address_is_deterministic_and_owner_specific() {
         let owner_a = Pubkey::new_unique();
         let owner_b = Pubkey::new_unique();
-        assert_eq!(obligation_address(&owner_a, 0), obligation_address(&owner_a, 0));
-        assert_ne!(obligation_address(&owner_a, 0), obligation_address(&owner_b, 0));
+        assert_eq!(
+            obligation_address(&owner_a, 0),
+            obligation_address(&owner_a, 0)
+        );
+        assert_ne!(
+            obligation_address(&owner_a, 0),
+            obligation_address(&owner_b, 0)
+        );
     }
 
     #[test]
@@ -1284,7 +1366,8 @@ mod tests {
     #[test]
     fn obligation_address_id_zero_matches_original_unparameterized_seed() {
         let owner = Pubkey::new_unique();
-        let expected = Pubkey::create_with_seed(&owner, "solend-obligation", &SOLEND_PROGRAM_ID).unwrap();
+        let expected =
+            Pubkey::create_with_seed(&owner, "solend-obligation", &SOLEND_PROGRAM_ID).unwrap();
         assert_eq!(obligation_address(&owner, 0), expected);
     }
 
@@ -1298,8 +1381,14 @@ mod tests {
     fn obligation_with_positions() -> SolendObligation {
         SolendObligation {
             owner: 0,
-            deposits: vec![ObligationCollateral { deposit_reserve: 7, deposited_amount: 5_000_000_000 }],
-            borrows: vec![ObligationLiquidity { borrow_reserve: 9, borrowed_amount: 1_200_000_000 }],
+            deposits: vec![ObligationCollateral {
+                deposit_reserve: 7,
+                deposited_amount: 5_000_000_000,
+            }],
+            borrows: vec![ObligationLiquidity {
+                borrow_reserve: 9,
+                borrowed_amount: 1_200_000_000,
+            }],
         }
     }
 
@@ -1314,7 +1403,9 @@ mod tests {
     #[test]
     fn borrow_for_finds_position_by_reserve() {
         let ob = obligation_with_positions();
-        let b = ob.borrow_for(9).expect("expected a borrow against reserve 9");
+        let b = ob
+            .borrow_for(9)
+            .expect("expected a borrow against reserve 9");
         assert_eq!(b.borrowed_amount, 1_200_000_000);
         assert!(ob.borrow_for(10).is_none());
     }

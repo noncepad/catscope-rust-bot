@@ -125,9 +125,11 @@
 //! instantly.
 
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
     rent::Rent,
+    transaction::TransactionError,
 };
 use solana_system_interface::instruction::create_account_with_seed;
 
@@ -137,7 +139,7 @@ use crate::{
     graph::{AccountId, Graph, SubscriptionRequest},
     log_warn,
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{Hop, TradeRouter},
         types::{DexType, TraderError},
     },
@@ -153,7 +155,8 @@ pub const MARINADE_PROGRAM_ID: Pubkey =
 /// hardcodes as Marinade's SOL-value-calculator `pool_state` (that's a
 /// coincidence of Marinade using the same account for both purposes, not a
 /// shared abstraction between the two modules).
-const MARINADE_STATE: Pubkey = Pubkey::from_str_const("8szGkuLTAux9XMgZ2vtY39jVSowEcpBfFfD8hXSEqdGC");
+const MARINADE_STATE: Pubkey =
+    Pubkey::from_str_const("8szGkuLTAux9XMgZ2vtY39jVSowEcpBfFfD8hXSEqdGC");
 
 const MSOL_MINT: Pubkey = Pubkey::from_str_const("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So");
 
@@ -164,8 +167,10 @@ const SPL_TOKEN_PROGRAM_ID: Pubkey =
 
 const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("11111111111111111111111111111111");
 
-const SYSVAR_CLOCK_ID: Pubkey = Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
-const SYSVAR_RENT_ID: Pubkey = Pubkey::from_str_const("SysvarRent111111111111111111111111111111111");
+const SYSVAR_CLOCK_ID: Pubkey =
+    Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
+const SYSVAR_RENT_ID: Pubkey =
+    Pubkey::from_str_const("SysvarRent111111111111111111111111111111111");
 
 // ─── State account layout (see module doc) ────────────────────────────────────
 const STATE_MIN_LEN: usize = 613; // through delayed_unstake_fee.bp_cents @609 (4 bytes)
@@ -260,14 +265,24 @@ impl MarinadeState {
     /// `DexState` instead).
     pub fn new() -> (Self, Vec<SubscriptionRequest>) {
         let state_id = account_id_from_pubkey(&MARINADE_STATE);
-        let (sol_leg_pda, _bump) =
-            Pubkey::find_program_address(&[MARINADE_STATE.as_ref(), b"liq_sol"], &MARINADE_PROGRAM_ID);
+        let (sol_leg_pda, _bump) = Pubkey::find_program_address(
+            &[MARINADE_STATE.as_ref(), b"liq_sol"],
+            &MARINADE_PROGRAM_ID,
+        );
         let sol_leg_id = account_id_from_pubkey(&sol_leg_pda);
         let mint_id = account_id_from_pubkey(&MSOL_MINT);
 
         let l_req = vec![
-            SubscriptionRequest { root: state_id, filter_weight: 0, depth: 1 },
-            SubscriptionRequest { root: sol_leg_id, filter_weight: 0, depth: 1 },
+            SubscriptionRequest {
+                root: state_id,
+                filter_weight: 0,
+                depth: 1,
+            },
+            SubscriptionRequest {
+                root: sol_leg_id,
+                filter_weight: 0,
+                depth: 1,
+            },
         ];
 
         let state = Self {
@@ -310,7 +325,8 @@ impl MarinadeState {
         }
         let u64_at = |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
         let u32_at = |off: usize| u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-        let pubkey_at = |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        let pubkey_at =
+            |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
 
         self.treasury_msol_account = pubkey_at(OFF_TREASURY_MSOL_ACCOUNT);
         self.rent_exempt_for_token_acc = u64_at(OFF_RENT_EXEMPT_FOR_TOKEN_ACC);
@@ -346,7 +362,9 @@ impl MarinadeState {
     /// removes any stale edge left over from when the pool was last valid.
     fn upsert_edge(&self, router: &mut TradeRouter) {
         let price = self.msol_price_raw as f64 / PRICE_DENOMINATOR;
-        let available = self.sol_leg_lamports.saturating_sub(self.rent_exempt_for_token_acc);
+        let available = self
+            .sol_leg_lamports
+            .saturating_sub(self.rent_exempt_for_token_acc);
         let fee_bps = self.marginal_fee_bps(available);
         let fee_frac = fee_bps as f64 / 10_000.0;
         // msol_leg's real balance isn't tracked live (not needed for pricing
@@ -392,21 +410,25 @@ impl MarinadeState {
         data.extend_from_slice(&amount_in.to_le_bytes());
 
         let accounts = vec![
-            AccountMeta::new(MARINADE_STATE, false),           // state
-            AccountMeta::new_readonly(MSOL_MINT, false),       // msol_mint
-            AccountMeta::new(self.sol_leg_pda, false),         // liq_pool_sol_leg_pda
-            AccountMeta::new(self.msol_leg_pk, false),         // liq_pool_msol_leg
+            AccountMeta::new(MARINADE_STATE, false),             // state
+            AccountMeta::new_readonly(MSOL_MINT, false),         // msol_mint
+            AccountMeta::new(self.sol_leg_pda, false),           // liq_pool_sol_leg_pda
+            AccountMeta::new(self.msol_leg_pk, false),           // liq_pool_msol_leg
             AccountMeta::new(self.treasury_msol_account, false), // treasury_msol_account
-            AccountMeta::new(user_msol_pk, false),              // get_msol_from
-            AccountMeta::new_readonly(user_wallet_pk, true),    // get_msol_from_authority (signer)
-            AccountMeta::new(user_sol_pk, false),               // transfer_sol_to
+            AccountMeta::new(user_msol_pk, false),               // get_msol_from
+            AccountMeta::new_readonly(user_wallet_pk, true),     // get_msol_from_authority (signer)
+            AccountMeta::new(user_sol_pk, false),                // transfer_sol_to
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // system_program
             AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // token_program
         ];
 
         wallet.require_signer(user_wallet);
         wallet.append_ix(
-            Instruction { program_id: MARINADE_PROGRAM_ID, accounts, data },
+            Instruction {
+                program_id: MARINADE_PROGRAM_ID,
+                accounts,
+                data,
+            },
             MARINADE_LIQUID_UNSTAKE_CU,
         );
         Ok(())
@@ -482,18 +504,22 @@ impl MarinadeState {
         data.extend_from_slice(&amount_in.to_le_bytes());
 
         let accounts = vec![
-            AccountMeta::new(MARINADE_STATE, false),            // state
-            AccountMeta::new(MSOL_MINT, false),                 // msol_mint
-            AccountMeta::new(user_msol_pk, false),               // burn_msol_from
-            AccountMeta::new_readonly(user_wallet_pk, true),     // burn_msol_authority (signer)
-            AccountMeta::new(ticket_pk, false),                  // new_ticket_account
-            AccountMeta::new_readonly(SYSVAR_CLOCK_ID, false),   // clock
-            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),    // rent
+            AccountMeta::new(MARINADE_STATE, false),           // state
+            AccountMeta::new(MSOL_MINT, false),                // msol_mint
+            AccountMeta::new(user_msol_pk, false),             // burn_msol_from
+            AccountMeta::new_readonly(user_wallet_pk, true),   // burn_msol_authority (signer)
+            AccountMeta::new(ticket_pk, false),                // new_ticket_account
+            AccountMeta::new_readonly(SYSVAR_CLOCK_ID, false), // clock
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),  // rent
             AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // token_program
         ];
 
         wallet.append_ix(
-            Instruction { program_id: MARINADE_PROGRAM_ID, accounts, data },
+            Instruction {
+                program_id: MARINADE_PROGRAM_ID,
+                accounts,
+                data,
+            },
             MARINADE_ORDER_UNSTAKE_CU,
         );
         Ok(account_id_from_pubkey(&ticket_pk))
@@ -522,20 +548,26 @@ impl MarinadeState {
         };
         let ticket_pk = resolve(ticket_account)?;
         let user_wallet_pk = resolve(user_wallet)?;
-        let (reserve_pda, _bump) =
-            Pubkey::find_program_address(&[MARINADE_STATE.as_ref(), b"reserve"], &MARINADE_PROGRAM_ID);
+        let (reserve_pda, _bump) = Pubkey::find_program_address(
+            &[MARINADE_STATE.as_ref(), b"reserve"],
+            &MARINADE_PROGRAM_ID,
+        );
 
         let accounts = vec![
-            AccountMeta::new(MARINADE_STATE, false), // state
-            AccountMeta::new(reserve_pda, false),    // reserve_pda
-            AccountMeta::new(ticket_pk, false),      // ticket_account
-            AccountMeta::new(user_wallet_pk, false), // transfer_sol_to
-            AccountMeta::new_readonly(SYSVAR_CLOCK_ID, false), // clock
+            AccountMeta::new(MARINADE_STATE, false),             // state
+            AccountMeta::new(reserve_pda, false),                // reserve_pda
+            AccountMeta::new(ticket_pk, false),                  // ticket_account
+            AccountMeta::new(user_wallet_pk, false),             // transfer_sol_to
+            AccountMeta::new_readonly(SYSVAR_CLOCK_ID, false),   // clock
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // system_program
         ];
 
         wallet.append_ix(
-            Instruction { program_id: MARINADE_PROGRAM_ID, accounts, data: DISC_CLAIM.to_vec() },
+            Instruction {
+                program_id: MARINADE_PROGRAM_ID,
+                accounts,
+                data: DISC_CLAIM.to_vec(),
+            },
             MARINADE_CLAIM_CU,
         );
         Ok(())
@@ -579,18 +611,22 @@ impl MarinadeState {
         // cached msol_price (see module doc's precision note on why the
         // fuller total_virtual_staked_lamports formula isn't used here).
         let price = self.msol_price_raw as f64 / PRICE_DENOMINATOR;
-        let delayed_fee_msol =
-            (amount_in as u128 * self.delayed_unstake_fee_bp_cents as u128 / FEE_CENTS_DENOMINATOR as u128) as u64;
+        let delayed_fee_msol = (amount_in as u128 * self.delayed_unstake_fee_bp_cents as u128
+            / FEE_CENTS_DENOMINATOR as u128) as u64;
         let delayed_out = (amount_in.saturating_sub(delayed_fee_msol) as f64 * price) as u64;
 
         // order_unstake's own created_epoch rule, then Claim's WAIT_EPOCHS.
         let current_epoch = current_slot / SLOTS_PER_EPOCH;
-        let created_epoch =
-            current_epoch + (current_epoch == self.last_stake_delta_epoch) as u64;
+        let created_epoch = current_epoch + (current_epoch == self.last_stake_delta_epoch) as u64;
         let claimable_epoch = created_epoch + UNSTAKE_WAIT_EPOCHS;
         let wait_epochs = claimable_epoch.saturating_sub(current_epoch);
 
-        Some(UnstakeComparison { instant_out, instant_route, delayed_out, wait_epochs })
+        Some(UnstakeComparison {
+            instant_out,
+            instant_route,
+            delayed_out,
+            wait_epochs,
+        })
     }
 }
 
@@ -613,7 +649,7 @@ pub struct UnstakeComparison {
 }
 
 impl Updater for MarinadeState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         // sol_leg_pda is System-owned, not Marinade-owned -- match by
         // accountid directly rather than gating on header.owner first (see
         // module doc; this differs from sanctum.rs's owner-first check).
@@ -627,6 +663,13 @@ impl Updater for MarinadeState {
                 );
             }
             self.parse_state(body);
+            // Same formula as `upsert_edge`.
+            let price = self.msol_price_raw as f64 / PRICE_DENOMINATOR;
+            Some(StateChange::Spot {
+                token_a: self.mint_id,
+                token_b: self.sol_mint_id,
+                price,
+            })
         } else if header.accountid == self.sol_leg_id {
             if !self.sol_leg_logged {
                 self.sol_leg_logged = true;
@@ -637,6 +680,13 @@ impl Updater for MarinadeState {
                 );
             }
             self.sol_leg_lamports = header.lamports;
+            // Affects available liquidity/fee tier, not the mSOL price
+            // itself (that comes only from `state_id`, above), so
+            // there's no fresh price to report -- `Blank`, not a
+            // half-populated `Spot`.
+            Some(StateChange::Blank)
+        } else {
+            None
         }
     }
 
@@ -644,7 +694,12 @@ impl Updater for MarinadeState {
         false
     }
 
-    fn on_tx(&mut self, _ix: &CatscopeInstructionRead<'_>, _slot: &solana_sdk::clock::Slot) {}
+    fn on_tx(
+        &mut self,
+        _ix: &CatscopeInstructionRead<'_>,
+        _result: &Result<Slot, TransactionError>,
+    ) {
+    }
 
     /// Add the mSOL → SOL liquid-unstake edge for arbitrage detection.
     fn batch_router(&mut self, router: &mut TradeRouter) {
@@ -783,7 +838,9 @@ mod tests {
         // bumps by one extra epoch -> wait_epochs = 2.
         let mut m = m;
         m.msol_price_raw = 6_442_450_944; // 1.5 SOL/mSOL, for the delayed leg
-        let cmp = m.compare_unstake_paths(1_000, 5 * SLOTS_PER_EPOCH, &router).unwrap();
+        let cmp = m
+            .compare_unstake_paths(1_000, 5 * SLOTS_PER_EPOCH, &router)
+            .unwrap();
         assert_eq!(cmp.instant_out, expected_instant);
         assert_eq!(cmp.instant_route, vec![DexType::Sanctum]);
         assert_eq!(cmp.delayed_out, 1_497); // (1000 - 2000bp-cents fee=2) * 1.5 = 1497
@@ -791,7 +848,9 @@ mod tests {
 
         // current_epoch(6) != last_stake_delta_epoch(5) -> no extra bump
         // -> wait_epochs = 1. Prices/fees unaffected by current_slot.
-        let cmp2 = m.compare_unstake_paths(1_000, 6 * SLOTS_PER_EPOCH, &router).unwrap();
+        let cmp2 = m
+            .compare_unstake_paths(1_000, 6 * SLOTS_PER_EPOCH, &router)
+            .unwrap();
         assert_eq!(cmp2.instant_out, expected_instant);
         assert_eq!(cmp2.delayed_out, 1_497);
         assert_eq!(cmp2.wait_epochs, 1);

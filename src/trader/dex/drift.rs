@@ -66,7 +66,11 @@
 use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, SubscriptionRequest},
-    trader::{dex::update::Updater, pricegraph::TradeRouter, types::TraderError},
+    trader::{
+        dex::update::{StateChange, Updater},
+        pricegraph::TradeRouter,
+        types::TraderError,
+    },
     util::{account_id_from_pubkey, pubkey_from_account_id},
     wallet::Wallet,
 };
@@ -74,6 +78,7 @@ use solana_sdk::{
     clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 use solana_sdk_ids::{system_program, sysvar::rent};
 use std::{collections::HashMap, hash::BuildHasherDefault};
@@ -274,13 +279,17 @@ impl DriftUser {
     /// `scaled_balance` is nonzero -- deposit or borrow, see
     /// [`DriftSpotPosition::is_borrow`]'s doc.
     pub fn spot_position_for(&self, market_index: u16) -> Option<&DriftSpotPosition> {
-        self.spot_positions.iter().find(|p| p.market_index == market_index && p.scaled_balance != 0)
+        self.spot_positions
+            .iter()
+            .find(|p| p.market_index == market_index && p.scaled_balance != 0)
     }
 
     /// The open position (if any) in `market_index`, if that slot's
     /// `base_asset_amount` is nonzero.
     pub fn perp_position_for(&self, market_index: u16) -> Option<&DriftPerpPosition> {
-        self.perp_positions.iter().find(|p| p.market_index == market_index && p.is_open())
+        self.perp_positions
+            .iter()
+            .find(|p| p.market_index == market_index && p.is_open())
     }
 
     /// Mint-keyed, human-readable (decimals-adjusted) view of this bot's
@@ -344,7 +353,9 @@ pub fn parse_user(body: &[u8]) -> Option<DriftUser> {
     let read_u64 = |off: usize| u64::from_le_bytes(body[off..off + 8].try_into().unwrap());
     let read_i64 = |off: usize| i64::from_le_bytes(body[off..off + 8].try_into().unwrap());
     let authority = account_id_from_pubkey(&Pubkey::new_from_array(
-        body[OFF_USER_AUTHORITY..OFF_USER_AUTHORITY + 32].try_into().unwrap(),
+        body[OFF_USER_AUTHORITY..OFF_USER_AUTHORITY + 32]
+            .try_into()
+            .unwrap(),
     ));
 
     let mut spot_positions = [DriftSpotPosition::default(); NUM_SPOT_POSITIONS];
@@ -369,7 +380,11 @@ pub fn parse_user(body: &[u8]) -> Option<DriftUser> {
         };
     }
 
-    Some(DriftUser { authority, spot_positions, perp_positions })
+    Some(DriftUser {
+        authority,
+        spot_positions,
+        perp_positions,
+    })
 }
 
 /// Parsed subset of a Drift v2 SpotMarket account -- only the fields
@@ -506,8 +521,7 @@ impl DriftSpotMarket {
                 accounts,
                 data,
             },
-            DRIFT_DEPOSIT_BASE_CU
-                + other_open_markets.len() as u32 * DRIFT_DEPOSIT_PER_MARKET_CU,
+            DRIFT_DEPOSIT_BASE_CU + other_open_markets.len() as u32 * DRIFT_DEPOSIT_PER_MARKET_CU,
         );
         Ok(())
     }
@@ -562,8 +576,7 @@ impl DriftSpotMarket {
                 accounts,
                 data,
             },
-            DRIFT_WITHDRAW_BASE_CU
-                + other_open_markets.len() as u32 * DRIFT_WITHDRAW_PER_MARKET_CU,
+            DRIFT_WITHDRAW_BASE_CU + other_open_markets.len() as u32 * DRIFT_WITHDRAW_PER_MARKET_CU,
         );
         Ok(())
     }
@@ -950,7 +963,13 @@ impl DriftState {
             m_market.insert(market_id, DriftSpotMarket::default());
         }
 
-        (Self { program_id, m_market }, l_req)
+        (
+            Self {
+                program_id,
+                m_market,
+            },
+            l_req,
+        )
     }
 
     pub fn program_id(&self) -> &AccountId {
@@ -972,7 +991,10 @@ impl DriftState {
     /// since the caller (`perpfundingv1`'s bootstrap) only proceeds once
     /// `mint`/`oracle` are non-default, checked at the call site).
     pub fn market_by_index(&self, market_index: u16) -> Option<(AccountId, &DriftSpotMarket)> {
-        self.m_market.iter().find(|(_, m)| m.market_index == market_index).map(|(id, m)| (*id, m))
+        self.m_market
+            .iter()
+            .find(|(_, m)| m.market_index == market_index)
+            .map(|(id, m)| (*id, m))
     }
 
     /// Build a priced [`crate::trader::credit::CreditReserve`] for
@@ -992,12 +1014,30 @@ impl DriftState {
 }
 
 impl Updater for DriftState {
-    fn on_account(&mut self, header: &crate::catscope::witbot::shooter::Header, body: &[u8]) {
+    fn on_account(
+        &mut self,
+        header: &crate::catscope::witbot::shooter::Header,
+        body: &[u8],
+    ) -> Option<StateChange> {
         if let Some(market) = self.m_market.get_mut(&header.accountid) {
             if let Some(parsed) = parse(body) {
                 *market = parsed;
+                // No `current_supply_apy` -- `DriftSpotMarket` only
+                // implements the borrow-side estimator, same gap
+                // `credit::CreditReserve::from_drift` already documents.
+                return Some(StateChange::Lending {
+                    account_id: header.accountid,
+                    borrow_apy: Some(market.current_borrow_apy()),
+                    supply_apy: None,
+                    price_usd: Some(market.price_usd),
+                });
             }
+            // Recognized (it's a tracked market) but unparseable --
+            // `Blank`, not `None` (which would mean "not recognized at
+            // all").
+            return Some(StateChange::Blank);
         }
+        None
     }
 
     fn on_token(&mut self, _ta: &crate::catscope::witbot::shooter::Tokenaccountv1) -> bool {
@@ -1014,7 +1054,12 @@ impl Updater for DriftState {
         // unimplemented.
     }
 
-    fn on_tx(&mut self, _ix: &crate::txview::CatscopeInstructionRead<'_>, _slot: &Slot) {}
+    fn on_tx(
+        &mut self,
+        _ix: &crate::txview::CatscopeInstructionRead<'_>,
+        _result: &Result<Slot, TransactionError>,
+    ) {
+    }
 
     fn flush_pool(&mut self, _g: &Graph, _max_per_flush: usize) -> Result<(), CatscopeGuestError> {
         Ok(())
@@ -1145,7 +1190,10 @@ mod tests {
         assert_eq!(data[9], MarketType::Perp as u8);
         assert_eq!(data[10], PositionDirection::Short as u8);
         assert_eq!(data[11], 0); // user_order_id
-        assert_eq!(u64::from_le_bytes(data[12..20].try_into().unwrap()), 2_500_000_000);
+        assert_eq!(
+            u64::from_le_bytes(data[12..20].try_into().unwrap()),
+            2_500_000_000
+        );
         assert_eq!(u64::from_le_bytes(data[20..28].try_into().unwrap()), 0); // price
         assert_eq!(u16::from_le_bytes(data[28..30].try_into().unwrap()), 7); // market_index
         assert_eq!(data[30], 1); // reduce_only = true
@@ -1178,26 +1226,55 @@ mod tests {
     /// rather than calling `parse()`). `DriftUser`/`DriftPerpPosition`'s
     /// own logic (`is_open`, `perp_position_for`) has no such dependency
     /// and is fully testable directly.
-    fn user_with_position(market_index: u16, base_asset_amount: i64, quote_entry_amount: i64) -> DriftUser {
+    fn user_with_position(
+        market_index: u16,
+        base_asset_amount: i64,
+        quote_entry_amount: i64,
+    ) -> DriftUser {
         let mut perp_positions = [DriftPerpPosition::default(); NUM_PERP_POSITIONS];
-        perp_positions[3] =
-            DriftPerpPosition { market_index, base_asset_amount, quote_entry_amount, ..Default::default() };
-        DriftUser { authority: 0, spot_positions: [DriftSpotPosition::default(); NUM_SPOT_POSITIONS], perp_positions }
+        perp_positions[3] = DriftPerpPosition {
+            market_index,
+            base_asset_amount,
+            quote_entry_amount,
+            ..Default::default()
+        };
+        DriftUser {
+            authority: 0,
+            spot_positions: [DriftSpotPosition::default(); NUM_SPOT_POSITIONS],
+            perp_positions,
+        }
     }
 
-    fn user_with_spot_position(market_index: u16, scaled_balance: u64, is_borrow: bool) -> DriftUser {
+    fn user_with_spot_position(
+        market_index: u16,
+        scaled_balance: u64,
+        is_borrow: bool,
+    ) -> DriftUser {
         let mut spot_positions = [DriftSpotPosition::default(); NUM_SPOT_POSITIONS];
-        spot_positions[1] = DriftSpotPosition { market_index, scaled_balance, is_borrow };
-        DriftUser { authority: 0, spot_positions, perp_positions: [DriftPerpPosition::default(); NUM_PERP_POSITIONS] }
+        spot_positions[1] = DriftSpotPosition {
+            market_index,
+            scaled_balance,
+            is_borrow,
+        };
+        DriftUser {
+            authority: 0,
+            spot_positions,
+            perp_positions: [DriftPerpPosition::default(); NUM_PERP_POSITIONS],
+        }
     }
 
     #[test]
     fn spot_position_for_finds_position_by_market_index() {
         let user = user_with_spot_position(0, 5_000_000_000, false);
-        let pos = user.spot_position_for(0).expect("expected a spot position in market 0");
+        let pos = user
+            .spot_position_for(0)
+            .expect("expected a spot position in market 0");
         assert_eq!(pos.scaled_balance, 5_000_000_000);
         assert!(!pos.is_borrow);
-        assert!(user.spot_position_for(1).is_none(), "market 1 has no position");
+        assert!(
+            user.spot_position_for(1).is_none(),
+            "market 1 has no position"
+        );
     }
 
     #[test]
@@ -1213,12 +1290,17 @@ mod tests {
         // synthetic values.
         let user = user_with_position(0, 2_500_000_000, 150_000_000);
 
-        let pos = user.perp_position_for(0).expect("expected an open position in market 0");
+        let pos = user
+            .perp_position_for(0)
+            .expect("expected an open position in market 0");
         assert_eq!(pos.base_asset_amount, 2_500_000_000);
         assert_eq!(pos.quote_entry_amount, 150_000_000);
         assert!(pos.is_open());
 
-        assert!(user.perp_position_for(1).is_none(), "market 1 has no position");
+        assert!(
+            user.perp_position_for(1).is_none(),
+            "market 1 has no position"
+        );
     }
 
     #[test]

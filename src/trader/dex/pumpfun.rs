@@ -104,8 +104,10 @@
 use std::collections::HashMap;
 
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 
 use crate::{
@@ -113,7 +115,7 @@ use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, SubscriptionRequest},
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{Hop, TradeRouter},
         types::{DexType, TraderError},
     },
@@ -226,20 +228,30 @@ impl PumpfunState {
         let mut curves = Vec::with_capacity(raw.len());
         let mut curve_to_idx = HashMap::with_capacity(raw.len());
         let mut l_req = Vec::with_capacity(raw.len() + 1);
-        l_req.push(SubscriptionRequest { root: global_id, filter_weight: 0, depth: 1 });
+        l_req.push(SubscriptionRequest {
+            root: global_id,
+            filter_weight: 0,
+            depth: 1,
+        });
 
         for entry in raw.iter() {
             let mint_pk = Pubkey::new_from_array(entry.mint);
             let mint_id = account_id_from_pubkey(&mint_pk);
-            let (bonding_curve_pk, _bump) =
-                Pubkey::find_program_address(&[b"bonding-curve", mint_pk.as_ref()], &PUMPFUN_PROGRAM_ID);
+            let (bonding_curve_pk, _bump) = Pubkey::find_program_address(
+                &[b"bonding-curve", mint_pk.as_ref()],
+                &PUMPFUN_PROGRAM_ID,
+            );
             let bonding_curve_id = account_id_from_pubkey(&bonding_curve_pk);
             let associated_bonding_curve_pk =
                 spl_ata(&bonding_curve_pk, &SPL_TOKEN_PROGRAM_ID, &mint_pk);
 
             let idx = curves.len();
             curve_to_idx.insert(bonding_curve_id, idx);
-            l_req.push(SubscriptionRequest { root: bonding_curve_id, filter_weight: 0, depth: 1 });
+            l_req.push(SubscriptionRequest {
+                root: bonding_curve_id,
+                filter_weight: 0,
+                depth: 1,
+            });
             curves.push(PumpfunBondingCurveState {
                 mint_id,
                 mint_pk,
@@ -292,7 +304,8 @@ impl PumpfunState {
             return;
         }
         let u64_at = |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-        let pubkey_at = |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        let pubkey_at =
+            |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
         self.fee_recipient = pubkey_at(OFF_GLOBAL_FEE_RECIPIENT);
         self.fee_basis_points = u64_at(OFF_GLOBAL_FEE_BASIS_POINTS);
         self.creator_fee_basis_points = u64_at(OFF_GLOBAL_CREATOR_FEE_BASIS_POINTS);
@@ -304,7 +317,8 @@ impl PumpfunState {
             return;
         }
         let u64_at = |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-        let pubkey_at = |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        let pubkey_at =
+            |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
         let c = &mut self.curves[idx];
         c.virtual_token_reserves = u64_at(OFF_BC_VIRTUAL_TOKEN_RESERVES);
         c.virtual_sol_reserves = u64_at(OFF_BC_VIRTUAL_SOL_RESERVES);
@@ -327,7 +341,11 @@ impl PumpfunState {
         user_token_account: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        let curve = self.curves.iter().find(|c| c.mint_id == mint_id).ok_or(TraderError::WrongMints)?;
+        let curve = self
+            .curves
+            .iter()
+            .find(|c| c.mint_id == mint_id)
+            .ok_or(TraderError::WrongMints)?;
         if curve.creator == Pubkey::default() || !self.global_ready {
             return Err(TraderError::PoolNotReady);
         }
@@ -337,8 +355,10 @@ impl PumpfunState {
         let user_wallet_pk = resolve(user_wallet)?;
         let user_token_pk = resolve(user_token_account)?;
 
-        let (creator_vault, _bump) =
-            Pubkey::find_program_address(&[b"creator-vault", curve.creator.as_ref()], &PUMPFUN_PROGRAM_ID);
+        let (creator_vault, _bump) = Pubkey::find_program_address(
+            &[b"creator-vault", curve.creator.as_ref()],
+            &PUMPFUN_PROGRAM_ID,
+        );
         let (global_volume_accumulator, _bump) =
             Pubkey::find_program_address(&[b"global_volume_accumulator"], &PUMPFUN_PROGRAM_ID);
         let (user_volume_accumulator, _bump) = Pubkey::find_program_address(
@@ -358,11 +378,11 @@ impl PumpfunState {
             AccountMeta::new_readonly(curve.mint_pk, false),   // mint
             AccountMeta::new(curve.bonding_curve_pk, false),   // bonding_curve
             AccountMeta::new(curve.associated_bonding_curve_pk, false), // associated_bonding_curve
-            AccountMeta::new(user_token_pk, false),             // associated_user
-            AccountMeta::new_readonly(user_wallet_pk, true),    // user (signer)
+            AccountMeta::new(user_token_pk, false),            // associated_user
+            AccountMeta::new_readonly(user_wallet_pk, true),   // user (signer)
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // system_program
             AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // token_program
-            AccountMeta::new(creator_vault, false),             // creator_vault
+            AccountMeta::new(creator_vault, false),            // creator_vault
             AccountMeta::new_readonly(self.event_authority, false), // event_authority
             AccountMeta::new_readonly(PUMPFUN_PROGRAM_ID, false), // program
             AccountMeta::new(global_volume_accumulator, false), // global_volume_accumulator
@@ -372,7 +392,14 @@ impl PumpfunState {
         ];
 
         wallet.require_signer(user_wallet);
-        wallet.append_ix(Instruction { program_id: PUMPFUN_PROGRAM_ID, accounts, data }, PUMPFUN_BUY_CU);
+        wallet.append_ix(
+            Instruction {
+                program_id: PUMPFUN_PROGRAM_ID,
+                accounts,
+                data,
+            },
+            PUMPFUN_BUY_CU,
+        );
         Ok(())
     }
 
@@ -386,7 +413,11 @@ impl PumpfunState {
         user_token_account: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        let curve = self.curves.iter().find(|c| c.mint_id == mint_id).ok_or(TraderError::WrongMints)?;
+        let curve = self
+            .curves
+            .iter()
+            .find(|c| c.mint_id == mint_id)
+            .ok_or(TraderError::WrongMints)?;
         if curve.creator == Pubkey::default() || !self.global_ready {
             return Err(TraderError::PoolNotReady);
         }
@@ -396,8 +427,10 @@ impl PumpfunState {
         let user_wallet_pk = resolve(user_wallet)?;
         let user_token_pk = resolve(user_token_account)?;
 
-        let (creator_vault, _bump) =
-            Pubkey::find_program_address(&[b"creator-vault", curve.creator.as_ref()], &PUMPFUN_PROGRAM_ID);
+        let (creator_vault, _bump) = Pubkey::find_program_address(
+            &[b"creator-vault", curve.creator.as_ref()],
+            &PUMPFUN_PROGRAM_ID,
+        );
 
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&DISC_SELL);
@@ -410,10 +443,10 @@ impl PumpfunState {
             AccountMeta::new_readonly(curve.mint_pk, false),   // mint
             AccountMeta::new(curve.bonding_curve_pk, false),   // bonding_curve
             AccountMeta::new(curve.associated_bonding_curve_pk, false), // associated_bonding_curve
-            AccountMeta::new(user_token_pk, false),             // associated_user
-            AccountMeta::new_readonly(user_wallet_pk, true),    // user (signer)
+            AccountMeta::new(user_token_pk, false),            // associated_user
+            AccountMeta::new_readonly(user_wallet_pk, true),   // user (signer)
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // system_program
-            AccountMeta::new(creator_vault, false),             // creator_vault
+            AccountMeta::new(creator_vault, false),            // creator_vault
             AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false), // token_program
             AccountMeta::new_readonly(self.event_authority, false), // event_authority
             AccountMeta::new_readonly(PUMPFUN_PROGRAM_ID, false), // program
@@ -422,7 +455,14 @@ impl PumpfunState {
         ];
 
         wallet.require_signer(user_wallet);
-        wallet.append_ix(Instruction { program_id: PUMPFUN_PROGRAM_ID, accounts, data }, PUMPFUN_SELL_CU);
+        wallet.append_ix(
+            Instruction {
+                program_id: PUMPFUN_PROGRAM_ID,
+                accounts,
+                data,
+            },
+            PUMPFUN_SELL_CU,
+        );
         Ok(())
     }
 
@@ -443,10 +483,24 @@ impl PumpfunState {
     ) -> Result<(), TraderError> {
         if hop.input_mint == self.sol_mint_id {
             // Buy: SOL -> token. dest_ata holds the token being bought.
-            self.buy(hop.output_mint, hop.amount_out, hop.amount_in, owner, dest_ata, wallet)
+            self.buy(
+                hop.output_mint,
+                hop.amount_out,
+                hop.amount_in,
+                owner,
+                dest_ata,
+                wallet,
+            )
         } else {
             // Sell: token -> SOL. source_ata holds the token being sold.
-            self.sell(hop.input_mint, hop.amount_in, hop.amount_out, owner, source_ata, wallet)
+            self.sell(
+                hop.input_mint,
+                hop.amount_in,
+                hop.amount_out,
+                owner,
+                source_ata,
+                wallet,
+            )
         }
     }
 
@@ -495,11 +549,32 @@ fn spl_ata(owner: &Pubkey, token_program: &Pubkey, mint: &Pubkey) -> Pubkey {
 }
 
 impl Updater for PumpfunState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if header.accountid == self.global_id {
             self.parse_global(body);
+            // Carries the shared fee bps every curve's price depends on,
+            // not one specific curve -- see `refresh_account_router`'s
+            // identical "re-derive every curve" handling of this account.
+            // `Blank`, not a half-populated `Spot`.
+            Some(StateChange::Blank)
         } else if let Some(&idx) = self.curve_to_idx.get(&header.accountid) {
             self.parse_curve(idx, body);
+            // Same formula as `upsert_curve_edge` -- no price for a
+            // complete/zero-reserve curve, same validity check; `Blank`
+            // rather than a half-populated `Spot` in that case.
+            let c = &self.curves[idx];
+            let valid = !c.complete && c.virtual_token_reserves != 0 && c.virtual_sol_reserves != 0;
+            if valid {
+                Some(StateChange::Spot {
+                    token_a: c.mint_id,
+                    token_b: self.sol_mint_id,
+                    price: c.virtual_sol_reserves as f64 / c.virtual_token_reserves as f64,
+                })
+            } else {
+                Some(StateChange::Blank)
+            }
+        } else {
+            None
         }
     }
 
@@ -507,7 +582,12 @@ impl Updater for PumpfunState {
         false
     }
 
-    fn on_tx(&mut self, _ix: &CatscopeInstructionRead<'_>, _slot: &solana_sdk::clock::Slot) {}
+    fn on_tx(
+        &mut self,
+        _ix: &CatscopeInstructionRead<'_>,
+        _result: &Result<Slot, TransactionError>,
+    ) {
+    }
 
     /// Add a token <-> SOL edge for every incomplete, priced bonding curve.
     fn batch_router(&mut self, router: &mut TradeRouter) {
@@ -556,7 +636,10 @@ mod tests {
         // confirmation that the "global" seed derivation is correct, not
         // just internally self-consistent.
         let (global_pda, _bump) = Pubkey::find_program_address(&[b"global"], &PUMPFUN_PROGRAM_ID);
-        assert_eq!(global_pda, Pubkey::from_str_const("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"));
+        assert_eq!(
+            global_pda,
+            Pubkey::from_str_const("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
+        );
     }
 
     #[test]
@@ -575,14 +658,26 @@ mod tests {
     fn bonding_curve_address_is_deterministic_and_mint_specific() {
         let mint_a = Pubkey::new_unique();
         let mint_b = Pubkey::new_unique();
-        let (a1, _) = Pubkey::find_program_address(&[b"bonding-curve", mint_a.as_ref()], &PUMPFUN_PROGRAM_ID);
-        let (a2, _) = Pubkey::find_program_address(&[b"bonding-curve", mint_a.as_ref()], &PUMPFUN_PROGRAM_ID);
-        let (b, _) = Pubkey::find_program_address(&[b"bonding-curve", mint_b.as_ref()], &PUMPFUN_PROGRAM_ID);
-        assert_eq!(a1, a2, "same mint must derive the same bonding_curve address");
-        assert_ne!(a1, b, "different mints must derive different bonding_curve addresses");
+        let (a1, _) =
+            Pubkey::find_program_address(&[b"bonding-curve", mint_a.as_ref()], &PUMPFUN_PROGRAM_ID);
+        let (a2, _) =
+            Pubkey::find_program_address(&[b"bonding-curve", mint_a.as_ref()], &PUMPFUN_PROGRAM_ID);
+        let (b, _) =
+            Pubkey::find_program_address(&[b"bonding-curve", mint_b.as_ref()], &PUMPFUN_PROGRAM_ID);
+        assert_eq!(
+            a1, a2,
+            "same mint must derive the same bonding_curve address"
+        );
+        assert_ne!(
+            a1, b,
+            "different mints must derive different bonding_curve addresses"
+        );
     }
 
-    fn synthetic_curve(mint_id: AccountId, bonding_curve_id: AccountId) -> PumpfunBondingCurveState {
+    fn synthetic_curve(
+        mint_id: AccountId,
+        bonding_curve_id: AccountId,
+    ) -> PumpfunBondingCurveState {
         PumpfunBondingCurveState {
             mint_id,
             mint_pk: Pubkey::default(),
@@ -624,7 +719,10 @@ mod tests {
         r.register_mint(sol_id);
         let mut router = TradeRouter::from_router(&r);
         state.batch_router(&mut router);
-        assert_eq!(router.edge_counts_by_dex(), vec![(DexType::PumpfunBondingCurve, 2)]);
+        assert_eq!(
+            router.edge_counts_by_dex(),
+            vec![(DexType::PumpfunBondingCurve, 2)]
+        );
 
         // Not ready until Global has been parsed at least once, even with
         // priced curves.

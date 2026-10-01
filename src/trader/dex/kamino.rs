@@ -59,15 +59,17 @@ use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, Subscription, SubscriptionRequest},
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         types::{PoolPrice, TraderError},
     },
     util::{account_id_from_pubkey, pubkey_from_account_id},
     wallet::Wallet,
 };
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 use solana_sdk_ids::{system_program, sysvar::rent};
 use std::{collections::HashMap, hash::BuildHasherDefault};
@@ -85,7 +87,8 @@ pub const KAMINO_LENDING_PROGRAM_ID: Pubkey =
 /// assumed. Distinct from [`KAMINO_LENDING_PROGRAM_ID`] -- a Scope
 /// account's `on_account` real-data check must compare against this, not
 /// that.
-pub const SCOPE_PROGRAM_ID: Pubkey = Pubkey::from_str_const("HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuPa9MF2fWJ");
+pub const SCOPE_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuPa9MF2fWJ");
 
 /// Kamino's real main market -- confirmed via `api.kamino.finance/kamino-market`
 /// -- the same lending market every currently-tracked reserve (SOL/BTC/ETH)
@@ -572,7 +575,9 @@ impl KaminoReserve {
     /// independently confirmed for Kamino specifically (real on-chain
     /// `protocol_take_rate_pct` plus `klend-sdk`'s `reserve.ts`).
     pub fn current_supply_apy(&self) -> f64 {
-        self.current_borrow_apy() * self.utilization() * (1.0 - self.protocol_take_rate_pct as f64 / 100.0)
+        self.current_borrow_apy()
+            * self.utilization()
+            * (1.0 - self.protocol_take_rate_pct as f64 / 100.0)
     }
 
     // ─── Flash-loan instruction builders ─────────────────────────────────────
@@ -1116,7 +1121,11 @@ fn flash_accounts(
 /// enforce `seeds = [LENDING_MARKET_AUTH, lending_market], bump =
 /// lending_market.bump_seed`).
 fn lending_market_authority(lending_market: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"lma", lending_market.as_ref()], &KAMINO_LENDING_PROGRAM_ID).0
+    Pubkey::find_program_address(
+        &[b"lma", lending_market.as_ref()],
+        &KAMINO_LENDING_PROGRAM_ID,
+    )
+    .0
 }
 
 /// `["user_meta", owner]` -- must exist (via [`init_user_metadata`]) before
@@ -1166,7 +1175,11 @@ pub fn obligation_pda(owner: &Pubkey, lending_market: &Pubkey, id: u8) -> Pubkey
 /// user). `farm` is a reserve's `farm_collateral`/`farm_debt` field (see
 /// [`KaminoReserve`]'s fields); `delegatee` is this bot's own obligation.
 pub fn farms_user_state_pda(farm: &Pubkey, delegatee: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"user", farm.as_ref(), delegatee.as_ref()], &KAMINO_FARMS_PROGRAM_ID).0
+    Pubkey::find_program_address(
+        &[b"user", farm.as_ref(), delegatee.as_ref()],
+        &KAMINO_FARMS_PROGRAM_ID,
+    )
+    .0
 }
 
 /// [`farms_user_state_pda`], operating on `AccountId`s directly (this
@@ -1177,7 +1190,10 @@ pub fn farms_user_state_pda(farm: &Pubkey, delegatee: &Pubkey) -> Pubkey {
 pub fn farm_user_state_id(farm: AccountId, obligation: AccountId) -> Option<AccountId> {
     let farm_pk = pubkey_from_account_id(&farm)?;
     let obligation_pk = pubkey_from_account_id(&obligation)?;
-    Some(account_id_from_pubkey(&farms_user_state_pda(&farm_pk, &obligation_pk)))
+    Some(account_id_from_pubkey(&farms_user_state_pda(
+        &farm_pk,
+        &obligation_pk,
+    )))
 }
 
 fn resolve(id: AccountId) -> Result<Pubkey, TraderError> {
@@ -1213,7 +1229,10 @@ fn farm_accounts_metas(
         Some(farm_id) => {
             let farm_pk = resolve(farm_id)?;
             let user_state_pk = farms_user_state_pda(&farm_pk, &obligation_pk);
-            Ok((AccountMeta::new(user_state_pk, false), AccountMeta::new(farm_pk, false)))
+            Ok((
+                AccountMeta::new(user_state_pk, false),
+                AccountMeta::new(farm_pk, false),
+            ))
         }
         None => Ok((
             AccountMeta::new_readonly(KAMINO_LENDING_PROGRAM_ID, false),
@@ -1789,15 +1808,27 @@ impl KaminoPosition {
     /// instead of five separate ones. Real, live-observed incident: those
     /// five one-at-a-time calls accounted for ~26 seconds of stall in one
     /// run (traced via `CommitHook::start`'s own timing diagnostics).
-    pub fn authority_subscribe_requests(&self, authority: Pubkey, id: u8) -> Vec<SubscriptionRequest> {
+    pub fn authority_subscribe_requests(
+        &self,
+        authority: Pubkey,
+        id: u8,
+    ) -> Vec<SubscriptionRequest> {
         if self.o_authority_pk == Some(authority) {
             return Vec::new();
         }
         let obligation_pk = obligation_pda(&authority, &KAMINO_MAIN_MARKET, id);
         let user_metadata_pk = user_metadata_pda(&authority);
         vec![
-            SubscriptionRequest { root: account_id_from_pubkey(&obligation_pk), filter_weight: 0, depth: 1 },
-            SubscriptionRequest { root: account_id_from_pubkey(&user_metadata_pk), filter_weight: 0, depth: 1 },
+            SubscriptionRequest {
+                root: account_id_from_pubkey(&obligation_pk),
+                filter_weight: 0,
+                depth: 1,
+            },
+            SubscriptionRequest {
+                root: account_id_from_pubkey(&user_metadata_pk),
+                filter_weight: 0,
+                depth: 1,
+            },
         ]
     }
 
@@ -1811,7 +1842,11 @@ impl KaminoPosition {
         if subs.is_empty() {
             return;
         }
-        assert_eq!(subs.len(), 2, "authority_subscribe_requests always returns exactly 2 requests");
+        assert_eq!(
+            subs.len(),
+            2,
+            "authority_subscribe_requests always returns exactly 2 requests"
+        );
         let obligation_pk = obligation_pda(&authority, &KAMINO_MAIN_MARKET, id);
         let obligation_id = account_id_from_pubkey(&obligation_pk);
         let user_metadata_pk = user_metadata_pda(&authority);
@@ -1879,13 +1914,25 @@ impl KaminoPosition {
     /// confirm whether [`init_obligation_farms_for_reserve`] has already
     /// succeeded for it. Idempotent -- a repeat call for an
     /// already-tracked id is a no-op.
-    pub fn track_farm_user_state(&mut self, farm_user_state_id: AccountId, g: &Graph) -> Result<(), CatscopeGuestError> {
-        if self.m_farm_user_state_seen.contains_key(&farm_user_state_id) {
+    pub fn track_farm_user_state(
+        &mut self,
+        farm_user_state_id: AccountId,
+        g: &Graph,
+    ) -> Result<(), CatscopeGuestError> {
+        if self
+            .m_farm_user_state_seen
+            .contains_key(&farm_user_state_id)
+        {
             return Ok(());
         }
-        let sub = g.subscribe(SubscriptionRequest { root: farm_user_state_id, filter_weight: 0, depth: 1 })?;
+        let sub = g.subscribe(SubscriptionRequest {
+            root: farm_user_state_id,
+            filter_weight: 0,
+            depth: 1,
+        })?;
         self.subscriptions.push(sub);
-        self.m_farm_user_state_seen.insert(farm_user_state_id, false);
+        self.m_farm_user_state_seen
+            .insert(farm_user_state_id, false);
         Ok(())
     }
 
@@ -1894,7 +1941,10 @@ impl KaminoPosition {
     /// real accounts produce updates" reasoning as [`Self::registered`].
     /// `false` if it isn't tracked yet (see [`Self::track_farm_user_state`]).
     pub fn farm_user_state_registered(&self, farm_user_state_id: AccountId) -> bool {
-        self.m_farm_user_state_seen.get(&farm_user_state_id).copied().unwrap_or(false)
+        self.m_farm_user_state_seen
+            .get(&farm_user_state_id)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn on_account(&mut self, header: &crate::catscope::witbot::shooter::Header, body: &[u8]) {
@@ -1927,7 +1977,11 @@ impl KaminoPosition {
             // after that fix alone). Require real Kamino-owned data here
             // too, matching the `user_metadata` check's rigor below.
             let kamino_owned = header.owner == account_id_from_pubkey(&KAMINO_LENDING_PROGRAM_ID);
-            self.o_obligation = if kamino_owned { parse_kamino_obligation(body) } else { None };
+            self.o_obligation = if kamino_owned {
+                parse_kamino_obligation(body)
+            } else {
+                None
+            };
         }
         // A subscription to an account that doesn't exist on-chain yet
         // still produces exactly one `on_account` push here (real,
@@ -1958,7 +2012,8 @@ impl KaminoPosition {
         // never flipping this flag true despite the account genuinely
         // existing after the first attempt.
         if let Some(seen) = self.m_farm_user_state_seen.get_mut(&header.accountid) {
-            if header.owner == account_id_from_pubkey(&KAMINO_FARMS_PROGRAM_ID) && !body.is_empty() {
+            if header.owner == account_id_from_pubkey(&KAMINO_FARMS_PROGRAM_ID) && !body.is_empty()
+            {
                 *seen = true;
             }
         }
@@ -2197,7 +2252,15 @@ impl KaminoState {
                 m_vault.insert(setup.fee_vault, setup.reserve);
             }
         }
-        (Self { program_id, m_reserve, m_lending_market, m_vault }, l_req)
+        (
+            Self {
+                program_id,
+                m_reserve,
+                m_lending_market,
+                m_vault,
+            },
+            l_req,
+        )
     }
 
     pub fn program_id(&self) -> &AccountId {
@@ -2227,7 +2290,11 @@ impl KaminoState {
         let main_market = account_id_from_pubkey(&KAMINO_MAIN_MARKET);
         self.m_reserve
             .iter()
-            .find(|(_, w)| w.reserve.token_mint == mint && w.reserve.lending_market == main_market && w.reserve.is_active())
+            .find(|(_, w)| {
+                w.reserve.token_mint == mint
+                    && w.reserve.lending_market == main_market
+                    && w.reserve.is_active()
+            })
             .map(|(id, w)| (*id, &w.reserve))
     }
 
@@ -2244,9 +2311,13 @@ impl KaminoState {
     }
 }
 impl Updater for KaminoState {
-    fn on_account(&mut self, header: &crate::catscope::witbot::shooter::Header, body: &[u8]) {
+    fn on_account(
+        &mut self,
+        header: &crate::catscope::witbot::shooter::Header,
+        body: &[u8],
+    ) -> Option<StateChange> {
         if self.program_id != header.owner {
-            return;
+            return None;
         }
         // LendingMarket itself has no fields worth tracking today (see its
         // definition above) -- reserves are the only account type with
@@ -2254,8 +2325,19 @@ impl Updater for KaminoState {
         if let Some(wrapper) = self.m_reserve.get_mut(&header.accountid) {
             if let Some(parsed) = parse(body) {
                 wrapper.reserve = parsed;
+                return Some(StateChange::Lending {
+                    account_id: header.accountid,
+                    borrow_apy: Some(wrapper.reserve.current_borrow_apy()),
+                    supply_apy: Some(wrapper.reserve.current_supply_apy()),
+                    price_usd: Some(wrapper.reserve.price_usd),
+                });
             }
+            // Recognized (it's a tracked reserve) but unparseable --
+            // `Blank`, not `None` (which would mean "not recognized at
+            // all").
+            return Some(StateChange::Blank);
         }
+        None
     }
 
     fn on_token(&mut self, ta: &crate::catscope::witbot::shooter::Tokenaccountv1) -> bool {
@@ -2284,11 +2366,15 @@ impl Updater for KaminoState {
     fn on_tx(
         &mut self,
         _ix: &crate::txview::CatscopeInstructionRead<'_>,
-        _slot: &solana_sdk::clock::Slot,
+        _r: &Result<Slot, TransactionError>,
     ) {
     }
 
-    fn flush_pool(&mut self, _graph: &Graph, _max_per_flush: usize) -> Result<(), CatscopeGuestError> {
+    fn flush_pool(
+        &mut self,
+        _graph: &Graph,
+        _max_per_flush: usize,
+    ) -> Result<(), CatscopeGuestError> {
         // Not currently called by DexState::flush_pool (only Orca is), and
         // Kamino has no per-slot pool state that needs flushing. Genuine
         // no-op for trait-completeness.
@@ -2359,8 +2445,11 @@ mod tests {
     #[test]
     fn lending_market_authority_uses_the_lma_prefix_seed() {
         let lending_market = Pubkey::new_unique();
-        let expected =
-            Pubkey::find_program_address(&[b"lma", lending_market.as_ref()], &KAMINO_LENDING_PROGRAM_ID).0;
+        let expected = Pubkey::find_program_address(
+            &[b"lma", lending_market.as_ref()],
+            &KAMINO_LENDING_PROGRAM_ID,
+        )
+        .0;
         assert_eq!(lending_market_authority(&lending_market), expected);
         // Regression check for the bug this session found and fixed: the
         // seed must NOT be just `[lending_market]`.
@@ -2415,8 +2504,14 @@ mod tests {
     // `borrow_for` have no such dependency and are fully testable directly.
     fn obligation_with_positions() -> KaminoObligation {
         KaminoObligation {
-            deposits: vec![KaminoCollateral { deposit_reserve: 7, deposited_amount: 5_000_000_000 }],
-            borrows: vec![KaminoLiquidity { borrow_reserve: 9, borrowed_amount: 1_200_000_000 }],
+            deposits: vec![KaminoCollateral {
+                deposit_reserve: 7,
+                deposited_amount: 5_000_000_000,
+            }],
+            borrows: vec![KaminoLiquidity {
+                borrow_reserve: 9,
+                borrowed_amount: 1_200_000_000,
+            }],
         }
     }
 
@@ -2431,7 +2526,9 @@ mod tests {
     #[test]
     fn borrow_for_finds_position_by_reserve() {
         let ob = obligation_with_positions();
-        let b = ob.borrow_for(9).expect("expected a borrow against reserve 9");
+        let b = ob
+            .borrow_for(9)
+            .expect("expected a borrow against reserve 9");
         assert_eq!(b.borrowed_amount, 1_200_000_000);
         assert!(ob.borrow_for(10).is_none());
     }
@@ -2440,7 +2537,10 @@ mod tests {
     fn is_active_true_only_for_status_zero() {
         // Real, live-verified: KAMINO_MAIN_MARKET's USDC reserves are
         // status=0 (Active, exactly one) or status=2 (Hidden, three).
-        let mut r = KaminoReserve { status: 0, ..Default::default() };
+        let mut r = KaminoReserve {
+            status: 0,
+            ..Default::default()
+        };
         assert!(r.is_active());
         r.status = 1; // Obsolete
         assert!(!r.is_active());

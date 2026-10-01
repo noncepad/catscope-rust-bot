@@ -1,6 +1,6 @@
 use std::{collections::HashSet, hash::BuildHasherDefault};
 
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{clock::Slot, pubkey::Pubkey, transaction::TransactionError};
 use twox_hash::XxHash64;
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
                 clmm::{RaydiumClmm, RaydiumClmmPoolSetup},
                 cpmm::{RaydiumCpmm, RaydiumCpmmPoolSetup},
             },
-            update::Updater,
+            update::{StateChange, Updater},
         },
         pricegraph::TradeRouter,
     },
@@ -125,7 +125,15 @@ impl RaydiumState {
         l_req.extend(amm_reqs);
         l_req.extend(clmm_reqs);
         l_req.extend(cpmm_reqs);
-        (Self { cpmm, clmm, amm, l_program }, l_req)
+        (
+            Self {
+                cpmm,
+                clmm,
+                amm,
+                l_program,
+            },
+            l_req,
+        )
     }
 
     /// (amm, clmm, cpmm) pool counts.
@@ -169,7 +177,12 @@ impl RaydiumState {
     }
 
     /// Thin delegation to `RaydiumClmm::exact_quote`.
-    pub fn clmm_exact_quote(&self, pool_id: AccountId, input_mint: AccountId, amount_in: u64) -> Option<u64> {
+    pub fn clmm_exact_quote(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amount_in: u64,
+    ) -> Option<u64> {
         self.clmm.exact_quote(pool_id, input_mint, amount_in)
     }
 
@@ -203,28 +216,20 @@ impl Updater for RaydiumState {
         }
     }
 
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         let mut o_i = None;
         for (i, program_id) in self.l_program.iter().enumerate() {
             if *program_id == header.owner {
                 o_i = Some(i);
             }
         }
-        if o_i.is_none() {
-            return;
-        }
+        o_i?;
         match o_i.unwrap() {
-            0 => {
-                self.amm.on_account(header, body);
-            }
-            1 => {
-                self.clmm.on_account(header, body);
-            }
-            2 => {
-                self.cpmm.on_account(header, body);
-            }
+            0 => self.amm.on_account(header, body),
+            1 => self.clmm.on_account(header, body),
+            2 => self.cpmm.on_account(header, body),
             x => panic!("bad i {x}"),
-        };
+        }
     }
 
     fn batch_router(&mut self, router: &mut TradeRouter) {
@@ -253,7 +258,7 @@ impl Updater for RaydiumState {
     fn on_tx(
         &mut self,
         ix: &crate::txview::CatscopeInstructionRead<'_>,
-        slot: &solana_sdk::clock::Slot,
+        r: &Result<Slot, TransactionError>,
     ) {
         let mut o_i = None;
         for (i, program_id) in self.l_program.iter().enumerate() {
@@ -265,14 +270,18 @@ impl Updater for RaydiumState {
             return;
         };
         match i {
-            0 => self.amm.on_tx(ix, slot),
-            1 => self.clmm.on_tx(ix, slot),
-            2 => self.cpmm.on_tx(ix, slot),
+            0 => self.amm.on_tx(ix, r),
+            1 => self.clmm.on_tx(ix, r),
+            2 => self.cpmm.on_tx(ix, r),
             x => panic!("bad i {x}"),
         };
     }
 
-    fn flush_pool(&mut self, graph: &Graph, max_per_flush: usize) -> Result<(), CatscopeGuestError> {
+    fn flush_pool(
+        &mut self,
+        graph: &Graph,
+        max_per_flush: usize,
+    ) -> Result<(), CatscopeGuestError> {
         // Only CLMM needs a real flush -- it queues PDA-derived tick-array
         // subscriptions (tick_array_sub_queue) that must be flushed the
         // same way Orca's tick-array subscriptions are; AMM/CPMM pools

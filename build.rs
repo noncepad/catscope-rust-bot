@@ -18,29 +18,32 @@ fn bs58_32(s: &str, label: &str) -> [u8; 32] {
         .unwrap_or_else(|_| panic!("{label} {s:?} is not 32 bytes (got {len})"))
 }
 
-/// Reads a Go-written JSON file, looking first in `<manifest_dir>/target/`
-/// (where `optimizer`'s Prefetcher.Build writes it) and falling back to
-/// `<manifest_dir>/` (for local dev running `cargo build` directly against
-/// a hand-placed file) -- the same two-location convention router.json
-/// already established. Returns None if the file isn't found in either
-/// location, so callers can choose their own missing-file behavior (some
-/// tables have always-required data, e.g. router.json; others are meant to
-/// degrade to empty, matching whatever their old "table not found in
+/// Reads a Go-written JSON file. Checks `$DATA_DIR/` if that env var is
+/// set, otherwise defaults to `<manifest_dir>/` (this crate's own repo
+/// root) -- lets a direct `cargo build` against this crate (not via a
+/// downstream crate's path/git dependency) point at an arbitrary
+/// external directory, e.g. a hand-maintained fixture bundle living
+/// outside this repo entirely, while still working out of the box
+/// against the root-level `*.json` files checked into this repo when
+/// `DATA_DIR` isn't set. Returns None if the file isn't found, so
+/// callers can choose their own missing-file behavior (some tables have
+/// always-required data, e.g. router.json; others are meant to degrade
+/// to empty, matching whatever their old "table not found in
 /// prefetch.db" fallback already did).
+///
+/// No longer checks `<manifest_dir>/target/` -- `optimizer`'s
+/// `Prefetcher.Build` must set `DATA_DIR` itself now (pointing at
+/// whichever directory it writes these files into) rather than relying
+/// on a hardcoded `target/` convention.
 fn read_target_json_file(manifest_dir: &Path, filename: &str) -> Option<String> {
-    println!("cargo:rerun-if-changed=target/{filename}");
+    println!("cargo:rerun-if-env-changed=DATA_DIR");
     println!("cargo:rerun-if-changed={filename}");
-    let mut fp = manifest_dir.join("target").join(filename);
-    let mut f = match File::open(&fp) {
-        Ok(f) => f,
-        Err(_) => {
-            fp = manifest_dir.join(filename);
-            match File::open(&fp) {
-                Ok(f) => f,
-                Err(_) => return None,
-            }
-        }
-    };
+    let dir = std::env::var("DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| manifest_dir.to_path_buf().join("data"));
+    let fp = dir.join(filename);
+    println!("cargo:rerun-if-changed={}", fp.display());
+    let mut f = File::open(&fp).ok()?;
     let mut s = String::new();
     f.read_to_string(&mut s)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", fp.display()));

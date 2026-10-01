@@ -49,7 +49,7 @@ use crate::{
     graph::{AccountId, Graph, Subscription, SubscriptionQueue, SubscriptionRequest},
     log_warn, orca_config,
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{cp_quote, Hop, TradeRouter},
         types::{DexType, PoolPrice, SwapParams, TraderError},
     },
@@ -65,6 +65,7 @@ use solana_sdk::{
     clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -769,70 +770,6 @@ impl OrcaState {
         (self.count, self.parsed_count, self.tx_count)
     }
 
-    /// l_account_id is sorted in ascending order
-    pub fn on_tx(&mut self, ix: &CatscopeInstructionRead<'_>, slot: &Slot) {
-        let l_account_id = ix.account();
-        //        ix.data();
-        let (mut i, mut j) = (0, 0);
-        while i < l_account_id.len() && j < self.l_pool.len() {
-            let x = l_account_id[i];
-            let y = self.l_pool[j].id;
-            if x < y {
-                i += 1;
-            } else if y < x {
-                j += 1;
-            } else {
-                self.tx_count += 1;
-                self.l_pool[j].last_tx = *slot;
-                self.l_pool[j].last_processed = *slot;
-                i += 1;
-                j += 1;
-            }
-        }
-
-        // Decode a landed swap_v2 instruction and provisionally ("fudge")
-        // adjust the pool's reserves ahead of the real account update that
-        // will arrive ~50ms later. Safe to mutate in place: the pool's
-        // reserve_a/reserve_b are the exact same fields on_token writes,
-        // so the next real vault-balance update simply overwrites this
-        // estimate with ground truth -- no separate expiry needed.
-        if *ix.program() == self.program_id {
-            let data = ix.data();
-            let accounts = ix.account();
-            if data.len() >= 42 && data[..8] == SWAP_V2_DISCRIMINATOR && accounts.len() > 4 {
-                let amount_specified_is_input = data[40] != 0;
-                let a_to_b = data[41] != 0;
-                // Exact-out swaps use the amount field as the desired
-                // output, not input -- not handled here.
-                if amount_specified_is_input {
-                    let amount_in = u64::from_le_bytes(data[8..16].try_into().unwrap());
-                    let pool_id = accounts[4];
-                    if let Some(&idx) = self.m_pool.get(&pool_id) {
-                        let pool = &mut self.l_pool[idx].processed;
-                        let fee_bps = pool.fee_bps();
-                        let (reserve_in, reserve_out) = if a_to_b {
-                            (pool.reserve_a, pool.reserve_b)
-                        } else {
-                            (pool.reserve_b, pool.reserve_a)
-                        };
-                        if reserve_in != 0 && reserve_out != 0 {
-                            let amount_out = cp_quote(amount_in, reserve_in, reserve_out, fee_bps);
-                            let new_in = reserve_in.saturating_sub(amount_in);
-                            let new_out = reserve_out.saturating_add(amount_out);
-                            if a_to_b {
-                                pool.reserve_a = new_in;
-                                pool.reserve_b = new_out;
-                            } else {
-                                pool.reserve_b = new_in;
-                                pool.reserve_a = new_out;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Swap tokens through the best-priced pool for the given mint pair.
     ///
     /// "Best" means the pool that maximises the fee-adjusted output per input unit,
@@ -1068,7 +1005,12 @@ impl OrcaState {
     /// genuinely computes zero output or the underlying quote call
     /// errors -- callers must check for zero explicitly, it is not
     /// distinguished from "no output" here.
-    pub fn exact_quote(&self, pool_id: AccountId, input_mint: AccountId, amount_in: u64) -> Option<u64> {
+    pub fn exact_quote(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amount_in: u64,
+    ) -> Option<u64> {
         let &idx = self.m_pool.get(&pool_id)?;
         let pool = &self.l_pool[idx];
         let whirlpool = if pool.last_processed >= pool.last_root {
@@ -1171,7 +1113,12 @@ impl OrcaState {
     /// actually be sold into this specific thin pool before slippage (and
     /// any tick-boundary crossing) eats the edge, using this pool's real
     /// live tick-array data instead of a hand-rolled approximation.
-    pub fn debug_quote_range(&self, pool_id: AccountId, input_mint: AccountId, amounts_in: &[u64]) -> Option<String> {
+    pub fn debug_quote_range(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amounts_in: &[u64],
+    ) -> Option<String> {
         let &idx = self.m_pool.get(&pool_id)?;
         let pool = &self.l_pool[idx];
         let whirlpool = if pool.last_processed >= pool.last_root {
@@ -1243,7 +1190,11 @@ impl OrcaState {
     /// `debug_quote_range` reports `out=0` for every size. Also dumps each
     /// tick array's own real pubkey so it can be checked directly against
     /// live mainnet RPC, independent of this bot's cache.
-    pub fn debug_tick_array_status(&self, pool_id: AccountId, input_mint: AccountId) -> Option<String> {
+    pub fn debug_tick_array_status(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+    ) -> Option<String> {
         let &idx = self.m_pool.get(&pool_id)?;
         let pool = &self.l_pool[idx];
         let whirlpool = if pool.last_processed >= pool.last_root {
@@ -1267,8 +1218,12 @@ impl OrcaState {
         for start in ta_starts {
             let ta_id = self.tick_array_by_start(&pool_id, start);
             let cached = ta_id.is_some_and(|id| self.m_tick_array.contains_key(&id));
-            let ta_pk = ta_id.and_then(|id| pubkey_from_account_id(&id)).map(|pk| pk.to_string());
-            out.push_str(&format!("| start={start} ta_id={ta_id:?} ta_pk={ta_pk:?} cached={cached} "));
+            let ta_pk = ta_id
+                .and_then(|id| pubkey_from_account_id(&id))
+                .map(|pk| pk.to_string());
+            out.push_str(&format!(
+                "| start={start} ta_id={ta_id:?} ta_pk={ta_pk:?} cached={cached} "
+            ));
         }
         Some(out)
     }
@@ -1303,7 +1258,8 @@ impl OrcaState {
             user_destination_token_account: dest_ata,
             user_wallet: owner,
         };
-        self.swap(&mut params, wallet, PLAN_MAX_SLIPPAGE).map_err(|_| TraderError::PoolNotReady)
+        self.swap(&mut params, wallet, PLAN_MAX_SLIPPAGE)
+            .map_err(|_| TraderError::PoolNotReady)
     }
 
     /// Build a [`TradeRouter`] from the current live pool snapshots.
@@ -1334,13 +1290,14 @@ impl OrcaState {
 }
 
 impl Updater for OrcaState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if header.owner != self.program_id {
-            return;
+            return None;
         }
         if body.len() < 8 {
-            return;
+            return None;
         }
+        let mut result: Option<StateChange> = None;
         let is_final = false;
         if body[..8] == DISC_WHIRLPOOL {
             if !is_final {
@@ -1372,6 +1329,11 @@ impl Updater for OrcaState {
                         vault_b = pool.processed.vault_b;
                     }
                     assert_ne!(vault_a, vault_b);
+                    result = Some(StateChange::Spot {
+                        token_a: pool.processed.token_mint_a,
+                        token_b: pool.processed.token_mint_b,
+                        price: pool.processed.spot_price(),
+                    });
                     if let PoolTokenSubscribeStage::Waiting = pool.stage {
                         pool.stage = PoolTokenSubscribeStage::Found(0);
                         for v in [vault_a, vault_b] {
@@ -1394,7 +1356,11 @@ impl Updater for OrcaState {
                     // since a stale cached window silently degrades quote
                     // accuracy (see `get_facade`'s empty-facade fallback).
                     let (start_0, o_ta_pks) = {
-                        let whirlpool = if is_final { &pool.root } else { &pool.processed };
+                        let whirlpool = if is_final {
+                            &pool.root
+                        } else {
+                            &pool.processed
+                        };
                         let start_0 = whirlpool.tick_array_start(whirlpool.tick_current_index);
                         let o_ta_pks =
                             pubkey_from_account_id(&pool.id).map(|pk| whirlpool.tick_arrays(&pk));
@@ -1416,7 +1382,7 @@ impl Updater for OrcaState {
             }
         } else if body[..8] == DISC_TICK_ARRAY {
             if body.len() < MIN_TICK_ARRAY_LEN {
-                return;
+                return None;
             }
             let start_tick_index = i32::from_le_bytes(
                 body[OFF_TA_START_INDEX..OFF_TA_START_INDEX + 4]
@@ -1477,6 +1443,7 @@ impl Updater for OrcaState {
                 .or_default()
                 .insert(start_tick_index, ta_id);
         }
+        result
     }
 
     /// Called for every low-latency token account update.
@@ -1544,15 +1511,18 @@ impl Updater for OrcaState {
     fn batch_router(&mut self, router: &mut TradeRouter) {
         self.batch_router_calls += 1;
         let log_this_call = self.batch_router_calls == 1 || self.batch_router_calls % 20 == 0;
-        let (mut n_total, mut n_gate_fail, mut n_node_fail, mut n_ok) = (0usize, 0usize, 0usize, 0usize);
+        let (mut n_total, mut n_gate_fail, mut n_node_fail, mut n_ok) =
+            (0usize, 0usize, 0usize, 0usize);
         for (&pool_id, &idx) in self.m_pool.iter() {
             let pool = &self.l_pool[idx].processed;
             if log_this_call {
                 n_total += 1;
                 let spot = pool.spot_price();
-                if spot <= 0.0 || pool.liquidity == 0 || pool.reserve_a == 0 || pool.reserve_b == 0 {
+                if spot <= 0.0 || pool.liquidity == 0 || pool.reserve_a == 0 || pool.reserve_b == 0
+                {
                     n_gate_fail += 1;
-                } else if !router.has_node(pool.token_mint_a) || !router.has_node(pool.token_mint_b) {
+                } else if !router.has_node(pool.token_mint_a) || !router.has_node(pool.token_mint_b)
+                {
                     n_node_fail += 1;
                 } else {
                     n_ok += 1;
@@ -1572,8 +1542,68 @@ impl Updater for OrcaState {
         }
     }
 
-    fn on_tx(&mut self, _ix: &CatscopeInstructionRead<'_>, _slot: &Slot) {}
+    fn on_tx(&mut self, ix: &CatscopeInstructionRead<'_>, r: &Result<Slot, TransactionError>) {
+        let l_account_id = ix.account();
+        //        ix.data();
+        let (mut i, mut j) = (0, 0);
+        while i < l_account_id.len() && j < self.l_pool.len() {
+            let x = l_account_id[i];
+            let y = self.l_pool[j].id;
+            if x < y {
+                i += 1;
+            } else if y < x {
+                j += 1;
+            } else if let Ok(slot) = r {
+                self.tx_count += 1;
+                self.l_pool[j].last_tx = *slot;
+                self.l_pool[j].last_processed = *slot;
+                i += 1;
+                j += 1;
+            }
+        }
 
+        // Decode a landed swap_v2 instruction and provisionally ("fudge")
+        // adjust the pool's reserves ahead of the real account update that
+        // will arrive ~50ms later. Safe to mutate in place: the pool's
+        // reserve_a/reserve_b are the exact same fields on_token writes,
+        // so the next real vault-balance update simply overwrites this
+        // estimate with ground truth -- no separate expiry needed.
+        if *ix.program() == self.program_id {
+            let data = ix.data();
+            let accounts = ix.account();
+            if data.len() >= 42 && data[..8] == SWAP_V2_DISCRIMINATOR && accounts.len() > 4 {
+                let amount_specified_is_input = data[40] != 0;
+                let a_to_b = data[41] != 0;
+                // Exact-out swaps use the amount field as the desired
+                // output, not input -- not handled here.
+                if amount_specified_is_input {
+                    let amount_in = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    let pool_id = accounts[4];
+                    if let Some(&idx) = self.m_pool.get(&pool_id) {
+                        let pool = &mut self.l_pool[idx].processed;
+                        let fee_bps = pool.fee_bps();
+                        let (reserve_in, reserve_out) = if a_to_b {
+                            (pool.reserve_a, pool.reserve_b)
+                        } else {
+                            (pool.reserve_b, pool.reserve_a)
+                        };
+                        if reserve_in != 0 && reserve_out != 0 {
+                            let amount_out = cp_quote(amount_in, reserve_in, reserve_out, fee_bps);
+                            let new_in = reserve_in.saturating_sub(amount_in);
+                            let new_out = reserve_out.saturating_add(amount_out);
+                            if a_to_b {
+                                pool.reserve_a = new_in;
+                                pool.reserve_b = new_out;
+                            } else {
+                                pool.reserve_b = new_in;
+                                pool.reserve_a = new_out;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Paced through `token_sub_queue` (bounded `max_per_flush` per call)
     // instead of one unbounded `bulk_subscribe` for however many vault/
     // tick-array requests this commit happened to discover -- real,

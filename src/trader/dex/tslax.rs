@@ -39,7 +39,7 @@ use crate::{
     trader::{
         dex::{
             raydium::clmm::{self, RaydiumClmmPool},
-            update::Updater,
+            update::{StateChange, Updater},
         },
         pricegraph::TradeRouter,
         types::{SwapParams, TraderError},
@@ -48,13 +48,15 @@ use crate::{
     wallet::Wallet,
 };
 use solana_clmm_raydium::{
-    state_helpers::array_start_index_for_tick, tick_array_bit_map::next_initialized_tick_array_start_index,
-    tick_array_bit_map::max_tick_in_tickarray_bitmap, PoolTickBitmap, MAX_TICK,
+    state_helpers::array_start_index_for_tick, tick_array_bit_map::max_tick_in_tickarray_bitmap,
+    tick_array_bit_map::next_initialized_tick_array_start_index, PoolTickBitmap, MAX_TICK,
 };
-use solana_sdk::{clock::Slot, pubkey::Pubkey};
+use solana_sdk::{clock::Slot, pubkey::Pubkey, transaction::TransactionError};
 
-pub const TSLAX_MINT: Pubkey = Pubkey::from_str_const("XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB");
-pub const TSLAX_POOL: Pubkey = Pubkey::from_str_const("HHQUnUbmWLrYzkscDY1C3deEFbGtiGBGoHjpANogmvum");
+pub const TSLAX_MINT: Pubkey =
+    Pubkey::from_str_const("XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB");
+pub const TSLAX_POOL: Pubkey =
+    Pubkey::from_str_const("HHQUnUbmWLrYzkscDY1C3deEFbGtiGBGoHjpANogmvum");
 pub const TOKEN_2022_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
@@ -68,7 +70,11 @@ pub const TSLAX_TICK_ARRAY_COUNT: usize = 3;
 
 fn tick_array_pda(pool_pk: &Pubkey, start_index: i32) -> Pubkey {
     Pubkey::find_program_address(
-        &[TICK_ARRAY_SEED, pool_pk.as_ref(), &start_index.to_be_bytes()],
+        &[
+            TICK_ARRAY_SEED,
+            pool_pk.as_ref(),
+            &start_index.to_be_bytes(),
+        ],
         &clmm::RAYDIUM_CLMM_PROGRAM_ID,
     )
     .0
@@ -89,7 +95,11 @@ fn tick_array_pda(pool_pk: &Pubkey, start_index: i32) -> Pubkey {
 /// TSLAx's real `tick_spacing = 60`, same math as `tick_array_windows`'s
 /// own doc comment: `max_tick_in_tickarray_bitmap(60)` = 1,843,200, far
 /// beyond `MAX_TICK`).
-fn initialized_tick_array_start_indices(pool: &RaydiumClmmPool, zero_for_one: bool, max_count: usize) -> Vec<i32> {
+fn initialized_tick_array_start_indices(
+    pool: &RaydiumClmmPool,
+    zero_for_one: bool,
+    max_count: usize,
+) -> Vec<i32> {
     let bitmap = PoolTickBitmap::new(pool.tick_array_bitmap);
     let start_0 = array_start_index_for_tick(pool.tick_current, pool.tick_spacing);
     let full_coverage = max_tick_in_tickarray_bitmap(pool.tick_spacing) >= MAX_TICK;
@@ -97,7 +107,8 @@ fn initialized_tick_array_start_indices(pool: &RaydiumClmmPool, zero_for_one: bo
     let mut out = vec![start_0];
     let mut last = start_0;
     while out.len() < max_count {
-        let (found, next) = next_initialized_tick_array_start_index(&bitmap, last, pool.tick_spacing, zero_for_one);
+        let (found, next) =
+            next_initialized_tick_array_start_index(&bitmap, last, pool.tick_spacing, zero_for_one);
         if !found {
             if !full_coverage {
                 return Vec::new();
@@ -187,8 +198,16 @@ impl TslaxState {
             return;
         };
         let mut starts = vec![start_0];
-        starts.extend(initialized_tick_array_start_indices(pool, true, TSLAX_TICK_ARRAY_COUNT));
-        starts.extend(initialized_tick_array_start_indices(pool, false, TSLAX_TICK_ARRAY_COUNT));
+        starts.extend(initialized_tick_array_start_indices(
+            pool,
+            true,
+            TSLAX_TICK_ARRAY_COUNT,
+        ));
+        starts.extend(initialized_tick_array_start_indices(
+            pool,
+            false,
+            TSLAX_TICK_ARRAY_COUNT,
+        ));
         starts.sort_unstable();
         starts.dedup();
         for start in starts {
@@ -215,7 +234,8 @@ impl TslaxState {
     /// callers should only call `build_swap_ix` once this returns `Some`.
     pub fn ready_tick_arrays(&self, zero_for_one: bool) -> Option<Vec<AccountId>> {
         let pool = self.o_pool.as_ref()?;
-        let starts = initialized_tick_array_start_indices(pool, zero_for_one, TSLAX_TICK_ARRAY_COUNT);
+        let starts =
+            initialized_tick_array_start_indices(pool, zero_for_one, TSLAX_TICK_ARRAY_COUNT);
         if starts.is_empty() {
             return None;
         }
@@ -245,25 +265,40 @@ impl TslaxState {
 }
 
 impl Updater for TslaxState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if header.accountid == self.pool_id {
             if let Some(parsed) = clmm::parse(body) {
+                let price = parsed.spot_price();
+                let (token_a, token_b) = (parsed.token_mint_0, parsed.token_mint_1);
                 self.o_pool = Some(parsed);
+                self.ensure_tick_array_subscriptions();
+                return Some(StateChange::Spot {
+                    token_a,
+                    token_b,
+                    price,
+                });
             }
             self.ensure_tick_array_subscriptions();
-            return;
+            return None;
         }
-        if self.m_tick_array_start.values().any(|&id| id == header.accountid) {
+        if self
+            .m_tick_array_start
+            .values()
+            .any(|&id| id == header.accountid)
+        {
             // Real, live-confirmed fix (2026-09-16):
             // merely receiving an update for a subscribed accountid is
             // NOT proof the account exists -- only real, currently
             // rent-exempt, program-owned data counts.
-            if header.owner == account_id_from_pubkey(&clmm::RAYDIUM_CLMM_PROGRAM_ID) && header.lamports > 0 {
+            if header.owner == account_id_from_pubkey(&clmm::RAYDIUM_CLMM_PROGRAM_ID)
+                && header.lamports > 0
+            {
                 self.s_confirmed_tick_array.insert(header.accountid);
             } else {
                 self.s_confirmed_tick_array.remove(&header.accountid);
             }
         }
+        None
     }
 
     fn on_token(&mut self, _ta: &Tokenaccountv1) -> bool {
@@ -277,12 +312,21 @@ impl Updater for TslaxState {
         // `swap` directly.
     }
 
-    fn on_tx(&mut self, _ix: &crate::txview::CatscopeInstructionRead<'_>, _slot: &Slot) {}
+    fn on_tx(
+        &mut self,
+        _ix: &crate::txview::CatscopeInstructionRead<'_>,
+        _result: &Result<Slot, TransactionError>,
+    ) {
+    }
 
     // Paced through `tick_array_sub_queue` -- an unbounded per-commit
     // batch here would risk the real `stdio timeout` hangs traced to this
     // pattern earlier in this codebase's history.
-    fn flush_pool(&mut self, g: &Graph, max_per_flush: usize) -> Result<(), crate::err::CatscopeGuestError> {
+    fn flush_pool(
+        &mut self,
+        g: &Graph,
+        max_per_flush: usize,
+    ) -> Result<(), crate::err::CatscopeGuestError> {
         self.tick_array_sub_queue.flush(g, max_per_flush)?;
         Ok(())
     }
@@ -335,9 +379,9 @@ mod tests {
     #[test]
     fn initialized_tick_array_start_indices_walks_outward_when_current_empty() {
         let multiplier = 60i32 * 60; // tick_spacing * TICK_ARRAY_SIZE
-        // tick_current=100 -> own window start=0 -> bit 512, left UNSET.
-        // Real initialized arrays one below (bit 511) and one above
-        // (bit 513).
+                                     // tick_current=100 -> own window start=0 -> bit 512, left UNSET.
+                                     // Real initialized arrays one below (bit 511) and one above
+                                     // (bit 513).
         let pool = test_pool(100, 60, &[511, 513]);
         let ups = initialized_tick_array_start_indices(&pool, false, 3);
         assert_eq!(ups, vec![0, multiplier]);

@@ -462,7 +462,6 @@ impl<'a> StateHelper<'a> {
             if result.is_err() {
                 continue;
             }
-            let slot = result.unwrap();
             l_a_size = tx.account.len();
             let inner_n = tx.ix_inner_len();
             let outer_n = tx.ix_outer_len();
@@ -497,7 +496,7 @@ impl<'a> StateHelper<'a> {
                                     break 'doneix1;
                                 }
                                 tx_processed_filter += 1;
-                                dex.on_tx(&ix, &slot);
+                                dex.on_tx(&ix, &result);
                                 tx = ix.into();
                             }
                         }
@@ -535,7 +534,7 @@ impl<'a> StateHelper<'a> {
                                     break 'doneix2;
                                 }
                                 tx_processed_filter += 1;
-                                dex.on_tx(&ix, &slot);
+                                dex.on_tx(&ix, &result);
                                 tx = ix.into();
                             }
                         }
@@ -603,9 +602,10 @@ impl<'a> StateHelper<'a> {
                             },
                             planner::ReverifyOutcome::HopFailed(failure) => {
                                 if failure.coolable {
-                                    self.state
-                                        .router
-                                        .mark_pool_cooldown(failure.pool_id, planner::POOL_COOLDOWN_SLOTS);
+                                    self.state.router.mark_pool_cooldown(
+                                        failure.pool_id,
+                                        planner::POOL_COOLDOWN_SLOTS,
+                                    );
                                 }
                                 log_warn!(
                                     "arbitrage opportunity @ slot {}: rejected -- exact-quote re-verification invalidated \
@@ -781,7 +781,8 @@ impl<'a> StateHelper<'a> {
                     // repeated case and reports once it's crossed a real
                     // threshold, so we still cool down eventually instead
                     // of retrying forever.
-                    let is_pool_not_ready = matches!(e, crate::trader::types::TraderError::PoolNotReady);
+                    let is_pool_not_ready =
+                        matches!(e, crate::trader::types::TraderError::PoolNotReady);
                     let coolable = if is_pool_not_ready {
                         self.state.router.note_pool_not_ready(hop.pool_id)
                     } else {
@@ -789,9 +790,10 @@ impl<'a> StateHelper<'a> {
                     };
                     if coolable {
                         if is_pool_not_ready {
-                            self.state
-                                .router
-                                .mark_pool_not_ready_cooldown(hop.pool_id, planner::POOL_COOLDOWN_SLOTS);
+                            self.state.router.mark_pool_not_ready_cooldown(
+                                hop.pool_id,
+                                planner::POOL_COOLDOWN_SLOTS,
+                            );
                         } else {
                             self.state
                                 .router
@@ -1137,7 +1139,8 @@ impl<'a> CommitHook for StateHelper<'a> {
         self.o_commit_slot = None;
         self.state.slot_delta_since_start += 1;
         if let Some(mut dex) = self.state.o_dex.take() {
-            dex.flush_pool(self.graph, planner::DEX_POOL_SUBSCRIPTION_FLUSH_BUDGET).expect("flush pool");
+            dex.flush_pool(self.graph, planner::DEX_POOL_SUBSCRIPTION_FLUSH_BUDGET)
+                .expect("flush pool");
             // Drains a bounded slice of the queued startup subscription
             // burst per slot (~32,000 requests total across every
             // sub-dex), instead of one giant blocking bulk_subscribe call

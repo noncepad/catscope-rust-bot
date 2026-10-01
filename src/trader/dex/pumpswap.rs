@@ -105,8 +105,10 @@
 use std::collections::HashMap;
 
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 
 use crate::{
@@ -114,7 +116,7 @@ use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, SubscriptionRequest},
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{Hop, TradeRouter},
         types::{DexType, TraderError},
     },
@@ -227,7 +229,11 @@ impl PumpswapState {
         let mut pool_by_id = HashMap::with_capacity(raw.len());
         let mut vault_to_pool = HashMap::with_capacity(raw.len() * 2);
         let mut l_req = Vec::with_capacity(raw.len() * 3 + 1);
-        l_req.push(SubscriptionRequest { root: global_config_id, filter_weight: 0, depth: 1 });
+        l_req.push(SubscriptionRequest {
+            root: global_config_id,
+            filter_weight: 0,
+            depth: 1,
+        });
 
         for entry in raw.iter() {
             let pool_pk = Pubkey::new_from_array(entry.pool);
@@ -243,9 +249,21 @@ impl PumpswapState {
             pool_by_id.insert(pool_id, idx);
             vault_to_pool.insert(base_vault_id, (idx, true));
             vault_to_pool.insert(quote_vault_id, (idx, false));
-            l_req.push(SubscriptionRequest { root: pool_id, filter_weight: 0, depth: 1 });
-            l_req.push(SubscriptionRequest { root: base_vault_id, filter_weight: 0, depth: 1 });
-            l_req.push(SubscriptionRequest { root: quote_vault_id, filter_weight: 0, depth: 1 });
+            l_req.push(SubscriptionRequest {
+                root: pool_id,
+                filter_weight: 0,
+                depth: 1,
+            });
+            l_req.push(SubscriptionRequest {
+                root: base_vault_id,
+                filter_weight: 0,
+                depth: 1,
+            });
+            l_req.push(SubscriptionRequest {
+                root: quote_vault_id,
+                filter_weight: 0,
+                depth: 1,
+            });
             pools.push(PumpswapPoolState {
                 pool_id,
                 pool_pk,
@@ -287,7 +305,10 @@ impl PumpswapState {
     /// How many tracked pools have live pricing data (both vault balances
     /// nonzero) -- for the periodic "pool stats" log.
     pub fn ready_count(&self) -> usize {
-        self.pools.iter().filter(|p| p.base_balance != 0 && p.quote_balance != 0).count()
+        self.pools
+            .iter()
+            .filter(|p| p.base_balance != 0 && p.quote_balance != 0)
+            .count()
     }
 
     fn parse_global_config(&mut self, data: &[u8]) {
@@ -295,7 +316,8 @@ impl PumpswapState {
             return;
         }
         let u64_at = |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-        let pubkey_at = |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        let pubkey_at =
+            |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
         self.lp_fee_bps = u64_at(OFF_GC_LP_FEE_BPS);
         self.protocol_fee_bps = u64_at(OFF_GC_PROTOCOL_FEE_BPS);
         self.coin_creator_fee_bps = u64_at(OFF_GC_COIN_CREATOR_FEE_BPS);
@@ -307,7 +329,8 @@ impl PumpswapState {
         if data.len() < POOL_MIN_LEN {
             return;
         }
-        let pubkey_at = |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        let pubkey_at =
+            |off: usize| Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
         // base_mint/quote_mint are already fixed at construction time (from
         // build.rs's embedded list) -- only coin_creator is genuinely
         // live-updated here, matching bonding_curve.creator's pattern in
@@ -329,7 +352,14 @@ impl PumpswapState {
         user_quote_token_account: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        let pool = self.pools.get(*self.pool_by_id.get(&pool_id).ok_or(TraderError::WrongMints)?)
+        let pool = self
+            .pools
+            .get(
+                *self
+                    .pool_by_id
+                    .get(&pool_id)
+                    .ok_or(TraderError::WrongMints)?,
+            )
             .ok_or(TraderError::WrongMints)?;
         if pool.coin_creator == Pubkey::default() || !self.global_ready {
             return Err(TraderError::PoolNotReady);
@@ -345,10 +375,16 @@ impl PumpswapState {
             &[b"creator_vault", pool.coin_creator.as_ref()],
             &PUMPSWAP_PROGRAM_ID,
         );
-        let coin_creator_vault_ata =
-            spl_ata(&coin_creator_vault_authority, &SPL_TOKEN_PROGRAM_ID, &pool.quote_mint_pk);
-        let protocol_fee_recipient_token_account =
-            spl_ata(&self.protocol_fee_recipient, &SPL_TOKEN_PROGRAM_ID, &pool.quote_mint_pk);
+        let coin_creator_vault_ata = spl_ata(
+            &coin_creator_vault_authority,
+            &SPL_TOKEN_PROGRAM_ID,
+            &pool.quote_mint_pk,
+        );
+        let protocol_fee_recipient_token_account = spl_ata(
+            &self.protocol_fee_recipient,
+            &SPL_TOKEN_PROGRAM_ID,
+            &pool.quote_mint_pk,
+        );
         let (global_volume_accumulator, _bump) =
             Pubkey::find_program_address(&[b"global_volume_accumulator"], &PUMPSWAP_PROGRAM_ID);
         let (user_volume_accumulator, _bump) = Pubkey::find_program_address(
@@ -363,33 +399,40 @@ impl PumpswapState {
         data.push(0); // track_volume: OptionBool(false) -- conservative default.
 
         let accounts = vec![
-            AccountMeta::new(pool.pool_pk, false),                    // pool
-            AccountMeta::new_readonly(user_wallet_pk, true),          // user (signer)
-            AccountMeta::new_readonly(self.global_config_pk, false),  // global_config
-            AccountMeta::new_readonly(pool.base_mint_pk, false),      // base_mint
-            AccountMeta::new_readonly(pool.quote_mint_pk, false),     // quote_mint
-            AccountMeta::new(user_base_pk, false),                    // user_base_token_account
-            AccountMeta::new(user_quote_pk, false),                   // user_quote_token_account
-            AccountMeta::new(pool.base_vault_pk, false),              // pool_base_token_account
-            AccountMeta::new(pool.quote_vault_pk, false),             // pool_quote_token_account
+            AccountMeta::new(pool.pool_pk, false),                   // pool
+            AccountMeta::new_readonly(user_wallet_pk, true),         // user (signer)
+            AccountMeta::new_readonly(self.global_config_pk, false), // global_config
+            AccountMeta::new_readonly(pool.base_mint_pk, false),     // base_mint
+            AccountMeta::new_readonly(pool.quote_mint_pk, false),    // quote_mint
+            AccountMeta::new(user_base_pk, false),                   // user_base_token_account
+            AccountMeta::new(user_quote_pk, false),                  // user_quote_token_account
+            AccountMeta::new(pool.base_vault_pk, false),             // pool_base_token_account
+            AccountMeta::new(pool.quote_vault_pk, false),            // pool_quote_token_account
             AccountMeta::new_readonly(self.protocol_fee_recipient, false), // protocol_fee_recipient
             AccountMeta::new(protocol_fee_recipient_token_account, false), // protocol_fee_recipient_token_account
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),   // base_token_program
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),   // quote_token_program
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),      // system_program
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),        // base_token_program
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),        // quote_token_program
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),           // system_program
             AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false), // associated_token_program
-            AccountMeta::new_readonly(self.event_authority, false),  // event_authority
-            AccountMeta::new_readonly(PUMPSWAP_PROGRAM_ID, false),   // program
-            AccountMeta::new(coin_creator_vault_ata, false),          // coin_creator_vault_ata
+            AccountMeta::new_readonly(self.event_authority, false),        // event_authority
+            AccountMeta::new_readonly(PUMPSWAP_PROGRAM_ID, false),         // program
+            AccountMeta::new(coin_creator_vault_ata, false),               // coin_creator_vault_ata
             AccountMeta::new_readonly(coin_creator_vault_authority, false), // coin_creator_vault_authority
             AccountMeta::new_readonly(global_volume_accumulator, false), // global_volume_accumulator
-            AccountMeta::new(user_volume_accumulator, false),        // user_volume_accumulator
-            AccountMeta::new_readonly(self.fee_config, false),       // fee_config
-            AccountMeta::new_readonly(PUMPSWAP_FEE_PROGRAM_ID, false), // fee_program
+            AccountMeta::new(user_volume_accumulator, false),            // user_volume_accumulator
+            AccountMeta::new_readonly(self.fee_config, false),           // fee_config
+            AccountMeta::new_readonly(PUMPSWAP_FEE_PROGRAM_ID, false),   // fee_program
         ];
 
         wallet.require_signer(user_wallet);
-        wallet.append_ix(Instruction { program_id: PUMPSWAP_PROGRAM_ID, accounts, data }, PUMPSWAP_BUY_CU);
+        wallet.append_ix(
+            Instruction {
+                program_id: PUMPSWAP_PROGRAM_ID,
+                accounts,
+                data,
+            },
+            PUMPSWAP_BUY_CU,
+        );
         Ok(())
     }
 
@@ -404,7 +447,14 @@ impl PumpswapState {
         user_quote_token_account: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        let pool = self.pools.get(*self.pool_by_id.get(&pool_id).ok_or(TraderError::WrongMints)?)
+        let pool = self
+            .pools
+            .get(
+                *self
+                    .pool_by_id
+                    .get(&pool_id)
+                    .ok_or(TraderError::WrongMints)?,
+            )
             .ok_or(TraderError::WrongMints)?;
         if pool.coin_creator == Pubkey::default() || !self.global_ready {
             return Err(TraderError::PoolNotReady);
@@ -420,10 +470,16 @@ impl PumpswapState {
             &[b"creator_vault", pool.coin_creator.as_ref()],
             &PUMPSWAP_PROGRAM_ID,
         );
-        let coin_creator_vault_ata =
-            spl_ata(&coin_creator_vault_authority, &SPL_TOKEN_PROGRAM_ID, &pool.quote_mint_pk);
-        let protocol_fee_recipient_token_account =
-            spl_ata(&self.protocol_fee_recipient, &SPL_TOKEN_PROGRAM_ID, &pool.quote_mint_pk);
+        let coin_creator_vault_ata = spl_ata(
+            &coin_creator_vault_authority,
+            &SPL_TOKEN_PROGRAM_ID,
+            &pool.quote_mint_pk,
+        );
+        let protocol_fee_recipient_token_account = spl_ata(
+            &self.protocol_fee_recipient,
+            &SPL_TOKEN_PROGRAM_ID,
+            &pool.quote_mint_pk,
+        );
 
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&DISC_SELL);
@@ -431,31 +487,38 @@ impl PumpswapState {
         data.extend_from_slice(&min_quote_amount_out.to_le_bytes());
 
         let accounts = vec![
-            AccountMeta::new(pool.pool_pk, false),                    // pool
-            AccountMeta::new_readonly(user_wallet_pk, true),          // user (signer)
-            AccountMeta::new_readonly(self.global_config_pk, false),  // global_config
-            AccountMeta::new_readonly(pool.base_mint_pk, false),      // base_mint
-            AccountMeta::new_readonly(pool.quote_mint_pk, false),     // quote_mint
-            AccountMeta::new(user_base_pk, false),                    // user_base_token_account
-            AccountMeta::new(user_quote_pk, false),                   // user_quote_token_account
-            AccountMeta::new(pool.base_vault_pk, false),              // pool_base_token_account
-            AccountMeta::new(pool.quote_vault_pk, false),             // pool_quote_token_account
+            AccountMeta::new(pool.pool_pk, false),                   // pool
+            AccountMeta::new_readonly(user_wallet_pk, true),         // user (signer)
+            AccountMeta::new_readonly(self.global_config_pk, false), // global_config
+            AccountMeta::new_readonly(pool.base_mint_pk, false),     // base_mint
+            AccountMeta::new_readonly(pool.quote_mint_pk, false),    // quote_mint
+            AccountMeta::new(user_base_pk, false),                   // user_base_token_account
+            AccountMeta::new(user_quote_pk, false),                  // user_quote_token_account
+            AccountMeta::new(pool.base_vault_pk, false),             // pool_base_token_account
+            AccountMeta::new(pool.quote_vault_pk, false),            // pool_quote_token_account
             AccountMeta::new_readonly(self.protocol_fee_recipient, false), // protocol_fee_recipient
             AccountMeta::new(protocol_fee_recipient_token_account, false), // protocol_fee_recipient_token_account
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),   // base_token_program
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),   // quote_token_program
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),      // system_program
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),        // base_token_program
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),        // quote_token_program
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),           // system_program
             AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false), // associated_token_program
-            AccountMeta::new_readonly(self.event_authority, false),  // event_authority
-            AccountMeta::new_readonly(PUMPSWAP_PROGRAM_ID, false),   // program
-            AccountMeta::new(coin_creator_vault_ata, false),          // coin_creator_vault_ata
+            AccountMeta::new_readonly(self.event_authority, false),        // event_authority
+            AccountMeta::new_readonly(PUMPSWAP_PROGRAM_ID, false),         // program
+            AccountMeta::new(coin_creator_vault_ata, false),               // coin_creator_vault_ata
             AccountMeta::new_readonly(coin_creator_vault_authority, false), // coin_creator_vault_authority
-            AccountMeta::new_readonly(self.fee_config, false),       // fee_config
-            AccountMeta::new_readonly(PUMPSWAP_FEE_PROGRAM_ID, false), // fee_program
+            AccountMeta::new_readonly(self.fee_config, false),              // fee_config
+            AccountMeta::new_readonly(PUMPSWAP_FEE_PROGRAM_ID, false),      // fee_program
         ];
 
         wallet.require_signer(user_wallet);
-        wallet.append_ix(Instruction { program_id: PUMPSWAP_PROGRAM_ID, accounts, data }, PUMPSWAP_SELL_CU);
+        wallet.append_ix(
+            Instruction {
+                program_id: PUMPSWAP_PROGRAM_ID,
+                accounts,
+                data,
+            },
+            PUMPSWAP_SELL_CU,
+        );
         Ok(())
     }
 
@@ -473,14 +536,35 @@ impl PumpswapState {
     ) -> Result<(), TraderError> {
         let pool = self
             .pools
-            .get(*self.pool_by_id.get(&hop.pool_id).ok_or(TraderError::UnknownPool(hop.pool_id))?)
+            .get(
+                *self
+                    .pool_by_id
+                    .get(&hop.pool_id)
+                    .ok_or(TraderError::UnknownPool(hop.pool_id))?,
+            )
             .ok_or(TraderError::UnknownPool(hop.pool_id))?;
         if hop.input_mint == pool.quote_mint_id {
             // Buy: quote -> base. dest_ata holds base, source_ata holds quote.
-            self.buy(hop.pool_id, hop.amount_out, hop.amount_in, owner, dest_ata, source_ata, wallet)
+            self.buy(
+                hop.pool_id,
+                hop.amount_out,
+                hop.amount_in,
+                owner,
+                dest_ata,
+                source_ata,
+                wallet,
+            )
         } else {
             // Sell: base -> quote. source_ata holds base, dest_ata holds quote.
-            self.sell(hop.pool_id, hop.amount_in, hop.amount_out, owner, source_ata, dest_ata, wallet)
+            self.sell(
+                hop.pool_id,
+                hop.amount_in,
+                hop.amount_out,
+                owner,
+                source_ata,
+                dest_ata,
+                wallet,
+            )
         }
     }
 
@@ -527,11 +611,20 @@ fn spl_ata(owner: &Pubkey, token_program: &Pubkey, mint: &Pubkey) -> Pubkey {
 }
 
 impl Updater for PumpswapState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if header.accountid == self.global_config_id {
             self.parse_global_config(body);
+            Some(StateChange::Blank)
         } else if let Some(&idx) = self.pool_by_id.get(&header.accountid) {
             self.parse_pool(idx, body);
+            // Price-bearing fields (`base_balance`/`quote_balance`, see
+            // `upsert_pool_edge`) only change via `on_token`, not this
+            // account's own bytes -- same reasoning as Raydium AMM/CPMM,
+            // so there's no fresh price to report -- `Blank`, not a
+            // half-populated `Spot`.
+            Some(StateChange::Blank)
+        } else {
+            None
         }
     }
 
@@ -548,7 +641,12 @@ impl Updater for PumpswapState {
         false
     }
 
-    fn on_tx(&mut self, _ix: &CatscopeInstructionRead<'_>, _slot: &solana_sdk::clock::Slot) {}
+    fn on_tx(
+        &mut self,
+        _ix: &CatscopeInstructionRead<'_>,
+        _result: &Result<Slot, TransactionError>,
+    ) {
+    }
 
     /// Add the base <-> quote edge for every priced pool.
     fn batch_router(&mut self, router: &mut TradeRouter) {
@@ -616,11 +714,18 @@ mod tests {
     #[test]
     fn coin_creator_vault_authority_uses_underscore_seed_not_hyphen() {
         let creator = Pubkey::new_unique();
-        let (underscore, _) =
-            Pubkey::find_program_address(&[b"creator_vault", creator.as_ref()], &PUMPSWAP_PROGRAM_ID);
-        let (hyphen, _) =
-            Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &PUMPSWAP_PROGRAM_ID);
-        assert_ne!(underscore, hyphen, "creator_vault and creator-vault must derive different PDAs");
+        let (underscore, _) = Pubkey::find_program_address(
+            &[b"creator_vault", creator.as_ref()],
+            &PUMPSWAP_PROGRAM_ID,
+        );
+        let (hyphen, _) = Pubkey::find_program_address(
+            &[b"creator-vault", creator.as_ref()],
+            &PUMPSWAP_PROGRAM_ID,
+        );
+        assert_ne!(
+            underscore, hyphen,
+            "creator_vault and creator-vault must derive different PDAs"
+        );
     }
 
     fn synthetic_pool(

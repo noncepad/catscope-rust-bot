@@ -28,7 +28,7 @@ use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, SubscriptionRequest},
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{cp_quote, Hop, TradeRouter},
         types::{DexType, PoolPrice, SwapParams, TraderError, RAYDIUM_HOP_MAX_SLIPPAGE},
     },
@@ -36,8 +36,10 @@ use crate::{
     wallet::Wallet,
 };
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 use std::{collections::HashMap, hash::BuildHasherDefault};
 use twox_hash::XxHash64;
@@ -171,7 +173,10 @@ impl RaydiumCpmm {
         dest_ata: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        let wrapper = self.m_pool.get(&hop.pool_id).ok_or(TraderError::UnknownPool(hop.pool_id))?;
+        let wrapper = self
+            .m_pool
+            .get(&hop.pool_id)
+            .ok_or(TraderError::UnknownPool(hop.pool_id))?;
         let mut params = SwapParams {
             pool: hop.pool_id,
             input_mint: hop.input_mint,
@@ -191,15 +196,15 @@ impl RaydiumCpmm {
 }
 
 impl Updater for RaydiumCpmm {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if header.owner != self.program_id {
-            return;
+            return None;
         }
         let Some(wrapper) = self.m_pool.get_mut(&header.accountid) else {
-            return;
+            return None;
         };
         let Some(mut new_state) = parse(body) else {
-            return;
+            return None;
         };
 
         // Preserve live reserves from token events -- parse() always
@@ -218,6 +223,11 @@ impl Updater for RaydiumCpmm {
         if old_v1 == 0 && vault_1 != 0 {
             self.m_vault.insert(vault_1, pool_id);
         }
+        // Price-bearing fields (`reserve_0`/`reserve_1`) are preserved
+        // from the old state above, not updated here -- see the comment
+        // on those two lines, so there's no fresh price to report --
+        // `Blank`, not a half-populated `Spot`.
+        Some(StateChange::Blank)
     }
 
     fn on_token(&mut self, ta: &Tokenaccountv1) -> bool {
@@ -252,7 +262,7 @@ impl Updater for RaydiumCpmm {
     fn on_tx(
         &mut self,
         ix: &crate::txview::CatscopeInstructionRead<'_>,
-        _slot: &solana_sdk::clock::Slot,
+        _r: &Result<Slot, TransactionError>,
     ) {
         // Decode a landed swap_base_input instruction and provisionally
         // ("fudge") adjust the pool's reserves ahead of the real account
@@ -303,7 +313,11 @@ impl Updater for RaydiumCpmm {
         }
     }
 
-    fn flush_pool(&mut self, _graph: &Graph, _max_per_flush: usize) -> Result<(), CatscopeGuestError> {
+    fn flush_pool(
+        &mut self,
+        _graph: &Graph,
+        _max_per_flush: usize,
+    ) -> Result<(), CatscopeGuestError> {
         // Not currently called by DexState::flush_pool (only Orca is).
         Ok(())
     }
@@ -490,4 +504,3 @@ pub fn build_swap_ix(
     );
     Ok(())
 }
-

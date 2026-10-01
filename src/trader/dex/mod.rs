@@ -12,11 +12,6 @@ pub mod kamino;
 /// here the way every other module in this list is; today's scope is the
 /// standalone tracking logic itself, not the brain-mode integration.
 pub mod kamino_xstocks_watcher;
-/// Direct-subscription watcher for the most liquid Orca Whirlpool pool
-/// per xStock ticker -- see the module's own doc comment. Same
-/// not-yet-wired-into-`DexState` status as `kamino_xstocks_watcher`
-/// above; `brain::xstockshealthv1` owns its own instance directly.
-pub mod xstock_dex_watcher;
 pub mod marginfi;
 pub mod marinade;
 pub mod orca;
@@ -43,9 +38,15 @@ pub mod update;
 /// exists to feed `perp_router::PerpRouter`, a standalone framework module,
 /// not a live subscription this bot maintains yet.
 pub mod velocity;
+/// Direct-subscription watcher for the most liquid Orca Whirlpool pool
+/// per xStock ticker -- see the module's own doc comment. Same
+/// not-yet-wired-into-`DexState` status as `kamino_xstocks_watcher`
+/// above; `brain::xstockshealthv1` owns its own instance directly.
+pub mod xstock_dex_watcher;
 
 use std::{collections::HashSet, hash::BuildHasherDefault};
 
+use solana_sdk::{clock::Slot, transaction::TransactionError};
 use twox_hash::XxHash64;
 
 use crate::{
@@ -54,11 +55,20 @@ use crate::{
     graph::{AccountId, Graph, SubscriptionQueue},
     trader::{
         dex::{
-            drift::DriftState, kamino::KaminoState, marginfi::MarginfiState,
-            marinade::MarinadeState, orca::OrcaState, phoenix::PhoenixState,
-            pumpfun::PumpfunState, pumpswap::PumpswapState, raydium::RaydiumState,
-            sanctum::SanctumState, solend::SolendState, spl_stake_pool::SplStakePoolState,
-            tslax::TslaxState, update::Updater,
+            drift::DriftState,
+            kamino::KaminoState,
+            marginfi::MarginfiState,
+            marinade::MarinadeState,
+            orca::OrcaState,
+            phoenix::PhoenixState,
+            pumpfun::PumpfunState,
+            pumpswap::PumpswapState,
+            raydium::RaydiumState,
+            sanctum::SanctumState,
+            solend::SolendState,
+            spl_stake_pool::SplStakePoolState,
+            tslax::TslaxState,
+            update::{StateChange, Updater},
         },
         pricegraph::Hop,
         types::{DexType, TraderError},
@@ -179,7 +189,11 @@ impl DexState {
     /// into one bounded `bulk_subscribe` call -- call once per slot,
     /// typically from `CommitHook::finish`. No-op (`Ok(0)`) once the
     /// queue is empty. See [`SubscriptionQueue::flush`].
-    pub fn flush_subscriptions(&mut self, g: &Graph, max_per_flush: usize) -> Result<usize, CatscopeGuestError> {
+    pub fn flush_subscriptions(
+        &mut self,
+        g: &Graph,
+        max_per_flush: usize,
+    ) -> Result<usize, CatscopeGuestError> {
         self.subscription_queue.flush(g, max_per_flush)
     }
     /// How many of the startup subscription burst's requests are still
@@ -267,17 +281,31 @@ impl DexState {
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
         match hop.dex {
-            DexType::RaydiumAmm => self.raydium.plan_amm_hop(hop, owner, source_ata, dest_ata, wallet),
-            DexType::RaydiumClmm => self.raydium.plan_clmm_hop(hop, owner, source_ata, dest_ata, wallet),
-            DexType::RaydiumCpmm => self.raydium.plan_cpmm_hop(hop, owner, source_ata, dest_ata, wallet),
+            DexType::RaydiumAmm => self
+                .raydium
+                .plan_amm_hop(hop, owner, source_ata, dest_ata, wallet),
+            DexType::RaydiumClmm => self
+                .raydium
+                .plan_clmm_hop(hop, owner, source_ata, dest_ata, wallet),
+            DexType::RaydiumCpmm => self
+                .raydium
+                .plan_cpmm_hop(hop, owner, source_ata, dest_ata, wallet),
             DexType::OrcaWhirlpool => self.orca.plan_hop(hop, owner, source_ata, dest_ata, wallet),
-            DexType::Sanctum => self.sanctum.plan_hop(hop, owner, source_ata, dest_ata, wallet),
-            DexType::MarinadeLiquidUnstake => self.marinade.plan_hop(hop, owner, source_ata, dest_ata, wallet),
-            DexType::SplStakePoolWithdrawSol => {
-                self.spl_stake_pool.plan_hop(hop, owner, source_ata, dest_ata, wallet)
-            }
-            DexType::PumpfunBondingCurve => self.pumpfun.plan_hop(hop, owner, source_ata, dest_ata, wallet),
-            DexType::PumpswapAmm => self.pumpswap.plan_hop(hop, owner, source_ata, dest_ata, wallet),
+            DexType::Sanctum => self
+                .sanctum
+                .plan_hop(hop, owner, source_ata, dest_ata, wallet),
+            DexType::MarinadeLiquidUnstake => self
+                .marinade
+                .plan_hop(hop, owner, source_ata, dest_ata, wallet),
+            DexType::SplStakePoolWithdrawSol => self
+                .spl_stake_pool
+                .plan_hop(hop, owner, source_ata, dest_ata, wallet),
+            DexType::PumpfunBondingCurve => self
+                .pumpfun
+                .plan_hop(hop, owner, source_ata, dest_ata, wallet),
+            DexType::PumpswapAmm => self
+                .pumpswap
+                .plan_hop(hop, owner, source_ata, dest_ata, wallet),
             DexType::KaminoLending => {
                 // Defensive/unreachable in practice: `KaminoState::batch_router`
                 // never adds an edge (a lending Bank has no swap price to
@@ -305,17 +333,31 @@ impl DexState {
     }
 
     /// TEMPORARY DEBUG: see `OrcaState::debug_quote_range`'s doc comment.
-    pub fn debug_orca_quote_range(&self, pool_id: AccountId, input_mint: AccountId, amounts_in: &[u64]) -> Option<String> {
+    pub fn debug_orca_quote_range(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amounts_in: &[u64],
+    ) -> Option<String> {
         self.orca.debug_quote_range(pool_id, input_mint, amounts_in)
     }
 
     /// TEMPORARY DEBUG: see `OrcaState::debug_tick_array_status`'s doc comment.
-    pub fn debug_orca_tick_array_status(&self, pool_id: AccountId, input_mint: AccountId) -> Option<String> {
+    pub fn debug_orca_tick_array_status(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+    ) -> Option<String> {
         self.orca.debug_tick_array_status(pool_id, input_mint)
     }
 
     /// See `OrcaState::exact_quote`'s doc comment.
-    pub fn orca_exact_quote(&self, pool_id: AccountId, input_mint: AccountId, amount_in: u64) -> Option<u64> {
+    pub fn orca_exact_quote(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amount_in: u64,
+    ) -> Option<u64> {
         self.orca.exact_quote(pool_id, input_mint, amount_in)
     }
 
@@ -325,18 +367,34 @@ impl DexState {
     }
 
     /// See `RaydiumClmm::exact_quote`'s doc comment.
-    pub fn raydium_clmm_exact_quote(&self, pool_id: AccountId, input_mint: AccountId, amount_in: u64) -> Option<u64> {
-        self.raydium.clmm_exact_quote(pool_id, input_mint, amount_in)
+    pub fn raydium_clmm_exact_quote(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amount_in: u64,
+    ) -> Option<u64> {
+        self.raydium
+            .clmm_exact_quote(pool_id, input_mint, amount_in)
     }
 
     /// See `RaydiumClmm::exact_quote_ready`'s doc comment.
-    pub fn raydium_clmm_exact_quote_ready(&self, pool_id: AccountId, input_mint: AccountId) -> bool {
+    pub fn raydium_clmm_exact_quote_ready(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+    ) -> bool {
         self.raydium.clmm_exact_quote_ready(pool_id, input_mint)
     }
 
     /// See `SplStakePoolState::exact_quote`'s doc comment.
-    pub fn spl_stake_pool_exact_quote(&self, pool_id: AccountId, input_mint: AccountId, amount_in: u64) -> Option<u64> {
-        self.spl_stake_pool.exact_quote(pool_id, input_mint, amount_in)
+    pub fn spl_stake_pool_exact_quote(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amount_in: u64,
+    ) -> Option<u64> {
+        self.spl_stake_pool
+            .exact_quote(pool_id, input_mint, amount_in)
     }
 
     /// See `MarginfiState::price_for_mint`'s doc comment.
@@ -383,7 +441,9 @@ impl DexState {
             pumpswap_pools_ready: self.pumpswap.ready_count(),
             phoenix_markets_ready: self.phoenix.ready_count(),
             orca_token_sub_queue_pending: self.orca.token_sub_queue_pending_count(),
-            raydium_clmm_tick_array_sub_queue_pending: self.raydium.clmm_tick_array_sub_queue_pending_count(),
+            raydium_clmm_tick_array_sub_queue_pending: self
+                .raydium
+                .clmm_tick_array_sub_queue_pending_count(),
         }
     }
 }
@@ -479,21 +539,44 @@ impl std::fmt::Display for DexPoolStats {
     }
 }
 impl Updater for DexState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
-        self.raydium.on_account(header, body);
-        self.kamino.on_account(header, body);
-        self.orca.on_account(header, body);
-        self.sanctum.on_account(header, body);
-        self.marginfi.on_account(header, body);
-        self.solend.on_account(header, body);
-        self.tslax.on_account(header, body);
-        self.drift.on_account(header, body);
-        self.marinade.on_account(header, body);
-        self.spl_stake_pool.on_account(header, body);
-        self.pumpfun.on_account(header, body);
-        self.pumpswap.on_account(header, body);
-        self.phoenix.on_account(header, body);
+    /// Every sub-dex's own `on_account` is still called unconditionally
+    /// (each independently decides by `header.accountid` whether this
+    /// update is theirs -- matching the pre-existing behavior this just
+    /// adds a return value to), so every sub-dex's internal bookkeeping
+    /// stays up to date regardless of which one actually recognized this
+    /// account. At most one realistically ever does (account addresses
+    /// are protocol-specific), so the first `Some` returned is taken as
+    /// this call's overall result -- ordering here has no real effect in
+    /// practice, just picks a deterministic tie-break if that assumption
+    /// is ever wrong. `pyth_feed` isn't included: it's a shared oracle
+    /// feed the router uses internally, not a Spot/Lending/Perp venue.
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
+        let r1 = self.raydium.on_account(header, body);
+        let r2 = self.kamino.on_account(header, body);
+        let r3 = self.orca.on_account(header, body);
+        let r4 = self.sanctum.on_account(header, body);
+        let r5 = self.marginfi.on_account(header, body);
+        let r6 = self.solend.on_account(header, body);
+        let r7 = self.tslax.on_account(header, body);
+        let r8 = self.drift.on_account(header, body);
+        let r9 = self.marinade.on_account(header, body);
+        let r10 = self.spl_stake_pool.on_account(header, body);
+        let r11 = self.pumpfun.on_account(header, body);
+        let r12 = self.pumpswap.on_account(header, body);
+        let r13 = self.phoenix.on_account(header, body);
         self.pyth_feed.on_account(header.accountid, body);
+        r1.or(r2)
+            .or(r3)
+            .or(r4)
+            .or(r5)
+            .or(r6)
+            .or(r7)
+            .or(r8)
+            .or(r9)
+            .or(r10)
+            .or(r11)
+            .or(r12)
+            .or(r13)
     }
 
     fn on_token(&mut self, ta: &Tokenaccountv1) -> bool {
@@ -533,7 +616,11 @@ impl Updater for DexState {
     /// chance to react, not just the first one that claims the account;
     /// the 5 that never feed router edges -- Kamino, Marginfi, Solend,
     /// Drift, Phoenix -- just inherit `Updater`'s default no-op).
-    fn refresh_account_router(&mut self, account_id: AccountId, router: &mut super::pricegraph::TradeRouter) {
+    fn refresh_account_router(
+        &mut self,
+        account_id: AccountId,
+        router: &mut super::pricegraph::TradeRouter,
+    ) {
         self.raydium.refresh_account_router(account_id, router);
         self.orca.refresh_account_router(account_id, router);
         self.kamino.refresh_account_router(account_id, router);
@@ -543,13 +630,18 @@ impl Updater for DexState {
         self.tslax.refresh_account_router(account_id, router);
         self.drift.refresh_account_router(account_id, router);
         self.marinade.refresh_account_router(account_id, router);
-        self.spl_stake_pool.refresh_account_router(account_id, router);
+        self.spl_stake_pool
+            .refresh_account_router(account_id, router);
         self.pumpfun.refresh_account_router(account_id, router);
         self.pumpswap.refresh_account_router(account_id, router);
         self.phoenix.refresh_account_router(account_id, router);
     }
 
-    fn refresh_token_router(&mut self, ta_id: AccountId, router: &mut super::pricegraph::TradeRouter) {
+    fn refresh_token_router(
+        &mut self,
+        ta_id: AccountId,
+        router: &mut super::pricegraph::TradeRouter,
+    ) {
         self.raydium.refresh_token_router(ta_id, router);
         self.orca.refresh_token_router(ta_id, router);
         self.kamino.refresh_token_router(ta_id, router);
@@ -568,24 +660,24 @@ impl Updater for DexState {
     fn on_tx(
         &mut self,
         ix: &crate::txview::CatscopeInstructionRead<'_>,
-        slot: &solana_sdk::clock::Slot,
+        r: &Result<Slot, TransactionError>,
     ) {
         // Every sub-dex's on_tx is a safe no-op except Orca's, which does
         // real per-pool slot/tx-count bookkeeping -- dispatch to all of
         // them now that none can panic.
-        self.raydium.on_tx(ix, slot);
-        self.orca.on_tx(ix, slot);
-        self.kamino.on_tx(ix, slot);
-        self.sanctum.on_tx(ix, slot);
-        self.marginfi.on_tx(ix, slot);
-        self.solend.on_tx(ix, slot);
-        self.tslax.on_tx(ix, slot);
-        self.drift.on_tx(ix, slot);
-        self.marinade.on_tx(ix, slot);
-        self.spl_stake_pool.on_tx(ix, slot);
-        self.pumpfun.on_tx(ix, slot);
-        self.pumpswap.on_tx(ix, slot);
-        self.phoenix.on_tx(ix, slot);
+        self.raydium.on_tx(ix, r);
+        self.orca.on_tx(ix, r);
+        self.kamino.on_tx(ix, r);
+        self.sanctum.on_tx(ix, r);
+        self.marginfi.on_tx(ix, r);
+        self.solend.on_tx(ix, r);
+        self.tslax.on_tx(ix, r);
+        self.drift.on_tx(ix, r);
+        self.marinade.on_tx(ix, r);
+        self.spl_stake_pool.on_tx(ix, r);
+        self.pumpfun.on_tx(ix, r);
+        self.pumpswap.on_tx(ix, r);
+        self.phoenix.on_tx(ix, r);
     }
 
     fn flush_pool(&mut self, g: &Graph, max_per_flush: usize) -> Result<(), CatscopeGuestError> {

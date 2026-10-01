@@ -72,8 +72,10 @@
 use std::collections::HashMap;
 
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 
 use crate::{
@@ -81,7 +83,7 @@ use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, SubscriptionQueue, SubscriptionRequest},
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{Hop, TradeRouter},
         types::{DexType, TraderError},
     },
@@ -103,7 +105,8 @@ const WSOL_MINT: Pubkey = Pubkey::from_str_const("So1111111111111111111111111111
 
 const STAKE_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("Stake11111111111111111111111111111111111111");
-const SYSVAR_CLOCK_ID: Pubkey = Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
+const SYSVAR_CLOCK_ID: Pubkey =
+    Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
 const SYSVAR_STAKE_HISTORY_ID: Pubkey =
     Pubkey::from_str_const("SysvarStakeHistory1111111111111111111111111");
 
@@ -138,10 +141,12 @@ impl<'a> Cursor<'a> {
         self.take(1).map(|s| s[0])
     }
     fn u64(&mut self) -> Option<u64> {
-        self.take(8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+        self.take(8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
     }
     fn pubkey(&mut self) -> Option<Pubkey> {
-        self.take(32).map(|s| Pubkey::new_from_array(s.try_into().unwrap()))
+        self.take(32)
+            .map(|s| Pubkey::new_from_array(s.try_into().unwrap()))
     }
     fn skip(&mut self, n: usize) -> Option<()> {
         self.take(n).map(|_| ())
@@ -295,7 +300,11 @@ impl SplStakePoolState {
             let pool_state_id = account_id_from_pubkey(&pool_state_pk);
             let idx = lsts.len();
             pool_state_to_idx.insert(pool_state_id, idx);
-            l_req.push(SubscriptionRequest { root: pool_state_id, filter_weight: 0, depth: 1 });
+            l_req.push(SubscriptionRequest {
+                root: pool_state_id,
+                filter_weight: 0,
+                depth: 1,
+            });
             lsts.push(LstEntry {
                 mint_id: account_id_from_pubkey(&mint_pk),
                 pool_state_id,
@@ -337,7 +346,9 @@ impl SplStakePoolState {
     pub fn ready_count(&self) -> usize {
         self.lsts
             .iter()
-            .filter(|l| l.total_lamports != 0 && l.pool_token_supply != 0 && l.reserve_stake_lamports != 0)
+            .filter(|l| {
+                l.total_lamports != 0 && l.pool_token_supply != 0 && l.reserve_stake_lamports != 0
+            })
             .count()
     }
 
@@ -383,9 +394,9 @@ impl SplStakePoolState {
             AccountMeta::new_readonly(user_wallet_pk, true), // user_transfer_authority (signer)
             AccountMeta::new(user_pool_token_pk, false), // burn_from_pool
             AccountMeta::new(lst.reserve_stake_pk, false), // reserve_stake
-            AccountMeta::new(user_sol_pk, false),        // destination_lamports
+            AccountMeta::new(user_sol_pk, false),       // destination_lamports
             AccountMeta::new(lst.manager_fee_account, false), // manager_fee
-            AccountMeta::new(lst.pool_mint, false),      // pool_mint
+            AccountMeta::new(lst.pool_mint, false),     // pool_mint
             AccountMeta::new_readonly(SYSVAR_CLOCK_ID, false),
             AccountMeta::new_readonly(SYSVAR_STAKE_HISTORY_ID, false),
             AccountMeta::new_readonly(STAKE_PROGRAM_ID, false),
@@ -397,7 +408,11 @@ impl SplStakePoolState {
 
         wallet.require_signer(user_wallet);
         wallet.append_ix(
-            Instruction { program_id: STAKE_POOL_PROGRAM_ID, accounts, data },
+            Instruction {
+                program_id: STAKE_POOL_PROGRAM_ID,
+                accounts,
+                data,
+            },
             STAKE_POOL_WITHDRAW_SOL_CU,
         );
         Ok(())
@@ -414,7 +429,15 @@ impl SplStakePoolState {
         dest_ata: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        self.swap(hop.input_mint, hop.amount_in, hop.amount_out, owner, source_ata, dest_ata, wallet)
+        self.swap(
+            hop.input_mint,
+            hop.amount_in,
+            hop.amount_out,
+            owner,
+            source_ata,
+            dest_ata,
+            wallet,
+        )
     }
 
     /// Bit-exact real on-chain `WithdrawSolWithSlippage` payout (this
@@ -446,7 +469,12 @@ impl SplStakePoolState {
     /// conditions [`Self::upsert_lst_edge`] gates on), or the real payout
     /// would exceed the pool's real `reserve_stake_lamports` liquidity
     /// (the real instruction would fail the same way).
-    pub fn exact_quote(&self, pool_id: AccountId, input_mint: AccountId, amount_in: u64) -> Option<u64> {
+    pub fn exact_quote(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amount_in: u64,
+    ) -> Option<u64> {
         let &idx = self.pool_state_to_idx.get(&pool_id)?;
         let lst = &self.lsts[idx];
         if lst.mint_id != input_mint {
@@ -463,7 +491,8 @@ impl SplStakePoolState {
         let pool_tokens = amount_in as u128;
         let fee_lamports = (pool_tokens * fee_num as u128).div_ceil(fee_denom as u128);
         let pool_tokens_after_fee = pool_tokens.saturating_sub(fee_lamports);
-        let lamports_out = pool_tokens_after_fee * lst.total_lamports as u128 / lst.pool_token_supply as u128;
+        let lamports_out =
+            pool_tokens_after_fee * lst.total_lamports as u128 / lst.pool_token_supply as u128;
         let lamports_out = u64::try_from(lamports_out).ok()?;
         if lamports_out > lst.reserve_stake_lamports {
             return None;
@@ -487,7 +516,11 @@ impl SplStakePoolState {
             && lst.pool_token_supply != 0
             && lst.reserve_stake_lamports != 0
             && lst.sol_withdrawal_fee.1 != 0;
-        let price = if valid { lst.total_lamports as f64 / lst.pool_token_supply as f64 } else { 0.0 };
+        let price = if valid {
+            lst.total_lamports as f64 / lst.pool_token_supply as f64
+        } else {
+            0.0
+        };
         let fee_frac = if valid {
             lst.sol_withdrawal_fee.0 as f64 / lst.sol_withdrawal_fee.1 as f64
         } else {
@@ -499,7 +532,11 @@ impl SplStakePoolState {
         // only for the instruction) -- same simplification as
         // marinade.rs's batch_router.
         let reserve_out = lst.reserve_stake_lamports;
-        let reserve_in = if valid { (reserve_out as f64 / price) as u64 } else { 0 };
+        let reserve_in = if valid {
+            (reserve_out as f64 / price) as u64
+        } else {
+            0
+        };
         router.add_directed_edge(
             lst.pool_state_id,
             lst.mint_id,
@@ -514,9 +551,11 @@ impl SplStakePoolState {
 }
 
 impl Updater for SplStakePoolState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if let Some(&idx) = self.pool_state_to_idx.get(&header.accountid) {
-            let Some(parsed) = parse_stake_pool(body) else { return };
+            let Some(parsed) = parse_stake_pool(body) else {
+                return None;
+            };
             self.lsts[idx].manager_fee_account = parsed.manager_fee_account;
             self.lsts[idx].pool_mint = parsed.pool_mint;
             self.lsts[idx].token_program_id = parsed.token_program_id;
@@ -535,18 +574,38 @@ impl Updater for SplStakePoolState {
                 });
                 self.lsts[idx].reserve_subscribed = true;
             }
-            return;
+            // Same formula/validity check as `upsert_lst_edge` --
+            // `reserve_stake_lamports`/`sol_withdrawal_fee` come from a
+            // different account (`reserve_to_idx`, below), so this
+            // branch can report a price before those have ever arrived
+            // -- `Blank` (not a half-populated `Spot`) until they do.
+            let lst = &self.lsts[idx];
+            return Some(if lst.total_lamports != 0 && lst.pool_token_supply != 0 {
+                StateChange::Spot {
+                    token_a: lst.mint_id,
+                    token_b: account_id_from_pubkey(&WSOL_MINT),
+                    price: lst.total_lamports as f64 / lst.pool_token_supply as f64,
+                }
+            } else {
+                StateChange::Blank
+            });
         }
         if let Some(&idx) = self.reserve_to_idx.get(&header.accountid) {
             self.lsts[idx].reserve_stake_lamports = header.lamports;
+            // Affects available liquidity/fee validity, not the exchange
+            // rate itself (that comes only from `pool_state_to_idx`,
+            // above), so there's no fresh price to report -- `Blank`,
+            // not a half-populated `Spot`.
+            return Some(StateChange::Blank);
         }
+        None
     }
 
     fn on_token(&mut self, _ta: &Tokenaccountv1) -> bool {
         false
     }
 
-    fn on_tx(&mut self, _ix: &CatscopeInstructionRead<'_>, _slot: &solana_sdk::clock::Slot) {}
+    fn on_tx(&mut self, _ix: &CatscopeInstructionRead<'_>, _r: &Result<Slot, TransactionError>) {}
 
     /// Add one LST → SOL withdraw-sol edge per LST with known live pricing.
     fn batch_router(&mut self, router: &mut TradeRouter) {
@@ -636,11 +695,17 @@ mod tests {
         let parsed = parse_stake_pool(&data).expect("should parse");
         assert_eq!(parsed.reserve_stake, Pubkey::new_from_array([5u8; 32]));
         assert_eq!(parsed.pool_mint, Pubkey::new_from_array([6u8; 32]));
-        assert_eq!(parsed.manager_fee_account, Pubkey::new_from_array([7u8; 32]));
+        assert_eq!(
+            parsed.manager_fee_account,
+            Pubkey::new_from_array([7u8; 32])
+        );
         assert_eq!(parsed.token_program_id, Pubkey::new_from_array([8u8; 32]));
         assert_eq!(parsed.total_lamports, 1_000_000);
         assert_eq!(parsed.pool_token_supply, 900_000);
-        assert_eq!(parsed.sol_withdraw_authority, Some(Pubkey::new_from_array([12u8; 32])));
+        assert_eq!(
+            parsed.sol_withdraw_authority,
+            Some(Pubkey::new_from_array([12u8; 32]))
+        );
         assert_eq!(parsed.sol_withdrawal_fee, (10, 10_000));
     }
 

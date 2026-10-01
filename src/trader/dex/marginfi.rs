@@ -100,7 +100,12 @@
 use crate::{
     err::CatscopeGuestError,
     graph::{AccountId, Graph, Subscription, SubscriptionRequest},
-    trader::{dex::pyth, dex::update::Updater, pricegraph::TradeRouter, types::TraderError},
+    trader::{
+        dex::pyth,
+        dex::update::{StateChange, Updater},
+        pricegraph::TradeRouter,
+        types::TraderError,
+    },
     util::{account_id_from_pubkey, pubkey_from_account_id},
     wallet::Wallet,
 };
@@ -108,6 +113,7 @@ use solana_sdk::{
     clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 use solana_sdk_ids::{system_program, sysvar::instructions};
 use std::{collections::HashMap, hash::BuildHasherDefault};
@@ -367,7 +373,8 @@ pub fn parse(body: &[u8]) -> Option<MarginfiBank> {
             body[off..off + 32].try_into().unwrap(),
         ))
     };
-    let read_u32 = |off: usize| -> u32 { u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) };
+    let read_u32 =
+        |off: usize| -> u32 { u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) };
 
     let mut curve_points = [(0u32, 0u32); CURVE_POINTS_COUNT];
     for (i, point) in curve_points.iter_mut().enumerate() {
@@ -395,7 +402,11 @@ pub fn parse(body: &[u8]) -> Option<MarginfiBank> {
         protocol_ir_fee: read_i80f48(OFF_PROTOCOL_IR_FEE),
         oracle_setup: body[OFF_ORACLE_SETUP],
         oracle_key: read_pk(OFF_ORACLE_KEY),
-        oracle_max_age: u16::from_le_bytes(body[OFF_ORACLE_MAX_AGE..OFF_ORACLE_MAX_AGE + 2].try_into().unwrap()),
+        oracle_max_age: u16::from_le_bytes(
+            body[OFF_ORACLE_MAX_AGE..OFF_ORACLE_MAX_AGE + 2]
+                .try_into()
+                .unwrap(),
+        ),
     })
 }
 
@@ -424,7 +435,11 @@ fn marginfi_account_pda(group: &Pubkey, authority: &Pubkey) -> Pubkey {
 /// `["liquidity_vault_auth", bank]` -- the PDA that signs token transfers
 /// out of a bank's liquidity vault (needed for borrow/withdraw).
 fn bank_liquidity_vault_authority(bank: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"liquidity_vault_auth", bank.as_ref()], &MARGINFI_PROGRAM_ID).0
+    Pubkey::find_program_address(
+        &[b"liquidity_vault_auth", bank.as_ref()],
+        &MARGINFI_PROGRAM_ID,
+    )
+    .0
 }
 
 /// `["liquidity_vault", bank]` -- confirmed against `marginfi-v2`'s
@@ -524,7 +539,8 @@ pub struct MarginfiState {
     /// for banks like SOL's plain bank (`oracle_setup == 4`), whose oracle
     /// isn't a Pyth account at all -- see `pyth::parse_switchboard_pull`'s
     /// doc comment for the live-verified account layout.
-    m_switchboard_price: HashMap<AccountId, pyth::SwitchboardPullPrice, BuildHasherDefault<XxHash64>>,
+    m_switchboard_price:
+        HashMap<AccountId, pyth::SwitchboardPullPrice, BuildHasherDefault<XxHash64>>,
 }
 
 impl std::fmt::Debug for MarginfiState {
@@ -561,7 +577,8 @@ impl MarginfiState {
         // bot never needed (same class of issue already found and fixed
         // once this session for obligation-account subscriptions,
         // elsewhere in the stack).
-        let usdc_mint = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").to_bytes();
+        let usdc_mint =
+            Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").to_bytes();
         let is_traded_mint = |mint: &[u8; 32]| {
             *mint == usdc_mint
                 || crate::symbol_mint_config::SYMBOL_MINT_MAP
@@ -703,7 +720,9 @@ impl MarginfiState {
     pub fn debug_oracle_status(&self) -> String {
         let mut lines = Vec::new();
         for (&oracle_id, &bank_id) in self.m_oracle_to_bank.iter() {
-            let Some(bank) = self.m_bank.get(&bank_id) else { continue };
+            let Some(bank) = self.m_bank.get(&bank_id) else {
+                continue;
+            };
             let mint_str = resolve(bank.mint)
                 .map(|pk| pk.to_string())
                 .unwrap_or_else(|_| "?".to_string());
@@ -759,7 +778,10 @@ impl MarginfiState {
         if let Some(&price) = self.m_push_price.get(&bank_id) {
             return Some(price.into());
         }
-        self.m_switchboard_price.get(&bank_id).copied().map(Into::into)
+        self.m_switchboard_price
+            .get(&bank_id)
+            .copied()
+            .map(Into::into)
     }
 
     /// Build a priced [`crate::trader::credit::CreditReserve`] for `bank_id`,
@@ -800,14 +822,19 @@ impl MarginfiState {
     /// supported types need exactly one remaining account, and it's
     /// `oracle_keys[0]` directly (confirmed via real source -- see the
     /// same doc comment), i.e. the already-parsed `oracle_key` field.
-    fn build_remaining_accounts(&self, bank_ids: &[AccountId]) -> Result<Vec<AccountMeta>, TraderError> {
+    fn build_remaining_accounts(
+        &self,
+        bank_ids: &[AccountId],
+    ) -> Result<Vec<AccountMeta>, TraderError> {
         let mut entries: Vec<(Pubkey, Pubkey)> = Vec::with_capacity(bank_ids.len());
         for &id in bank_ids {
             let bank = self
                 .m_bank
                 .get(&id)
                 .ok_or(TraderError::PubkeyResolutionFailed(id))?;
-            if bank.oracle_setup != ORACLE_SETUP_PYTH_PUSH && bank.oracle_setup != ORACLE_SETUP_SWITCHBOARD_PULL {
+            if bank.oracle_setup != ORACLE_SETUP_PYTH_PUSH
+                && bank.oracle_setup != ORACLE_SETUP_SWITCHBOARD_PULL
+            {
                 return Err(TraderError::MissingConfig(
                     "marginfi: bank uses an oracle_setup this bot doesn't parse yet, can't build remaining_accounts",
                 ));
@@ -1039,22 +1066,54 @@ impl MarginfiState {
 }
 
 impl Updater for MarginfiState {
-    fn on_account(&mut self, header: &crate::catscope::witbot::shooter::Header, body: &[u8]) {
+    fn on_account(
+        &mut self,
+        header: &crate::catscope::witbot::shooter::Header,
+        body: &[u8],
+    ) -> Option<StateChange> {
         if let Some(bank) = self.m_bank.get_mut(&header.accountid) {
             if let Some(parsed) = parse(body) {
                 *bank = parsed;
+                let (borrow_apy, supply_apy) =
+                    (bank.current_borrow_apy(), bank.current_supply_apy());
+                let price_usd = self.price_for_bank(header.accountid).map(|p| p.price_usd);
+                return Some(StateChange::Lending {
+                    account_id: header.accountid,
+                    borrow_apy: Some(borrow_apy),
+                    supply_apy: Some(supply_apy),
+                    price_usd,
+                });
             }
-            return;
+            // Recognized (it's a tracked bank) but unparseable -- `Blank`,
+            // not `None` (which would mean "not recognized at all").
+            return Some(StateChange::Blank);
         }
         if let Some(&bank_id) = self.m_oracle_to_bank.get(&header.accountid) {
-            if let Some(price) = pyth::parse_legacy(body) {
+            let price_usd = if let Some(price) = pyth::parse_legacy(body) {
                 self.m_price.insert(bank_id, price);
+                Some(price.price_usd)
             } else if let Some(price) = pyth::parse_push_oracle(body) {
                 self.m_push_price.insert(bank_id, price);
+                Some(price.price_usd)
             } else if let Some(price) = pyth::parse_switchboard_pull(body) {
                 self.m_switchboard_price.insert(bank_id, price);
-            }
+                Some(price.price_usd)
+            } else {
+                None
+            };
+            // Recognized (it's a tracked oracle) even when unparseable --
+            // `Blank`, not `None`, in that case.
+            return Some(match price_usd {
+                Some(price_usd) => StateChange::Lending {
+                    account_id: bank_id,
+                    borrow_apy: None,
+                    supply_apy: None,
+                    price_usd: Some(price_usd),
+                },
+                None => StateChange::Blank,
+            });
         }
+        None
     }
 
     fn on_token(&mut self, _ta: &crate::catscope::witbot::shooter::Tokenaccountv1) -> bool {
@@ -1071,7 +1130,12 @@ impl Updater for MarginfiState {
         // see the module doc comment. Genuine no-op, not unimplemented.
     }
 
-    fn on_tx(&mut self, _ix: &crate::txview::CatscopeInstructionRead<'_>, _slot: &Slot) {}
+    fn on_tx(
+        &mut self,
+        _ix: &crate::txview::CatscopeInstructionRead<'_>,
+        _r: &Result<Slot, TransactionError>,
+    ) {
+    }
 
     fn flush_pool(&mut self, _g: &Graph, _max_per_flush: usize) -> Result<(), CatscopeGuestError> {
         Ok(())
@@ -1108,12 +1172,16 @@ pub struct MarginfiLendingAccount {
 impl MarginfiLendingAccount {
     /// The deposit (if any) in `bank_id`.
     pub fn deposit_for(&self, bank_id: AccountId) -> Option<&MarginfiBalance> {
-        self.balances.iter().find(|b| b.bank_id == bank_id && b.asset_shares > 0.0)
+        self.balances
+            .iter()
+            .find(|b| b.bank_id == bank_id && b.asset_shares > 0.0)
     }
 
     /// The borrow (if any) against `bank_id`.
     pub fn borrow_for(&self, bank_id: AccountId) -> Option<&MarginfiBalance> {
-        self.balances.iter().find(|b| b.bank_id == bank_id && b.liability_shares > 0.0)
+        self.balances
+            .iter()
+            .find(|b| b.bank_id == bank_id && b.liability_shares > 0.0)
     }
 
     /// Every bank this account currently has an active balance in, other
@@ -1121,7 +1189,11 @@ impl MarginfiLendingAccount {
     /// `other_active_banks` param needs (this bot doesn't track a user's
     /// open positions any other way, see those methods' doc comments).
     pub fn other_active_banks(&self, exclude: AccountId) -> Vec<AccountId> {
-        self.balances.iter().filter(|b| b.bank_id != exclude).map(|b| b.bank_id).collect()
+        self.balances
+            .iter()
+            .filter(|b| b.bank_id != exclude)
+            .map(|b| b.bank_id)
+            .collect()
     }
 
     /// Mint-keyed, human-readable (decimals-adjusted) view of this
@@ -1141,10 +1213,16 @@ impl MarginfiLendingAccount {
             };
             let decimals = 10f64.powi(bank.mint_decimals as i32);
             if balance.asset_shares > 0.0 {
-                deposits.push((bank.mint, balance.asset_shares * bank.asset_share_value / decimals));
+                deposits.push((
+                    bank.mint,
+                    balance.asset_shares * bank.asset_share_value / decimals,
+                ));
             }
             if balance.liability_shares > 0.0 {
-                borrows.push((bank.mint, balance.liability_shares * bank.liability_share_value / decimals));
+                borrows.push((
+                    bank.mint,
+                    balance.liability_shares * bank.liability_share_value / decimals,
+                ));
             }
         }
         MarginfiPositionSummary { deposits, borrows }
@@ -1277,7 +1355,11 @@ impl MarginfiPosition {
             return Vec::new();
         }
         let account_pk = marginfi_account_pda(&MARGINFI_MAIN_GROUP, &authority);
-        vec![SubscriptionRequest { root: account_id_from_pubkey(&account_pk), filter_weight: 0, depth: 1 }]
+        vec![SubscriptionRequest {
+            root: account_id_from_pubkey(&account_pk),
+            filter_weight: 0,
+            depth: 1,
+        }]
     }
 
     /// Apply `authority` plus its already-resolved subscription (from
@@ -1285,7 +1367,9 @@ impl MarginfiPosition {
     /// split described there. No-op if `subs` is empty (either already
     /// set, or nothing to apply).
     pub fn apply_authority(&mut self, authority: Pubkey, subs: Vec<Subscription>) {
-        let Some(sub) = subs.into_iter().next() else { return };
+        let Some(sub) = subs.into_iter().next() else {
+            return;
+        };
         let account_pk = marginfi_account_pda(&MARGINFI_MAIN_GROUP, &authority);
         let account_id = account_id_from_pubkey(&account_pk);
         self.subscriptions.push(sub);
@@ -1347,11 +1431,20 @@ mod tests {
 
     #[test]
     fn discriminators_match_their_instruction_names() {
-        assert_eq!(disc("marginfi_account_initialize_pda"), DISC_INITIALIZE_ACCOUNT_PDA);
-        assert_eq!(disc("lending_account_deposit"), DISC_LENDING_ACCOUNT_DEPOSIT);
+        assert_eq!(
+            disc("marginfi_account_initialize_pda"),
+            DISC_INITIALIZE_ACCOUNT_PDA
+        );
+        assert_eq!(
+            disc("lending_account_deposit"),
+            DISC_LENDING_ACCOUNT_DEPOSIT
+        );
         assert_eq!(disc("lending_account_borrow"), DISC_LENDING_ACCOUNT_BORROW);
         assert_eq!(disc("lending_account_repay"), DISC_LENDING_ACCOUNT_REPAY);
-        assert_eq!(disc("lending_account_withdraw"), DISC_LENDING_ACCOUNT_WITHDRAW);
+        assert_eq!(
+            disc("lending_account_withdraw"),
+            DISC_LENDING_ACCOUNT_WITHDRAW
+        );
     }
 
     #[test]
@@ -1373,7 +1466,10 @@ mod tests {
     fn bank_liquidity_vault_and_authority_differ_and_are_bank_specific() {
         let bank_a = Pubkey::new_unique();
         let bank_b = Pubkey::new_unique();
-        assert_ne!(bank_liquidity_vault(&bank_a), bank_liquidity_vault_authority(&bank_a));
+        assert_ne!(
+            bank_liquidity_vault(&bank_a),
+            bank_liquidity_vault_authority(&bank_a)
+        );
         assert_ne!(bank_liquidity_vault(&bank_a), bank_liquidity_vault(&bank_b));
     }
 
@@ -1413,8 +1509,16 @@ mod tests {
     fn lending_account_with_positions() -> MarginfiLendingAccount {
         MarginfiLendingAccount {
             balances: vec![
-                MarginfiBalance { bank_id: 7, asset_shares: 90_051.3, liability_shares: 0.0 },
-                MarginfiBalance { bank_id: 9, asset_shares: 0.0, liability_shares: 478_903.3 },
+                MarginfiBalance {
+                    bank_id: 7,
+                    asset_shares: 90_051.3,
+                    liability_shares: 0.0,
+                },
+                MarginfiBalance {
+                    bank_id: 9,
+                    asset_shares: 0.0,
+                    liability_shares: 478_903.3,
+                },
             ],
         }
     }

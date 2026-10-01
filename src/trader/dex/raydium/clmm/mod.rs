@@ -88,7 +88,7 @@ use crate::{
     graph::{AccountId, Graph, SubscriptionQueue, SubscriptionRequest},
     log_warn,
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{cp_quote, Hop, TradeRouter},
         types::{DexType, PoolPrice, SwapParams, TraderError, RAYDIUM_HOP_MAX_SLIPPAGE},
     },
@@ -96,17 +96,17 @@ use crate::{
     wallet::Wallet,
 };
 use solana_clmm_raydium::{
-    compute_swap_full, next_initialized_tick_array_start_index, tick_array_bit_map::max_tick_in_tickarray_bitmap,
-    InitializedTick, PoolTickBitmap, SwapPool, MAX_TICK,
+    compute_swap_full, next_initialized_tick_array_start_index,
+    tick_array_bit_map::max_tick_in_tickarray_bitmap, InitializedTick, PoolTickBitmap, SwapPool,
+    MAX_TICK,
 };
 use solana_sdk::{
+    clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
-use std::{
-    collections::HashMap,
-    hash::BuildHasherDefault,
-};
+use std::{collections::HashMap, hash::BuildHasherDefault};
 use twox_hash::XxHash64;
 
 // ─── Program IDs ─────────────────────────────────────────────────────────────
@@ -280,7 +280,12 @@ impl RaydiumClmm {
 
     pub fn populate_router(&self, router: &mut TradeRouter) {
         for (&pool_id, wrapper) in &self.m_pool {
-            router.add_raydium_clmm_pool(pool_id, &wrapper.pool, wrapper.fee_rate_pips, DexType::RaydiumClmm);
+            router.add_raydium_clmm_pool(
+                pool_id,
+                &wrapper.pool,
+                wrapper.fee_rate_pips,
+                DexType::RaydiumClmm,
+            );
         }
     }
 
@@ -294,7 +299,10 @@ impl RaydiumClmm {
         dest_ata: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        let wrapper = self.m_pool.get(&hop.pool_id).ok_or(TraderError::UnknownPool(hop.pool_id))?;
+        let wrapper = self
+            .m_pool
+            .get(&hop.pool_id)
+            .ok_or(TraderError::UnknownPool(hop.pool_id))?;
         let pool = &wrapper.pool;
 
         // Real, live-confirmed failure mode (2026-08-27, same session/root
@@ -313,13 +321,14 @@ impl RaydiumClmm {
         // if any of the windows we're about to reference have no real
         // subscribed tick-array data yet, same "refuse rather than
         // guess" policy as the Orca fix, same error type.
-        let zero_for_one = if hop.input_mint == pool.token_mint_0 && hop.output_mint == pool.token_mint_1 {
-            true
-        } else if hop.input_mint == pool.token_mint_1 && hop.output_mint == pool.token_mint_0 {
-            false
-        } else {
-            return Err(TraderError::WrongMints);
-        };
+        let zero_for_one =
+            if hop.input_mint == pool.token_mint_0 && hop.output_mint == pool.token_mint_1 {
+                true
+            } else if hop.input_mint == pool.token_mint_1 && hop.output_mint == pool.token_mint_0 {
+                false
+            } else {
+                return Err(TraderError::WrongMints);
+            };
         let Some(ta_starts) = tick_array_windows(pool, zero_for_one) else {
             return Err(TraderError::PoolNotReady);
         };
@@ -375,7 +384,12 @@ impl RaydiumClmm {
     /// need the `TickArrayBitmapExtension` account (see
     /// `tick_array_windows`'s doc comment), or the underlying quote call
     /// errors.
-    pub fn exact_quote(&self, pool_id: AccountId, input_mint: AccountId, amount_in: u64) -> Option<u64> {
+    pub fn exact_quote(
+        &self,
+        pool_id: AccountId,
+        input_mint: AccountId,
+        amount_in: u64,
+    ) -> Option<u64> {
         let wrapper = self.m_pool.get(&pool_id)?;
         let pool = &wrapper.pool;
         if pool.liquidity == 0 {
@@ -394,8 +408,12 @@ impl RaydiumClmm {
         let mut ticks: Vec<InitializedTick> = Vec::new();
         let m_starts = self.m_pool_tick_arrays.get(&pool_id);
         for &start in &starts {
-            let Some(ta_id) = m_starts.and_then(|m| m.get(&start)) else { continue };
-            let Some(pta) = self.m_tick_array.get(ta_id) else { continue };
+            let Some(ta_id) = m_starts.and_then(|m| m.get(&start)) else {
+                continue;
+            };
+            let Some(pta) = self.m_tick_array.get(ta_id) else {
+                continue;
+            };
             ticks.extend_from_slice(&pta.ticks);
         }
         ticks.sort_by_key(|t| t.tick);
@@ -407,7 +425,8 @@ impl RaydiumClmm {
             tick_spacing: pool.tick_spacing,
             fee_rate_pips: wrapper.fee_rate_pips,
         };
-        let result = compute_swap_full(&swap_pool, &ticks, amount_in, 0, true, zero_for_one).ok()?;
+        let result =
+            compute_swap_full(&swap_pool, &ticks, amount_in, 0, true, zero_for_one).ok()?;
         Some(result.amount_out)
     }
 
@@ -564,19 +583,19 @@ fn dedup_tick_array_starts(starts: [i32; 3]) -> Vec<i32> {
 }
 
 impl Updater for RaydiumClmm {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if header.owner != self.program_id {
-            return;
+            return None;
         }
         if body.len() >= 8 && body[..8] == DISC_TICK_ARRAY {
             self.on_tick_array_account(header.accountid, body);
-            return;
+            return None;
         }
         let Some(wrapper) = self.m_pool.get_mut(&header.accountid) else {
-            return;
+            return None;
         };
         let Some(mut new_state) = parse(body) else {
-            return;
+            return None;
         };
 
         // Preserve live reserves from token events -- parse() always
@@ -634,6 +653,17 @@ impl Updater for RaydiumClmm {
                 self.m_pool.get_mut(&pool_id).unwrap().subscribed_tick_start = Some(start_0);
             }
         }
+        // Re-borrowed fresh rather than reusing `wrapper` above -- its
+        // borrow can't span the `self.m_pool.get_mut` re-borrow inside
+        // the `if` block just above.
+        match self.m_pool.get(&pool_id) {
+            Some(w) => Some(StateChange::Spot {
+                token_a: w.pool.token_mint_0,
+                token_b: w.pool.token_mint_1,
+                price: w.pool.spot_price(),
+            }),
+            None => Some(StateChange::Blank),
+        }
     }
 
     fn on_token(&mut self, ta: &Tokenaccountv1) -> bool {
@@ -657,14 +687,24 @@ impl Updater for RaydiumClmm {
 
     fn refresh_account_router(&mut self, account_id: AccountId, router: &mut TradeRouter) {
         if let Some(wrapper) = self.m_pool.get(&account_id) {
-            router.add_raydium_clmm_pool(account_id, &wrapper.pool, wrapper.fee_rate_pips, DexType::RaydiumClmm);
+            router.add_raydium_clmm_pool(
+                account_id,
+                &wrapper.pool,
+                wrapper.fee_rate_pips,
+                DexType::RaydiumClmm,
+            );
         }
     }
 
     fn refresh_token_router(&mut self, ta_id: AccountId, router: &mut TradeRouter) {
         if let Some(&pool_id) = self.m_vault.get(&ta_id) {
             if let Some(wrapper) = self.m_pool.get(&pool_id) {
-                router.add_raydium_clmm_pool(pool_id, &wrapper.pool, wrapper.fee_rate_pips, DexType::RaydiumClmm);
+                router.add_raydium_clmm_pool(
+                    pool_id,
+                    &wrapper.pool,
+                    wrapper.fee_rate_pips,
+                    DexType::RaydiumClmm,
+                );
             }
         }
     }
@@ -672,7 +712,7 @@ impl Updater for RaydiumClmm {
     fn on_tx(
         &mut self,
         ix: &crate::txview::CatscopeInstructionRead<'_>,
-        _slot: &solana_sdk::clock::Slot,
+        _r: &Result<Slot, TransactionError>,
     ) {
         // Decode a landed swap_v2 instruction and provisionally ("fudge")
         // adjust the pool's reserves ahead of the real account update that
@@ -748,10 +788,17 @@ impl RaydiumClmm {
         if body.len() < MIN_TICK_ARRAY_LEN {
             return;
         }
-        let pool_pk = Pubkey::new_from_array(body[OFF_TA_POOL_ID..OFF_TA_POOL_ID + 32].try_into().unwrap());
+        let pool_pk = Pubkey::new_from_array(
+            body[OFF_TA_POOL_ID..OFF_TA_POOL_ID + 32]
+                .try_into()
+                .unwrap(),
+        );
         let pool_id = account_id_from_pubkey(&pool_pk);
-        let start_tick_index =
-            i32::from_le_bytes(body[OFF_TA_START_INDEX..OFF_TA_START_INDEX + 4].try_into().unwrap());
+        let start_tick_index = i32::from_le_bytes(
+            body[OFF_TA_START_INDEX..OFF_TA_START_INDEX + 4]
+                .try_into()
+                .unwrap(),
+        );
 
         let mut ticks = Vec::new();
         for i in 0..TICK_ARRAY_SIZE as usize {
@@ -765,11 +812,24 @@ impl RaydiumClmm {
             }
             let tick = i32::from_le_bytes(body[o..o + 4].try_into().unwrap());
             let liquidity_net = i128::from_le_bytes(body[o + 4..o + 20].try_into().unwrap());
-            ticks.push(InitializedTick { tick, liquidity_net });
+            ticks.push(InitializedTick {
+                tick,
+                liquidity_net,
+            });
         }
 
-        self.m_tick_array.insert(ta_id, ParsedTickArray { start_tick_index, pool_id, ticks });
-        self.m_pool_tick_arrays.entry(pool_id).or_default().insert(start_tick_index, ta_id);
+        self.m_tick_array.insert(
+            ta_id,
+            ParsedTickArray {
+                start_tick_index,
+                pool_id,
+                ticks,
+            },
+        );
+        self.m_pool_tick_arrays
+            .entry(pool_id)
+            .or_default()
+            .insert(start_tick_index, ta_id);
     }
 }
 
@@ -1008,7 +1068,10 @@ mod tests {
 
     #[test]
     fn dedup_tick_array_starts_keeps_three_distinct_windows() {
-        assert_eq!(dedup_tick_array_starts([100, 200, 300]), vec![100, 200, 300]);
+        assert_eq!(
+            dedup_tick_array_starts([100, 200, 300]),
+            vec![100, 200, 300]
+        );
     }
 
     #[test]
@@ -1019,4 +1082,3 @@ mod tests {
         assert_eq!(dedup_tick_array_starts([100, 100, 100]), vec![100]);
     }
 }
-

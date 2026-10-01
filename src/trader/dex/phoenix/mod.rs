@@ -73,12 +73,13 @@ pub mod pda;
 
 use std::collections::HashMap;
 
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{clock::Slot, pubkey::Pubkey, transaction::TransactionError};
 
 use crate::{
     catscope::witbot::shooter::Header,
     err::CatscopeGuestError,
     graph::{AccountId, Graph, Subscription, SubscriptionQueue, SubscriptionRequest},
+    trader::dex::update::StateChange,
     util::{account_id_from_pubkey, resolve_symbol_mint},
 };
 
@@ -131,9 +132,11 @@ const QUOTE_LOT_DECIMALS: i32 = 6;
 
 impl PhoenixMarketState {
     pub fn symbol_str(&self) -> std::borrow::Cow<'_, str> {
-        String::from_utf8_lossy(&self.symbol[..self.symbol.iter().position(|&b| b == 0).unwrap_or(16)])
-            .into_owned()
-            .into()
+        String::from_utf8_lossy(
+            &self.symbol[..self.symbol.iter().position(|&b| b == 0).unwrap_or(16)],
+        )
+        .into_owned()
+        .into()
     }
 
     /// Mark price in USD, converted from `oracle_mark_price_ticks` (the
@@ -347,7 +350,9 @@ impl PhoenixState {
     }
 
     pub fn market(&self, asset_id: u32) -> Option<&PhoenixMarketState> {
-        self.market_by_asset_id.get(&asset_id).map(|&i| &self.markets[i])
+        self.market_by_asset_id
+            .get(&asset_id)
+            .map(|&i| &self.markets[i])
     }
 
     pub fn markets(&self) -> &[PhoenixMarketState] {
@@ -439,13 +444,21 @@ impl PhoenixState {
     /// the same authority is a no-op; a call with a *different* authority
     /// re-derives and re-subscribes (mirrors `arbv1`'s wallet-replacement
     /// handling).
-    pub fn set_authority(&mut self, authority: Pubkey, g: &Graph) -> Result<(), CatscopeGuestError> {
+    pub fn set_authority(
+        &mut self,
+        authority: Pubkey,
+        g: &Graph,
+    ) -> Result<(), CatscopeGuestError> {
         if self.o_authority_pk == Some(authority) {
             return Ok(());
         }
         let trader_pk = pda::trader_account(&authority, 0, pda::SUBACCOUNT_CROSS_MARGIN);
         let trader_id = account_id_from_pubkey(&trader_pk);
-        let sub = g.subscribe(SubscriptionRequest { root: trader_id, filter_weight: 0, depth: 1 })?;
+        let sub = g.subscribe(SubscriptionRequest {
+            root: trader_id,
+            filter_weight: 0,
+            depth: 1,
+        })?;
         self.subscriptions.push(sub);
         self.o_authority_pk = Some(authority);
         self.o_trader_account_pk = Some(trader_pk);
@@ -473,7 +486,11 @@ impl PhoenixState {
         }
         let trader_pk = pda::trader_account(&authority, 0, pda::SUBACCOUNT_CROSS_MARGIN);
         let trader_id = account_id_from_pubkey(&trader_pk);
-        vec![SubscriptionRequest { root: trader_id, filter_weight: 0, depth: 1 }]
+        vec![SubscriptionRequest {
+            root: trader_id,
+            filter_weight: 0,
+            depth: 1,
+        }]
     }
 
     /// Apply `authority` plus its already-resolved subscription (from
@@ -482,7 +499,9 @@ impl PhoenixState {
     /// described there. No-op if `subs` is empty (either already set, or
     /// nothing to apply).
     pub fn apply_authority(&mut self, authority: Pubkey, subs: Vec<Subscription>) {
-        let Some(sub) = subs.into_iter().next() else { return };
+        let Some(sub) = subs.into_iter().next() else {
+            return;
+        };
         let trader_pk = pda::trader_account(&authority, 0, pda::SUBACCOUNT_CROSS_MARGIN);
         let trader_id = account_id_from_pubkey(&trader_pk);
         self.subscriptions.push(sub);
@@ -502,19 +521,26 @@ impl PhoenixState {
         if !self.pending_second_hop {
             return Ok(());
         }
-        let subs = SubscriptionQueue::subscribe_now(g, vec![
-            SubscriptionRequest { root: self.perp_asset_map_id, filter_weight: 0, depth: 1 },
-            SubscriptionRequest {
-                root: account_id_from_pubkey(&self.global_trader_index_header_pk),
-                filter_weight: 0,
-                depth: 1,
-            },
-            SubscriptionRequest {
-                root: account_id_from_pubkey(&self.active_trader_buffer_header_pk),
-                filter_weight: 0,
-                depth: 1,
-            },
-        ])?;
+        let subs = SubscriptionQueue::subscribe_now(
+            g,
+            vec![
+                SubscriptionRequest {
+                    root: self.perp_asset_map_id,
+                    filter_weight: 0,
+                    depth: 1,
+                },
+                SubscriptionRequest {
+                    root: account_id_from_pubkey(&self.global_trader_index_header_pk),
+                    filter_weight: 0,
+                    depth: 1,
+                },
+                SubscriptionRequest {
+                    root: account_id_from_pubkey(&self.active_trader_buffer_header_pk),
+                    filter_weight: 0,
+                    depth: 1,
+                },
+            ],
+        )?;
         self.subscriptions.extend(subs);
         self.pending_second_hop = false;
         Ok(())
@@ -523,7 +549,7 @@ impl PhoenixState {
     /// Dispatch a live account update. Routed by known-pubkey identity
     /// (not by reading the account discriminant), same convention as
     /// `pumpswap.rs`/`pumpfun.rs`.
-    pub fn on_account(&mut self, header: &Header, body: &[u8]) {
+    pub fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if header.accountid == self.global_config_id {
             if let Some(v) = accounts::parse_global_config(body) {
                 self.canonical_mint_pk = v.canonical_token_mint;
@@ -538,9 +564,16 @@ impl PhoenixState {
                 }
                 self.global_ready = true;
             }
-            return;
+            return Some(StateChange::Blank);
         }
         if header.accountid == self.perp_asset_map_id {
+            // Updates every market's price ticks in one account -- unlike
+            // a single-market account, there's no one market this
+            // account_id itself represents, so there's no single price
+            // to attribute to it (same reasoning as
+            // `SanctumState::on_account`'s pool-wide/list accounts) --
+            // `Blank`, not a half-populated `Perp`. Read each market's
+            // own `mark_price_usd()` afterward if you need a specific one.
             for m in self.markets.iter_mut() {
                 if let Some(e) = accounts::find_perp_asset_by_id(body, m.asset_id) {
                     m.tick_size = e.tick_size;
@@ -554,7 +587,7 @@ impl PhoenixState {
                     m.priced = true;
                 }
             }
-            return;
+            return Some(StateChange::Blank);
         }
         if Some(header.accountid) == self.o_trader_account_id {
             if let Some(h) = accounts::parse_trader_header(body) {
@@ -575,8 +608,13 @@ impl PhoenixState {
                         });
                     }
                 }
+                // This bot's own trader/position account, not a market --
+                // no single mark price to report either. `Blank`, not a
+                // half-populated `Perp`.
+                return Some(StateChange::Blank);
             }
         }
+        None
     }
 
     /// Remaining-accounts list for `global_trader_index`. Verified live at
@@ -637,8 +675,8 @@ impl PhoenixState {
 }
 
 impl super::update::Updater for PhoenixState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
-        PhoenixState::on_account(self, header, body);
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<super::update::StateChange> {
+        PhoenixState::on_account(self, header, body)
     }
 
     /// No token accounts tracked (Phoenix's own accounts -- `GlobalConfiguration`,
@@ -648,7 +686,12 @@ impl super::update::Updater for PhoenixState {
         false
     }
 
-    fn on_tx(&mut self, _ix: &crate::txview::CatscopeInstructionRead<'_>, _slot: &solana_sdk::clock::Slot) {}
+    fn on_tx(
+        &mut self,
+        _ix: &crate::txview::CatscopeInstructionRead<'_>,
+        _result: &Result<Slot, TransactionError>,
+    ) {
+    }
 
     /// See [`PhoenixState::add_to_pricing_router`]'s doc -- placeholder,
     /// same convention as Kamino/Marginfi/Solend's own no-op
@@ -737,7 +780,11 @@ mod tests {
         assert_eq!(m.symbol_str(), "SOL");
     }
 
-    fn market_with_price(tick_size: u64, base_lot_decimals: i8, oracle_mark_price_ticks: u64) -> PhoenixMarketState {
+    fn market_with_price(
+        tick_size: u64,
+        base_lot_decimals: i8,
+        oracle_mark_price_ticks: u64,
+    ) -> PhoenixMarketState {
         PhoenixMarketState {
             symbol: [0u8; 16],
             asset_id: 0,

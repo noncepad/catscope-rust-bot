@@ -38,6 +38,7 @@ use solana_sdk::{
     clock::Slot,
     message::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    transaction::TransactionError,
 };
 use twox_hash::XxHash64;
 
@@ -47,7 +48,7 @@ use crate::{
     graph::{AccountId, Graph, SubscriptionRequest},
     log_warn,
     trader::{
-        dex::update::Updater,
+        dex::update::{StateChange, Updater},
         pricegraph::{Hop, Route, TradeRouter},
         types::{DexType, TraderError},
     },
@@ -678,19 +679,36 @@ impl SanctumState {
         dest_ata: AccountId,
         wallet: &mut Wallet,
     ) -> Result<(), TraderError> {
-        self.swap(hop.input_mint, hop.output_mint, hop.amount_in, hop.amount_out, owner, source_ata, dest_ata, wallet)
+        self.swap(
+            hop.input_mint,
+            hop.output_mint,
+            hop.amount_in,
+            hop.amount_out,
+            owner,
+            source_ata,
+            dest_ata,
+            wallet,
+        )
     }
 }
 
 impl Updater for SanctumState {
-    fn on_account(&mut self, header: &Header, body: &[u8]) {
+    fn on_account(&mut self, header: &Header, body: &[u8]) -> Option<StateChange> {
         if self.program_id != header.owner {
-            return;
+            return None;
         }
+        // Neither branch reports a `Spot` -- both update *many* LSTs'
+        // `sol_value` at once (this is a shared pool-wide/list account,
+        // not a per-LST one), so there's no single pair/price for this
+        // account_id to carry. `Blank`, not a half-populated `Spot`.
         if header.accountid == self.pool_state_id {
             self.parse_pool_state(body);
+            Some(StateChange::Blank)
         } else if header.accountid == self.lst_state_list_id {
             self.parse_lst_state_list(body);
+            Some(StateChange::Blank)
+        } else {
+            None
         }
     }
 
@@ -741,7 +759,7 @@ impl Updater for SanctumState {
         }
     }
 
-    fn on_tx(&mut self, _ix: &CatscopeInstructionRead<'_>, _slot: &Slot) {}
+    fn on_tx(&mut self, _ix: &CatscopeInstructionRead<'_>, _r: &Result<Slot, TransactionError>) {}
 
     fn flush_pool(&mut self, _g: &Graph, _max_per_flush: usize) -> Result<(), CatscopeGuestError> {
         Ok(())
