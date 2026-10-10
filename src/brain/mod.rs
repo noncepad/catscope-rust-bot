@@ -2,19 +2,16 @@ use std::{cell::UnsafeCell, rc::Rc};
 
 use crate::{
     brain::{
-        arbv1::ArbitrageV1Hook, marketwatchv1::MarketWatchV1Hook,
-        testlatencylitev1::TestLatencyLiteV1Hook, testperplatencyv1::TestPerpLatencyV1Hook,
-        testperplatencyv1lite::TestPerpLatencyV1LiteHook, xstockshealthv1::XstocksHealthV1Hook,
+        marketwatchv1::MarketWatchV1Hook, testlatencylitev1::TestLatencyLiteV1Hook,
+        testperplatencyv1::TestPerpLatencyV1Hook, xstockshealthv1::XstocksHealthV1Hook,
     },
     event_loop::EventHandler,
     message::Parser,
 };
 
-pub mod arbv1;
 pub mod marketwatchv1;
 pub mod testlatencylitev1;
 pub mod testperplatencyv1;
-pub mod testperplatencyv1lite;
 pub mod xstockshealthv1;
 
 pub struct Merged {
@@ -22,12 +19,9 @@ pub struct Merged {
 }
 
 enum BotMode {
-    Arbitrage(Box<ArbitrageV1Hook>),
     //    PhoenixPerps(Box<PhoenixPerpsV1Hook>),
-    //   PerpFunding(Box<PerpFundingV1Hook>),
     //   TestPerp(Box<TestPerpV1Hook>),
     TestPerpLatency(Box<TestPerpLatencyV1Hook>),
-    TestPerpLatencyLite(Box<TestPerpLatencyV1LiteHook>),
     TestLatencyLiteV1(Box<TestLatencyLiteV1Hook>),
     //    LeveragedLoop(Box<LeveragedLoopV1Hook>),
     //   MultiModel(Box<MultiModelV1Hook>),
@@ -44,15 +38,9 @@ impl Default for Merged {
         };
 
         let inner = match mode.as_str() {
-            "arbv1" => BotMode::Arbitrage(Box::new(ArbitrageV1Hook::new(Rc::new(
-                UnsafeCell::new(Parser::default()),
-            )))),
             "testperplatencyv1" => BotMode::TestPerpLatency(Box::new(TestPerpLatencyV1Hook::new(
                 Rc::new(UnsafeCell::new(Parser::default())),
             ))),
-            "testperplatencyv1lite" => BotMode::TestPerpLatencyLite(Box::new(
-                TestPerpLatencyV1LiteHook::new(Rc::new(UnsafeCell::new(Parser::default()))),
-            )),
             "testlatencylitev1" => BotMode::TestLatencyLiteV1(Box::new(
                 TestLatencyLiteV1Hook::new(Rc::new(UnsafeCell::new(Parser::default()))),
             )),
@@ -77,17 +65,9 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::Arbitrage(mut x) => {
-                r = x.on_load(poller, args);
-                inner = BotMode::Arbitrage(x);
-            }
             BotMode::TestPerpLatency(mut x) => {
                 r = x.on_load(poller, args);
                 inner = BotMode::TestPerpLatency(x);
-            }
-            BotMode::TestPerpLatencyLite(mut x) => {
-                r = x.on_load(poller, args);
-                inner = BotMode::TestPerpLatencyLite(x);
             }
             BotMode::TestLatencyLiteV1(mut x) => {
                 r = x.on_load(poller, args);
@@ -110,17 +90,9 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::Arbitrage(mut x) => {
-                r = x.on_unload();
-                inner = BotMode::Arbitrage(x);
-            }
             BotMode::TestPerpLatency(mut x) => {
                 r = x.on_unload();
                 inner = BotMode::TestPerpLatency(x);
-            }
-            BotMode::TestPerpLatencyLite(mut x) => {
-                r = x.on_unload();
-                inner = BotMode::TestPerpLatencyLite(x);
             }
             BotMode::TestLatencyLiteV1(mut x) => {
                 r = x.on_unload();
@@ -146,17 +118,9 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::Arbitrage(mut x) => {
-                r = x.on_event(event);
-                inner = BotMode::Arbitrage(x);
-            }
             BotMode::TestPerpLatency(mut x) => {
                 r = x.on_event(event);
                 inner = BotMode::TestPerpLatency(x);
-            }
-            BotMode::TestPerpLatencyLite(mut x) => {
-                r = x.on_event(event);
-                inner = BotMode::TestPerpLatencyLite(x);
             }
             BotMode::TestLatencyLiteV1(mut x) => {
                 r = x.on_event(event);
@@ -179,17 +143,9 @@ impl EventHandler for Merged {
         let mut inner = self.inner.take().unwrap();
         let r;
         match inner {
-            BotMode::Arbitrage(mut x) => {
-                r = x.flush();
-                inner = BotMode::Arbitrage(x);
-            }
             BotMode::TestPerpLatency(mut x) => {
                 r = x.flush();
                 inner = BotMode::TestPerpLatency(x);
-            }
-            BotMode::TestPerpLatencyLite(mut x) => {
-                r = x.flush();
-                inner = BotMode::TestPerpLatencyLite(x);
             }
             BotMode::TestLatencyLiteV1(mut x) => {
                 r = x.flush();

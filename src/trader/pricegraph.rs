@@ -674,7 +674,7 @@ impl TradeRouter {
     /// Re-quote a single already-known edge (identified the same way a
     /// `Hop` identifies it: `input_mint` + `pool_id` + `output_mint`)
     /// against a possibly-different `amount_in`. Used by
-    /// `planner::reverify_with_exact_quotes` to propagate a corrected
+    /// `planner::reverify_route_with_exact_quotes` to propagate a corrected
     /// upstream amount through the rest of a cycle's non-CLMM hops --
     /// `cp_quote` is already the *exact* formula for those (only CLMM
     /// pools have the tick-unaware-approximation gap that needs a real

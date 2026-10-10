@@ -990,7 +990,7 @@ impl OrcaState {
     /// instruction -- NOT the naive constant-product-within-current-tick
     /// approximation `cp_quote`/`virtual_reserves()` use for cheap graph
     /// search. Real (non-debug) usage:
-    /// `planner::reverify_with_exact_quotes` calls this to correct a
+    /// `planner::reverify_route_with_exact_quotes` calls this to correct a
     /// router-found cycle's Orca hops before trusting them as a genuine
     /// opportunity -- found this session that a CLMM pool's real
     /// liquidity structure near the current tick (e.g. a large
