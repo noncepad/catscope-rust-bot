@@ -624,8 +624,11 @@ impl Wallet {
     ) -> Option<AccountId> {
         let owner_pubkey = pubkey_from_account_id(&owner)?;
         let mint_pubkey = pubkey_from_account_id(&mint)?;
-        let ata_address =
-            get_associated_token_address_with_program_id(&owner_pubkey, &mint_pubkey, token_program);
+        let ata_address = get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &mint_pubkey,
+            token_program,
+        );
         Some(account_id_from_pubkey(&ata_address))
     }
 
@@ -801,8 +804,11 @@ impl Wallet {
         let owner_pubkey = self.pubkey_from_account_id(&owner)?;
         let mint_pubkey = self.pubkey_from_account_id(&mint)?;
         let ix = make_ata_instruction(&owner_pubkey, &owner_pubkey, &mint_pubkey, token_program);
-        let ata_address: Pubkey =
-            get_associated_token_address_with_program_id(&owner_pubkey, &mint_pubkey, token_program);
+        let ata_address: Pubkey = get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &mint_pubkey,
+            token_program,
+        );
         self.require_signer(owner);
         // 15_000 (classic SPL Token's own real-confirmed minimum, see
         // `append_create_ata`'s doc comment) is NOT enough here -- real,

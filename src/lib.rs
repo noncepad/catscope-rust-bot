@@ -9,16 +9,11 @@ wit_bindgen::generate!({
     pub_export_macro: true,
 });
 #[cfg(feature = "component-entrypoint")]
-use crate::{
-    brain::Merged, event_loop::run,
-};
+use crate::{brain::Merged, event_loop::run};
 #[cfg(feature = "component-entrypoint")]
 use exports::wasi::cli::run::Guest;
 #[cfg(feature = "component-entrypoint")]
-use std::{
-    cell::{RefCell},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 
 pub mod brain;
 pub mod bundler_message;

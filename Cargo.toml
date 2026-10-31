@@ -1,6 +1,6 @@
 [package]
 name = "catscope-rust-bot"
-version = "0.5.25"
+version = "0.5.26"
 edition = "2021"
 
 [features]
@@ -16,7 +16,7 @@ component-entrypoint = []
 [dependencies]
 
 #orca_whirlpools = "8"hex = "0.4.3"
-wit-bindgen = "0.41"
+wit-bindgen = "0.63"
 paste = "1.0.15"
 solana-sdk = "3.0.0"
 solana-sdk-ids = "3.0.0"
